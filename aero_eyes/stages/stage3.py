@@ -118,10 +118,10 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # "0 detection frames" result.
     log.info(
         "[Stage3] %s: candidate similarity stats — min=%.3f p50=%.3f mean=%.3f "
-        "p95=%.3f max=%.3f (n=%d)",
+        "std=%.3f p95=%.3f max=%.3f (n=%d)",
         sample_id, float(all_sims.min()), float(np.percentile(all_sims, 50)),
-        float(all_sims.mean()), float(np.percentile(all_sims, 95)),
-        float(all_sims.max()), len(all_sims),
+        float(all_sims.mean()), float(all_sims.std()),
+        float(np.percentile(all_sims, 95)), float(all_sims.max()), len(all_sims),
     )
 
     # ---- Compute effective threshold ----
