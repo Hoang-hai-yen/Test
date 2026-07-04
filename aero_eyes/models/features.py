@@ -143,7 +143,12 @@ class CLIPFeatureExtractor:
             batch_pil = pil_imgs[i:i+batch_size]
             inputs = self.processor(images=batch_pil, return_tensors="pt", padding=True)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            feats  = self.model.get_image_features(**inputs)
+            # Some transformers releases return a ModelOutput (not a plain
+            # tensor) from get_image_features() due to an upstream API
+            # regression. Call the stable vision_model + visual_projection
+            # submodules directly instead of depending on that method.
+            pooled = self.model.vision_model(pixel_values=inputs["pixel_values"]).pooler_output
+            feats = self.model.visual_projection(pooled)
             out.append(F.normalize(feats, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
 
