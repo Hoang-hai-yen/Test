@@ -1,0 +1,205 @@
+# ============================================================================
+# AERO EYES — Few-Shot Spatio-Temporal Drone Object Localization
+# Master configuration. Every switch here is a real, documented option.
+# Override any field via CLI: --set proposal_model=fastsam_s
+# ============================================================================
+
+project:
+  name: aero_eyes
+  # Where intermediate per-stage artifacts + final outputs are written.
+  work_dir: ./runs/exp001
+  # Re-use cached artifacts (e.g. prototype) instead of recomputing.
+  use_cache: true
+  seed: 42
+
+# ----------------------------------------------------------------------------
+# DATA  —  CONFIRM THIS LAYOUT WITH THE USER BEFORE WRITING CODE.
+# These are PLACEHOLDER assumptions; the real schema must be verified.
+# ----------------------------------------------------------------------------
+data:
+  # One sample = 3 reference images + 1 drone video (+ optional GT).
+  # Expected layout (TO BE CONFIRMED):
+  #   data_root/
+  #     <sample_id>/
+  #       refs/   ref_0.jpg ref_1.jpg ref_2.jpg
+  #       video.mp4
+  #       gt.json            # optional, only for local eval
+  data_root: ./data
+  refs_subdir: refs
+  video_glob: "*.mp4"
+  num_references: 3
+
+  # Ground-truth schema — confirmed by user.
+  # Single global annotations file at project root; filter by video_id.
+  gt:
+    global_file: "annotations (1).json"  # at project root, all videos
+    box_format: xyxy          # confirmed: x1,y1,x2,y2 absolute pixels
+    normalized: false
+    frame_index_base: 0       # confirmed 0-based
+    absent_encoding: omit     # confirmed: missing frames = absent
+    one_object_per_video: true
+
+  # Submission / output format — confirmed same schema as GT.
+  submission:
+    path_name: submission.json
+    box_format: xyxy
+    normalized: false
+    frame_index_base: 0
+    absent_encoding: omit
+
+# ----------------------------------------------------------------------------
+# RUNTIME
+# ----------------------------------------------------------------------------
+runtime:
+  device: auto              # auto | cpu | cuda
+  # Jetson/TensorRT explicitly OUT OF SCOPE. CPU/GPU portable only.
+  num_workers: 4
+  batch_size: 16            # candidate-feature extraction batch
+  log_level: INFO
+  save_visualizations: true # overlays/heatmaps/annotated video per stage
+
+# ----------------------------------------------------------------------------
+# STAGE 1 — Reference processing (offline, runs once per target)
+# ----------------------------------------------------------------------------
+stage1:
+  segmentation:
+    enabled: true
+    model: mobilesam         # mobilesam  (background removal on refs)
+    weights: null            # path to MobileSAM ckpt; null = auto-download
+    fallback_if_missing: passthrough   # passthrough = skip masking, use full image
+  feature_extractor:
+    model: dinov2            # dinov2 | clip | ensemble (dinov2+clip concat)
+    dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d)
+    clip_variant: vit-b/32   # vit-b/32 (512-d) | vit-l/14 (768-d)
+    weights: null            # null = load from torch.hub / hf
+    image_size: 224
+  prototype:
+    # How the 3 per-reference feature sets are fused.
+    fusion: mean             # mean | max | concat_then_pca
+    l2_normalize: true
+    cache_name: prototype.npz
+
+# ----------------------------------------------------------------------------
+# STAGE 2 — Candidate generation (per keyframe)
+# ----------------------------------------------------------------------------
+stage2:
+  keyframe_interval: 8       # sample 1 keyframe every N frames (5–10 typical)
+
+  sahi:
+    use_sahi: true           # <<< SAHI ON/OFF SWITCH
+    tile: [640, 640]
+    overlap: 0.25            # fraction
+    # If false: run the proposal model on the full (resized) frame instead.
+
+  proposal_model: yolov11n   # <<< "yolov11n"  |  "fastsam_s"  (pick exactly ONE)
+                             #     YOLOv8 is explicitly NOT allowed.
+  yolov11n:
+    weights: yolo11n.pt      # ultralytics auto-downloads if absent
+    conf: 0.05               # low: class-agnostic recall over precision
+    iou: 0.5
+    max_det: 300
+    classes: null            # null = all classes (class-agnostic use)
+  fastsam_s:
+    weights: FastSAM-s.pt    # ultralytics auto-downloads if absent
+    conf: 0.2
+    iou: 0.7
+    imgsz: 640
+
+  candidate:
+    min_box_area: 16         # discard sub-pixel noise (px^2)
+    max_candidates_per_keyframe: 400
+    feature_crop_pad: 0.10   # pad each candidate crop before DINOv2
+
+# ----------------------------------------------------------------------------
+# STAGE 3 — Cross-domain matching
+# ----------------------------------------------------------------------------
+stage3:
+  similarity: cosine         # cosine
+  match_threshold: 0.55      # calibratable; candidates below are dropped (used unless adaptive_threshold below)
+  nms_iou: 0.5               # NMS across overlapping SAHI tiles
+  topk_per_keyframe: 5       # keep at most K detections per keyframe
+  # global_topk: cap the number of surviving candidates across the WHOLE video
+  # (applied AFTER threshold filtering). null = no cap. Useful when the ground-
+  # to-aerial domain gap pushes the whole similarity distribution down and a
+  # fixed threshold alone lets too much noise through.
+  global_topk: null          # e.g. 30-100 when domain gap is large
+  # adaptive_threshold: instead of a fixed match_threshold, compute
+  # per-video threshold = mean(sim) + adaptive_z_score * std(sim), floored at
+  # adaptive_min_floor. Robust when the tiny top-down object's absolute
+  # similarity to the close-up reference is unpredictable video to video.
+  adaptive_threshold: false
+  adaptive_z_score: 3.0      # higher = fewer false positives, lower = more recall
+  adaptive_min_floor: 0.05   # hard floor: never accept sim below this even if adaptive
+  # Optional auto-calibration of match_threshold on a labelled subset.
+  calibrate:
+    enabled: false
+    target_metric: st_iou
+    search_range: [0.40, 0.75]
+    steps: 8
+
+# ----------------------------------------------------------------------------
+# STAGE 4 — Tracking between keyframes
+# ----------------------------------------------------------------------------
+stage4:
+  tracker: builtin           # <<< "builtin" | "litetrack" | "none"
+                             #   builtin   = OpenCV CSRT/KCF (no extra weights)
+                             #   litetrack = LiteTrack-B4 ONNX (needs weights)
+                             #   none      = run detection on EVERY frame
+  builtin:
+    algorithm: csrt          # csrt | kcf | mosse
+  litetrack:
+    onnx_path: null          # REQUIRED if tracker=litetrack; else fail clearly
+    input_size: 256
+  tracker_conf_threshold: 0.40   # τ: below this → re-detect immediately
+  max_track_age: 30          # frames a track survives without re-detection
+
+# ----------------------------------------------------------------------------
+# STAGE 5 — Spatio-temporal output
+# ----------------------------------------------------------------------------
+stage5:
+  temporal_smoothing:
+    enabled: true
+    method: ema              # ema | none
+    ema_alpha: 0.6
+  min_tube_length: 2         # discard tubes shorter than this (frames)
+  fill_short_gaps: 3         # linearly interpolate gaps <= this many frames
+
+# ----------------------------------------------------------------------------
+# ACCURACY MODE — progressively enables domain-gap mitigations.
+#   baseline       : single-scale, plain prototype
+#   cheap_boosters : multi-scale scan + tuned NMS/thresh + multi-ref averaging
+#   max_accuracy   : + synthetic viewpoint aug + CD-ViTO-style domain prompter
+# Individual sub-toggles let each technique be ablated independently.
+# ----------------------------------------------------------------------------
+accuracy:
+  mode: baseline             # baseline | cheap_boosters | max_accuracy
+
+  cheap_boosters:
+    multi_scale_scan: true
+    scales: [0.75, 1.0, 1.5]
+    tuned_nms: true
+    multi_reference_embedding: true   # keep per-ref protos + ensemble match
+
+  max_accuracy:
+    synthetic_viewpoint_aug:
+      enabled: true
+      method: homography     # homography | perspective_warp
+      num_synth_views: 6
+      pitch_range_deg: [40, 85]   # simulate top-down
+      fold_into_prototype: true
+    domain_prompter:
+      enabled: true
+      # CD-ViTO-style: synthesize "imaginary domain" feature shifts and
+      # align candidate features toward the reference style.
+      num_prompts: 4
+      strength: 0.3
+
+# ----------------------------------------------------------------------------
+# EVALUATION (ST-IoU)
+# ----------------------------------------------------------------------------
+eval:
+  metric: st_iou
+  # Per-frame IoU averaged over the TEMPORAL UNION of pred & GT tubes;
+  # frames present in only one tube contribute IoU = 0.
+  spatial_iou_type: standard
+  report_per_video: true

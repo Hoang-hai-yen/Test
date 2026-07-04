@@ -1,0 +1,26 @@
+# Core — pin exact versions during implementation (Claude Code: fill ==x.y.z)
+# CPU/GPU portable. NO Jetson / TensorRT dependencies.
+
+numpy
+opencv-python
+pyyaml
+pydantic>=2
+torch                 # CPU or CUDA build per the user's machine
+torchvision
+ultralytics           # provides BOTH YOLOv11n (yolo11n) and FastSAM-s
+sahi                  # tiled inference (toggleable via config)
+pillow
+tqdm
+
+transformers          # DINOv2 HF fallback + CLIP feature extractor (stage1/stage2/stage3)
+scikit-learn          # stage1.prototype.fusion == "concat_then_pca"
+
+# DINOv2: loaded via torch.hub ("facebookresearch/dinov2") or huggingface.
+# MobileSAM: install from its package/repo; Stage 1 must degrade gracefully
+#            (passthrough) if weights are unavailable.
+
+# Dev / test
+pytest
+
+# Optional — only needed if stage4.tracker == "litetrack"
+onnxruntime           # (or onnxruntime-gpu)

@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+
+# Pipeline outputs (too large for git)
+runs/
+data/
+tests/fixtures/
+
+# Model weights (download at runtime)
+*.pt
+*.onnx
+*.npz
+*.pth
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

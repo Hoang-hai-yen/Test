@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: aero_eyes
+Version: 0.1.0
+Summary: Few-shot spatio-temporal drone object localization
+Requires-Python: >=3.10
