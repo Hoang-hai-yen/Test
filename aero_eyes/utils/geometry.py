@@ -233,9 +233,12 @@ def generate_synth_views(img_bgr, mask, method: str, num_views: int,
         else:
             raise ValueError(f"Unknown synth viewpoint method '{method}'")
         if mask is not None:
+            # cv2.warpPerspective on a single-channel (H,W) input returns (H,W),
+            # not (H,W,1) — squeezing the singleton channel dim. Warp the mask
+            # as plain 2D uint8 instead of round-tripping through a 3D shape.
             warped_mask = homography_warp(
-                (mask[:, :, None] * 255).astype(np.uint8), pitch_deg=pitch, seed=view_seed
-            )[:, :, 0].astype(bool)
+                (mask * 255).astype(np.uint8), pitch_deg=pitch, seed=view_seed
+            ).astype(bool)
             warped = warped * warped_mask[:, :, None]
         views.append(warped)
     return views
