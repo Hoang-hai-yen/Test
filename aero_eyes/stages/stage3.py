@@ -112,6 +112,18 @@ def run_stage3(cfg, sample_id: str) -> Path:
             and cfg.accuracy.max_accuracy.domain_prompter.enabled):
         all_sims = _apply_domain_prompter(all_feats, prototype, all_sims, cfg)
 
+    # Always log the raw similarity distribution — the ground-to-aerial domain
+    # gap means a fixed match_threshold tuned on one dataset can silently pass
+    # zero candidates on another; this makes that visible instead of a mute
+    # "0 detection frames" result.
+    log.info(
+        "[Stage3] %s: candidate similarity stats — min=%.3f p50=%.3f mean=%.3f "
+        "p95=%.3f max=%.3f (n=%d)",
+        sample_id, float(all_sims.min()), float(np.percentile(all_sims, 50)),
+        float(all_sims.mean()), float(np.percentile(all_sims, 95)),
+        float(all_sims.max()), len(all_sims),
+    )
+
     # ---- Compute effective threshold ----
     if s3.adaptive_threshold:
         sim_mean = float(all_sims.mean())
