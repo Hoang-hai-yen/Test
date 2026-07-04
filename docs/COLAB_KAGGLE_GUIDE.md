@@ -231,6 +231,12 @@ git clone https://github.com/Hoang-hai-yen/Test.git /kaggle/working/aero_eyes
 cd /kaggle/working/aero_eyes
 pip install -r requirements.txt -q
 pip install -e . -q
+
+# Kaggle mặc định chỉ có opencv-python (KHÔNG có module cv2.legacy chứa
+# CSRT/KCF tracker) — cần cho stage4.tracker=builtin. Không cài dòng này
+# Stage 4 sẽ crash với "OpenCV tracker 'csrt' not found".
+pip install opencv-contrib-python-headless -q
+
 echo "Done!"
 ```
 
@@ -311,6 +317,9 @@ print('File submission.json đã sẵn sàng ở Output tab!')
 | `destination path ... already exists` | Chạy lại Cell 1 lần 2, folder clone cũ còn tồn tại | Thêm `rm -rf /kaggle/working/aero_eyes` trước `git clone` |
 | `data_root not found: /kaggle/input/aero-eyes-dataset` | Đoán sai mount path — Kaggle có thể thêm lớp `datasets/<user>/` và/hoặc thư mục con như `PublicTest/samples/` | Luôn chạy `!find /kaggle/input -maxdepth 4` trước, copy đúng path |
 | `Expected 3 reference images ..., found 0` | Tên thư mục ảnh tham chiếu khác `refs` (ví dụ `object_images`), hoặc đuôi ảnh khác `.jpg`/`.png` | Kiểm tra bằng `!find <sample_dir> -maxdepth 2`, set đúng `data.refs_subdir` |
+| `threshold=0.55 → 0/N candidates pass` (mọi sample đều 0) | Domain gap ground→aerial: similarity thật của cả video chỉ ~0.1-0.4, không bao giờ chạm ngưỡng cố định 0.55 | `--set stage3.adaptive_threshold=true` (ngưỡng tự tính theo mean+z*std từng video) thay vì số cố định |
+| `OpenCV tracker 'csrt' not found` (Stage 4) | Kaggle mặc định chỉ có `opencv-python`, thiếu `cv2.legacy` (CSRT/KCF) | `pip install opencv-contrib-python-headless -q` ở Cell 1 (đã thêm sẵn ở trên) |
+| Output/log biến mất, `candidates.json`/`runs/` không còn | Session Kaggle bị reset (đóng notebook, hết giờ idle) — `/kaggle/working/` là ổ tạm, mất hết mỗi session mới | Chạy lại từ Cell 1 (clone) → Cell 3 (run_all) trong 1 mạch, không nghỉ giữa chừng |
 
 ---
 
