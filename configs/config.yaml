@@ -18,14 +18,13 @@ project:
 # ----------------------------------------------------------------------------
 data:
   # One sample = 3 reference images + 1 drone video (+ optional GT).
-  # Expected layout (TO BE CONFIRMED):
+  # Confirmed layout (aero-eyes-dataset / PublicTest / samples):
   #   data_root/
   #     <sample_id>/
-  #       refs/   ref_0.jpg ref_1.jpg ref_2.jpg
-  #       video.mp4
-  #       gt.json            # optional, only for local eval
+  #       object_images/   img_1.jpg img_2.jpg img_3.jpg
+  #       drone_video.mp4  (any *.mp4 name — video_glob matches by extension)
   data_root: ./data
-  refs_subdir: refs
+  refs_subdir: object_images
   video_glob: "*.mp4"
   num_references: 3
 

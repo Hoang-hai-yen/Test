@@ -184,19 +184,24 @@ Kết quả sẽ được lưu ở `MyDrive/aero_eyes_runs/exp001/<sample_id>/` 
 
 1. Vào [kaggle.com/datasets](https://www.kaggle.com/datasets) → **New Dataset**
 
-2. Upload theo cấu trúc:
+2. Upload theo cấu trúc (mỗi sample: 3 ảnh vật thể + 1 video drone).
+   > ⚠️ Kaggle có thể mount dataset với thêm 1-2 lớp thư mục con tùy cách bạn
+   > upload (ví dụ `PublicTest/samples/` như dataset thật của project này).
+   > Luôn kiểm tra bằng `!find /kaggle/input -maxdepth 4` sau khi add data,
+   > **không giả định** đường dẫn — copy đúng path in ra để dùng ở Cell 3.
    ```
    aero-eyes-dataset/
-   ├── annotations (1).json
-   ├── Backpack_0/
-   │   ├── refs/ref_0.jpg, ref_1.jpg, ref_2.jpg
-   │   └── video.mp4
-   └── Person_1/ ...
+   └── PublicTest/samples/            # có thể không có lớp này, tùy dataset
+       ├── annotations (1).json
+       ├── BlackBox_0/
+       │   ├── object_images/img_1.jpg, img_2.jpg, img_3.jpg   # ← refs_subdir
+       │   └── drone_video.mp4                                  # tên bất kỳ, khớp *.mp4
+       └── LifeJacket_0/ ...
    ```
 
 3. Đặt tên dataset (ví dụ: `aero-eyes-dataset`), chọn **Private**
 
-4. Lưu lại **Dataset path**, ví dụ: `your_username/aero-eyes-dataset`
+4. Lưu lại **Dataset path**, ví dụ: `zerunagiryu/aero-eyes-dataset`
 
 ### Bước 2 — Tạo notebook Kaggle
 
@@ -208,10 +213,21 @@ Kết quả sẽ được lưu ở `MyDrive/aero_eyes_runs/exp001/<sample_id>/` 
 
 4. Dán các cell sau:
 
+**Cell 0 — Kiểm tra đường dẫn dataset thật (LUÔN chạy trước, đừng đoán path):**
+```bash
+!find /kaggle/input -maxdepth 4
+```
+Ghi lại path đầy đủ tới thư mục chứa các folder sample (ví dụ
+`/kaggle/input/datasets/zerunagiryu/aero-eyes-dataset/PublicTest/samples`) — dùng
+path đó cho `DATA_ROOT` ở Cell 3.
+
 **Cell 1 — Clone repo:**
 ```bash
 %%bash
-git clone https://github.com/YOUR_USERNAME/aero_eyes_starter.git /kaggle/working/aero_eyes
+# rm -rf trước để lần chạy lại luôn lấy code mới nhất từ GitHub (không bị
+# lỗi "destination path already exists" khi re-run cell).
+rm -rf /kaggle/working/aero_eyes
+git clone https://github.com/Hoang-hai-yen/Test.git /kaggle/working/aero_eyes
 cd /kaggle/working/aero_eyes
 pip install -r requirements.txt -q
 pip install -e . -q
@@ -223,8 +239,8 @@ echo "Done!"
 import os
 
 REPO_DIR = '/kaggle/working/aero_eyes'
-# Kaggle mount dataset vào /kaggle/input/<dataset-name>/
-DATA_DIR = '/kaggle/input/aero-eyes-dataset'   # ← đổi theo tên dataset của bạn
+# ← Dán đúng path đã xác nhận ở Cell 0 (KHÔNG đoán, mount path đổi tùy dataset)
+DATA_DIR = '/kaggle/input/datasets/zerunagiryu/aero-eyes-dataset/PublicTest/samples'
 WORK_DIR = '/kaggle/working/runs/exp001'
 
 os.chdir(REPO_DIR)
@@ -239,18 +255,26 @@ print(f'Tìm thấy {len(samples)} sample(s):', samples[:5])
 %%bash
 cd /kaggle/working/aero_eyes
 
+DATA_ROOT="/kaggle/input/datasets/zerunagiryu/aero-eyes-dataset/PublicTest/samples"
+
 python -m aero_eyes.stages.run_all \
     --config configs/config.yaml \
-    --set data.data_root=/kaggle/input/aero-eyes-dataset \
+    --set data.data_root="$DATA_ROOT" \
+    --set data.gt.global_file="$DATA_ROOT/annotations (1).json" \
     --set project.work_dir=/kaggle/working/runs/exp001 \
     --set stage1.feature_extractor.dinov2_variant=vitb14 \
     --set accuracy.mode=cheap_boosters
 ```
+> `refs_subdir` (`object_images`) đã là default trong `configs/config.yaml`
+> cho dataset này — không cần `--set` thêm. Nếu dataset khác đặt tên thư mục
+> ảnh tham chiếu khác, thêm `--set data.refs_subdir=<tên_thư_mục>`.
 
 **Cell 4 — Đánh giá:**
 ```bash
 %%bash
 cd /kaggle/working/aero_eyes
+
+DATA_ROOT="/kaggle/input/datasets/zerunagiryu/aero-eyes-dataset/PublicTest/samples"
 
 # Gom tất cả submission thành 1 file
 python -c "
@@ -264,7 +288,7 @@ print(f'Gom {len(preds)} video')
 
 python -m aero_eyes.evaluate \
     --pred /kaggle/working/all_submissions.json \
-    --gt '/kaggle/input/aero-eyes-dataset/annotations (1).json' \
+    --gt "$DATA_ROOT/annotations (1).json" \
     --config configs/config.yaml
 ```
 
@@ -279,6 +303,14 @@ print('File submission.json đã sẵn sàng ở Output tab!')
 
 ### Download kết quả từ Kaggle
 - Sau khi notebook chạy xong: **Output tab (bên phải)** → `submission.json` → Download
+
+### Sự cố thường gặp (đã gặp thật khi chạy dataset này)
+| Lỗi | Nguyên nhân | Cách sửa |
+|--|--|--|
+| `No such file or directory: 'requirements.txt'` | `cd` nhầm vào thư mục dataset thay vì thư mục repo vừa clone | `cd /kaggle/working/aero_eyes` trước khi `pip install` |
+| `destination path ... already exists` | Chạy lại Cell 1 lần 2, folder clone cũ còn tồn tại | Thêm `rm -rf /kaggle/working/aero_eyes` trước `git clone` |
+| `data_root not found: /kaggle/input/aero-eyes-dataset` | Đoán sai mount path — Kaggle có thể thêm lớp `datasets/<user>/` và/hoặc thư mục con như `PublicTest/samples/` | Luôn chạy `!find /kaggle/input -maxdepth 4` trước, copy đúng path |
+| `Expected 3 reference images ..., found 0` | Tên thư mục ảnh tham chiếu khác `refs` (ví dụ `object_images`), hoặc đuôi ảnh khác `.jpg`/`.png` | Kiểm tra bằng `!find <sample_dir> -maxdepth 2`, set đúng `data.refs_subdir` |
 
 ---
 

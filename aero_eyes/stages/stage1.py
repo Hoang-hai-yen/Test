@@ -43,11 +43,17 @@ def run_stage1(cfg, sample_id: str) -> Path:
     # ---- 1. Load reference images ----
     data_root = Path(cfg.data.data_root)
     refs_dir = data_root / sample_id / cfg.data.refs_subdir
-    ref_paths = sorted(refs_dir.glob("*.jpg")) + sorted(refs_dir.glob("*.png"))
+    # Case-insensitive match across common extensions (.jpg/.JPG/.jpeg/.png/.bmp/.webp).
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    ref_paths = sorted(
+        p for p in (refs_dir.iterdir() if refs_dir.is_dir() else [])
+        if p.suffix.lower() in exts
+    )
     if len(ref_paths) < cfg.data.num_references:
         raise FileNotFoundError(
             f"Expected {cfg.data.num_references} reference images in {refs_dir}, "
-            f"found {len(ref_paths)}."
+            f"found {len(ref_paths)}. Files present: "
+            f"{[p.name for p in refs_dir.iterdir()] if refs_dir.is_dir() else '(directory does not exist)'}"
         )
     ref_paths = ref_paths[: cfg.data.num_references]
     ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
