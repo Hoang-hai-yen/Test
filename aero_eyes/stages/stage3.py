@@ -29,6 +29,23 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.ndarray:
+    """Score every row of feats [N,D] against a single reference vector [D].
+
+    Higher score always means "more similar" regardless of metric, so the
+    rest of Stage 3 (threshold filtering, adaptive threshold, ranking) works
+    unchanged no matter which metric is selected. For distance metrics
+    (l1/l2) this means returning the negated distance.
+    """
+    if metric == "cosine":
+        return feats @ ref
+    if metric == "l2":
+        return -np.linalg.norm(feats - ref[None, :], axis=1)
+    if metric == "l1":
+        return -np.sum(np.abs(feats - ref[None, :]), axis=1)
+    raise ValueError(f"Unknown stage3.similarity metric '{metric}'. Must be 'cosine', 'l1', or 'l2'.")
+
+
 def run_stage3(cfg, sample_id: str) -> Path:
     """Run Stage 3 for the given sample. Returns path to detections.json."""
     from aero_eyes.stages.stage2 import read_candidates_with_features
@@ -100,16 +117,24 @@ def run_stage3(cfg, sample_id: str) -> Path:
     all_dets = [e[1] for e in all_entries]
     all_feats = np.stack([e[2] for e in all_entries], axis=0)  # [N, D]
 
-    # Compute similarity for every candidate at once
+    # Compute similarity for every candidate at once (higher = more similar,
+    # regardless of metric -- see _score_against_ref).
     if use_multi_ref:
-        sims_per_ref = [all_feats @ ref_feat for ref_feat in per_ref_features]
+        sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
         all_sims = np.mean(sims_per_ref, axis=0)
     else:
-        all_sims = all_feats @ prototype  # [N]
+        all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
 
-    # CD-ViTO domain prompter (max_accuracy)
+    # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;
+    # already shown to hurt results (see docs/COLAB_KAGGLE_GUIDE.md), kept
+    # off by default and not extended to l1/l2.
     if (cfg.accuracy.mode == "max_accuracy"
             and cfg.accuracy.max_accuracy.domain_prompter.enabled):
+        if s3.similarity != "cosine":
+            raise ValueError(
+                "accuracy.max_accuracy.domain_prompter is only implemented for "
+                "stage3.similarity='cosine'. Disable domain_prompter or switch back to cosine."
+            )
         all_sims = _apply_domain_prompter(all_feats, prototype, all_sims, cfg)
 
     # Always log the raw similarity distribution — the ground-to-aerial domain
@@ -117,9 +142,9 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # zero candidates on another; this makes that visible instead of a mute
     # "0 detection frames" result.
     log.info(
-        "[Stage3] %s: candidate similarity stats — min=%.3f p50=%.3f mean=%.3f "
-        "std=%.3f p95=%.3f max=%.3f (n=%d)",
-        sample_id, float(all_sims.min()), float(np.percentile(all_sims, 50)),
+        "[Stage3] %s: candidate score stats (metric=%s, higher=more similar) — "
+        "min=%.3f p50=%.3f mean=%.3f std=%.3f p95=%.3f max=%.3f (n=%d)",
+        sample_id, s3.similarity, float(all_sims.min()), float(np.percentile(all_sims, 50)),
         float(all_sims.mean()), float(all_sims.std()),
         float(np.percentile(all_sims, 95)), float(all_sims.max()), len(all_sims),
     )
@@ -128,14 +153,19 @@ def run_stage3(cfg, sample_id: str) -> Path:
     if s3.adaptive_threshold:
         sim_mean = float(all_sims.mean())
         sim_std = float(all_sims.std())
-        effective_threshold = max(
-            s3.adaptive_min_floor,
-            sim_mean + s3.adaptive_z_score * sim_std,
-        )
+        raw_threshold = sim_mean + s3.adaptive_z_score * sim_std
+        # adaptive_min_floor is calibrated for cosine's roughly [-1,1] range.
+        # l1/l2 scores are negated distances (unbounded, typically negative),
+        # so the floor has no meaningful interpretation there -- skip it.
+        if s3.similarity == "cosine":
+            effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
+        else:
+            effective_threshold = raw_threshold
         log.info(
-            "[Stage3] %s: adaptive threshold = max(floor=%.3f, %.3f + %.1f*%.3f) = %.3f",
-            sample_id, s3.adaptive_min_floor,
-            sim_mean, s3.adaptive_z_score, sim_std, effective_threshold,
+            "[Stage3] %s: adaptive threshold (metric=%s) = %.3f + %.1f*%.3f = %.3f%s",
+            sample_id, s3.similarity, sim_mean, s3.adaptive_z_score, sim_std,
+            effective_threshold,
+            f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else "",
         )
     else:
         effective_threshold = threshold

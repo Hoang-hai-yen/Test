@@ -67,9 +67,14 @@ class DINOv2FeatureExtractor:
             return m
         except Exception as e:
             log.warning("torch.hub failed (%s) → HuggingFace", e)
-        hf_map = {"vits14": "facebook/dinov2-small", "vitb14": "facebook/dinov2-base"}
+        hf_map = {
+            "vits14": "facebook/dinov2-small", "vitb14": "facebook/dinov2-base",
+            "vitl14": "facebook/dinov2-large", "vitg14": "facebook/dinov2-giant",
+        }
+        if variant not in hf_map:
+            raise ValueError(f"Unknown DINOv2 variant '{variant}'. Must be one of {list(hf_map)}.")
         from transformers import AutoModel
-        m = AutoModel.from_pretrained(hf_map.get(variant, f"facebook/dinov2-{variant}"))
+        m = AutoModel.from_pretrained(hf_map[variant])
         m._hf = True
         return m
 
@@ -94,8 +99,10 @@ class DINOv2FeatureExtractor:
             return np.zeros((0, self._dim()), dtype=np.float32)
         return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
 
+    _DIMS = {"vits14": 384, "vitb14": 768, "vitl14": 1024, "vitg14": 1536}
+
     def _dim(self) -> int:
-        return {"vits14": 384, "vitb14": 768}.get(self.variant, 768)
+        return self._DIMS.get(self.variant, 768)
 
     # Keep old name for compatibility
     def _feature_dim(self) -> int:

@@ -67,7 +67,7 @@ class SegmentationConfig(BaseModel):
 
 class FeatureExtractorConfig(BaseModel):
     model: Literal["dinov2", "clip", "ensemble"] = "dinov2"
-    dinov2_variant: Literal["vits14", "vitb14"] = "vitb14"
+    dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     clip_variant: str = "vit-b/32"   # "vit-b/32" (512-d) or "vit-l/14" (768-d)
     weights: Optional[str] = None
     image_size: int = 224
@@ -140,7 +140,7 @@ class CalibrateConfig(BaseModel):
 
 
 class Stage3Config(BaseModel):
-    similarity: str = "cosine"
+    similarity: Literal["cosine", "l1", "l2"] = "cosine"
     match_threshold: float = 0.55
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
@@ -152,7 +152,7 @@ class Stage3Config(BaseModel):
     # Robust to domain gap — adapts to the actual similarity distribution.
     # Replaces match_threshold when enabled.
     adaptive_threshold: bool = False
-    adaptive_z_score: float = 3.0   # higher = fewer FP, lower = more recall
+    adaptive_z_score: float = 2.0   # higher = fewer FP, lower = more recall (see configs/config.yaml for the sweep)
     adaptive_min_floor: float = 0.05  # hard floor: never accept sim below this
     calibrate: CalibrateConfig = CalibrateConfig()
 
