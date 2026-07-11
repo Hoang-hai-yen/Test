@@ -48,6 +48,15 @@ def run_sweep(cfg, sample_ids: list[str], z_values: list[float]) -> dict[float, 
     from aero_eyes.stages.stage5 import run_stage5
     from aero_eyes.evaluate import evaluate_dataset
 
+    if not cfg.stage3.adaptive_threshold:
+        log.warning(
+            "stage3.adaptive_threshold was false -- forcing it to true. "
+            "This script sweeps adaptive_z_score, which has no effect unless "
+            "adaptive_threshold is enabled (otherwise every z gives the same "
+            "fixed-match_threshold result)."
+        )
+        cfg.stage3.adaptive_threshold = True
+
     work_dir = Path(cfg.project.work_dir)
     results: dict[float, dict[str, float]] = {}
 
