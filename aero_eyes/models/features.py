@@ -2,7 +2,12 @@
 
 Supported models:
   dinov2   — DINOv2 ViT-S/14 or ViT-B/14, CLS token (384 or 768-d)
+  dinov3   — DINOv3 ViT-S/16, ViT-B/16 or ViT-L/16, CLS token (384/768/1024-d).
+             Weights are gated on HuggingFace -- request access and set
+             HF_TOKEN before use.
   clip     — CLIP ViT-B/32, visual encoder (512-d)
+  siglip   — SigLIP vision encoder (base/large/so400m), pooled output
+             (768/1024/1152-d). Open access, no gating.
   ensemble — DINOv2 + CLIP concatenated then L2-normalized (1280 or 896-d)
 
 All extractors return L2-normalized float32 feature vectors.
@@ -110,6 +115,68 @@ class DINOv2FeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
+# DINOv3
+# ---------------------------------------------------------------------------
+
+class DINOv3FeatureExtractor:
+    """DINOv3 ViT-S/16, ViT-B/16 or ViT-L/16, returns L2-normalized CLS tokens.
+
+    Weights are gated on HuggingFace (facebook/dinov3-*-pretrain-lvd1689m):
+    request access on the model page, then set HF_TOKEN before running, or
+    `from_pretrained` will fail with a 401/403.
+    """
+
+    _VARIANT_MAP = {
+        "vits16": "facebook/dinov3-vits16-pretrain-lvd1689m",
+        "vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m",
+        "vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+    }
+    _DIMS = {"vits16": 384, "vitb16": 768, "vitl16": 1024}
+
+    def __init__(self, variant: str = "vitb16", device: str = "auto"):
+        if variant not in self._VARIANT_MAP:
+            raise ValueError(f"Unknown DINOv3 variant '{variant}'. Must be one of {list(self._VARIANT_MAP)}.")
+        self.variant = variant
+        self.device  = _resolve_device(device)
+        self.model, self.processor = self._load(variant)
+        self.model.eval().to(self.device)
+        log.info("DINOv3 %s on %s  (dim=%d)", variant, self.device, self._dim())
+
+    def _load(self, variant: str):
+        from transformers import AutoImageProcessor, AutoModel
+        hf_name = self._VARIANT_MAP[variant]
+        processor = AutoImageProcessor.from_pretrained(hf_name)
+        model     = AutoModel.from_pretrained(hf_name)
+        return model, processor
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            inputs = self.processor(images=batch_pil, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            pooled = self.model(**inputs).pooler_output
+            out.append(F.normalize(pooled, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._DIMS.get(self.variant, 768)
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
 # CLIP
 # ---------------------------------------------------------------------------
 
@@ -173,6 +240,63 @@ class CLIPFeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
+# SigLIP
+# ---------------------------------------------------------------------------
+
+class SiglipFeatureExtractor:
+    """SigLIP vision encoder only (no text tower), returns L2-normalized pooled tokens."""
+
+    _VARIANT_MAP = {
+        "base":    "google/siglip-base-patch16-224",
+        "large":   "google/siglip-large-patch16-256",
+        "so400m":  "google/siglip-so400m-patch14-384",
+    }
+    _DIMS = {"base": 768, "large": 1024, "so400m": 1152}
+
+    def __init__(self, variant: str = "base", device: str = "auto"):
+        if variant not in self._VARIANT_MAP:
+            raise ValueError(f"Unknown SigLIP variant '{variant}'. Must be one of {list(self._VARIANT_MAP)}.")
+        self.variant = variant
+        self.device  = _resolve_device(device)
+        self.model, self.processor = self._load(variant)
+        self.model.eval().to(self.device)
+        log.info("SigLIP %s on %s  (dim=%d)", variant, self.device, self._dim())
+
+    def _load(self, variant: str):
+        from transformers import AutoImageProcessor, SiglipVisionModel
+        hf_name = self._VARIANT_MAP[variant]
+        processor = AutoImageProcessor.from_pretrained(hf_name)
+        model     = SiglipVisionModel.from_pretrained(hf_name)
+        return model, processor
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            inputs = self.processor(images=batch_pil, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            pooled = self.model(**inputs).pooler_output
+            out.append(F.normalize(pooled, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._DIMS.get(self.variant, 768)
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
 # Ensemble (DINOv2 + CLIP concat → L2-normalize)
 # ---------------------------------------------------------------------------
 
@@ -220,7 +344,7 @@ class EnsembleFeatureExtractor:
 # Factory
 # ---------------------------------------------------------------------------
 
-def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | CLIPFeatureExtractor | EnsembleFeatureExtractor:
+def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtractor | CLIPFeatureExtractor | SiglipFeatureExtractor | EnsembleFeatureExtractor:
     """Build the feature extractor specified by cfg.stage1.feature_extractor."""
     fe  = cfg.stage1.feature_extractor
     dev = cfg.device()
@@ -231,9 +355,19 @@ def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | CLIPFeatureExtracto
             device     = dev,
             image_size = fe.image_size,
         )
+    if fe.model == "dinov3":
+        return DINOv3FeatureExtractor(
+            variant = fe.dinov3_variant,
+            device  = dev,
+        )
     if fe.model == "clip":
         return CLIPFeatureExtractor(
             variant = fe.clip_variant,
+            device  = dev,
+        )
+    if fe.model == "siglip":
+        return SiglipFeatureExtractor(
+            variant = fe.siglip_variant,
             device  = dev,
         )
     if fe.model == "ensemble":
@@ -245,7 +379,7 @@ def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | CLIPFeatureExtracto
         )
     raise ValueError(
         f"Unknown feature extractor model '{fe.model}'. "
-        "Must be 'dinov2', 'clip', or 'ensemble'."
+        "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
     )
 
 

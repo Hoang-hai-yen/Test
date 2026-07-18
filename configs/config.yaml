@@ -67,10 +67,18 @@ stage1:
     weights: null            # path to MobileSAM ckpt; null = auto-download
     fallback_if_missing: passthrough   # passthrough = skip masking, use full image
   feature_extractor:
-    model: dinov2            # dinov2 | clip | ensemble (dinov2+clip concat)
+    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dinov2+clip concat)
     dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
                               # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
+    # dinov3_variant: used only when model=dinov3. Weights are GATED on
+    # HuggingFace (facebook/dinov3-*-pretrain-lvd1689m) -- request access on
+    # the model page with your HF account first, then set HF_TOKEN in the
+    # environment before running, or the download will 401/403.
+    dinov3_variant: vitb16   # vits16 (384-d) | vitb16 (768-d) | vitl16 (1024-d)
     clip_variant: vit-b/32   # vit-b/32 (512-d) | vit-l/14 (768-d)
+    # siglip_variant: used only when model=siglip. Open access on HuggingFace,
+    # no token needed. Vision encoder only (no text tower loaded).
+    siglip_variant: base     # base (768-d) | large (1024-d) | so400m (1152-d, slow)
     weights: null            # null = load from torch.hub / hf
     image_size: 224
   prototype:

@@ -66,9 +66,14 @@ class SegmentationConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: Literal["dinov2", "clip", "ensemble"] = "dinov2"
+    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
+    # DINOv3 weights are gated on HuggingFace (facebook/dinov3-*) -- request
+    # access on the model page and set HF_TOKEN before using this.
+    dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
     clip_variant: str = "vit-b/32"   # "vit-b/32" (512-d) or "vit-l/14" (768-d)
+    # SigLIP: open access (no gating), vision-only encoder.
+    siglip_variant: Literal["base", "large", "so400m"] = "base"
     weights: Optional[str] = None
     image_size: int = 224
 
