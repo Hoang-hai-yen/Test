@@ -69,7 +69,7 @@ class MobileSAMSegmenter:
         os.makedirs(os.path.dirname(ckpt), exist_ok=True)
         try:
             import urllib.request
-            url = "https://github.com/ChaoningZhang/MobileSAM/releases/download/v1.0/mobile_sam.pt"
+            url = "https://raw.githubusercontent.com/ChaoningZhang/MobileSAM/master/weights/mobile_sam.pt"
             log.info("Downloading MobileSAM weights to %s ...", ckpt)
             urllib.request.urlretrieve(url, ckpt)
         except Exception as e:
