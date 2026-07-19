@@ -74,7 +74,13 @@ def run_stage1(cfg, sample_id: str) -> Path:
             mask = np.ones(img.shape[:2], dtype=bool)
         masks.append(mask)
         masked = img.copy()
-        masked[~mask] = 0
+        # Fill background with the image's own mean color rather than pure
+        # black: a large solid-black region is out-of-distribution for
+        # ImageNet-pretrained backbones (DINOv2/CLIP/SigLIP) and can distort
+        # the embedding more than the background clutter it was meant to
+        # remove.
+        bg_color = img.reshape(-1, 3).mean(axis=0)
+        masked[~mask] = bg_color
         masked_imgs.append(masked)
 
     if cfg.runtime.save_visualizations:

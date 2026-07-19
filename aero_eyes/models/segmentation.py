@@ -16,9 +16,18 @@ log = logging.getLogger(__name__)
 class MobileSAMSegmenter:
     """Segment the largest/most-central object in a reference image."""
 
-    def __init__(self, weights_path: str | None = None, fallback_if_missing: str = "passthrough"):
+    def __init__(self, weights_path: str | None = None, fallback_if_missing: str = "passthrough",
+                 min_area_frac: float = 0.05, max_area_frac: float = 0.95):
         self.weights_path = weights_path
         self.fallback_if_missing = fallback_if_missing
+        # Guardrail: a single center-point prompt sometimes locks onto a tiny
+        # spurious region (a shadow, a logo) or ~the whole frame (no real
+        # segmentation). Either extreme is worse than no masking at all, so
+        # reject implausible mask sizes and fall back to passthrough for
+        # that image instead of feeding a near-all-black or no-op crop
+        # downstream.
+        self.min_area_frac = min_area_frac
+        self.max_area_frac = max_area_frac
         self._sam = None
         self._predictor = None
         self._available = False
@@ -101,7 +110,15 @@ class MobileSAMSegmenter:
             )
             # Pick the highest-scoring mask
             best_idx = int(np.argmax(scores))
-            return masks[best_idx].astype(bool)
+            mask = masks[best_idx].astype(bool)
+            area_frac = mask.mean()
+            if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
+                log.warning(
+                    "MobileSAM mask area implausible (%.1f%% of frame), using passthrough mask.",
+                    area_frac * 100,
+                )
+                return np.ones((h, w), dtype=bool)
+            return mask
         except Exception as e:
             log.warning("MobileSAM inference failed (%s), using passthrough mask.", e)
             return np.ones((h, w), dtype=bool)
