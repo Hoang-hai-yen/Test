@@ -84,10 +84,20 @@ class PrototypeConfig(BaseModel):
     cache_name: str = "prototype.npz"
 
 
+class AerialSimConfig(BaseModel):
+    """Degrade reference images to look more like a distant aerial capture
+    before feature extraction, to shrink the domain gap between crisp
+    close-up references and the drone's actual view of the object."""
+    enabled: bool = False
+    downscale_factor: float = 1.0  # e.g. 0.25 = shrink to 1/4 then upscale back (simulate distance)
+    blur_ksize: int = 0  # Gaussian blur kernel size in px, 0 = off (simulate motion/optical blur)
+
+
 class Stage1Config(BaseModel):
     segmentation: SegmentationConfig = SegmentationConfig()
     feature_extractor: FeatureExtractorConfig = FeatureExtractorConfig()
     prototype: PrototypeConfig = PrototypeConfig()
+    aerial_sim: AerialSimConfig = AerialSimConfig()
 
 
 class SAHIConfig(BaseModel):

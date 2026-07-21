@@ -22,6 +22,24 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _apply_aerial_sim(img: np.ndarray, downscale_factor: float, blur_ksize: int) -> np.ndarray:
+    """Degrade a reference image toward what a distant aerial camera would
+    capture: shrink-then-upscale to destroy fine detail, optionally followed
+    by a Gaussian blur. Both are no-ops at their default (1.0 / 0) values.
+    """
+    out = img
+    if downscale_factor < 1.0:
+        h, w = out.shape[:2]
+        small_w = max(1, int(round(w * downscale_factor)))
+        small_h = max(1, int(round(h * downscale_factor)))
+        small = cv2.resize(out, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        out = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    if blur_ksize > 0:
+        k = blur_ksize | 1  # Gaussian blur requires an odd kernel size
+        out = cv2.GaussianBlur(out, (k, k), 0)
+    return out
+
+
 def run_stage1(cfg, sample_id: str) -> Path:
     """Run Stage 1 for the given sample. Returns path to prototype.npz."""
     from aero_eyes.config import load_config
@@ -86,6 +104,14 @@ def run_stage1(cfg, sample_id: str) -> Path:
     if cfg.runtime.save_visualizations:
         viz_dir = work_dir / "viz" / "stage1"
         vizmod.save_stage1_refs(ref_imgs, masks, viz_dir)
+
+    # ---- 2b. Aerial-view simulation (shrink/blur to match drone domain) ----
+    sim_cfg = cfg.stage1.aerial_sim
+    if sim_cfg.enabled:
+        masked_imgs = [
+            _apply_aerial_sim(m, sim_cfg.downscale_factor, sim_cfg.blur_ksize)
+            for m in masked_imgs
+        ]
 
     # ---- 3. Collect images to extract features from ----
     feat_cfg = cfg.stage1.feature_extractor
