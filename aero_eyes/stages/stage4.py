@@ -29,7 +29,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
     """Run Stage 4. Returns path to tracks.json."""
     from aero_eyes.models.trackers import NoneTracker, build_tracker
     from aero_eyes.utils import viz as vizmod
-    from aero_eyes.utils.io import read_detections, write_tracks
+    from aero_eyes.utils.io import read_detections, read_detections_threshold, write_tracks
     from aero_eyes.utils.video import AnnotatedVideoWriter, frame_iterator, video_info
 
     t0 = time.time()
@@ -48,6 +48,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
             f"detections.json not found at {det_path}. Run Stage 3 first."
         )
     detections = read_detections(det_path)
+    # Reuse the exact threshold Stage 3 matched with (adaptive z-score value
+    # when enabled) so mid-video re-detection applies the same acceptance
+    # bar instead of silently falling back to the fixed config default.
+    match_threshold = read_detections_threshold(det_path)
+    if match_threshold is None:
+        match_threshold = cfg.stage3.match_threshold
 
     # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
@@ -106,7 +112,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 # Re-detect every frame
                 box_out, source = _detect_on_frame(
                     frame_bgr, frame_idx, proposal_model, extractor,
-                    prototype, per_ref_features, cfg
+                    prototype, per_ref_features, cfg, match_threshold
                 )
             else:
                 if frame_idx in kf_set:
@@ -145,7 +151,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
 
                         box_out, source = _detect_on_frame(
                             frame_bgr, frame_idx, proposal_model, extractor,
-                            prototype, per_ref_features, cfg
+                            prototype, per_ref_features, cfg, match_threshold
                         )
                         if box_out is not None:
                             tracker.init(frame_bgr, box_out)
@@ -181,6 +187,7 @@ def _detect_on_frame(
     prototype,
     per_ref_features: list,
     cfg,
+    match_threshold: float,
 ):
     """Run proposal + matching on a single frame; return (best_box, source)."""
     if proposal_model is None or extractor is None or prototype is None:
@@ -189,7 +196,6 @@ def _detect_on_frame(
     from aero_eyes.utils.geometry import nms, remap_box_from_tile, sahi_tiles
 
     s2 = cfg.stage2
-    s3 = cfg.stage3
     h, w = frame_bgr.shape[:2]
 
     # Proposals
@@ -230,7 +236,7 @@ def _detect_on_frame(
         sims = feats @ prototype
 
     best_idx = int(np.argmax(sims))
-    if sims[best_idx] >= s3.match_threshold:
+    if sims[best_idx] >= match_threshold:
         return boxes[best_idx], "detect"
     return None, "none"
 

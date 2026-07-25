@@ -189,7 +189,11 @@ def read_candidates(path: str | Path) -> dict[int, list[Detection]]:
 # detections.json
 # ---------------------------------------------------------------------------
 
-def write_detections(detections: dict[int, list[Detection]], path: str | Path) -> None:
+def write_detections(
+    detections: dict[int, list[Detection]],
+    path: str | Path,
+    threshold: float | None = None,
+) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -197,6 +201,12 @@ def write_detections(detections: dict[int, list[Detection]], path: str | Path) -
             str(fi): [d.to_dict() for d in dets]
             for fi, dets in detections.items()
         },
+        # The effective match threshold Stage 3 actually used (adaptive
+        # z-score threshold when enabled, else the fixed match_threshold).
+        # Stage 4 re-detection must reuse this exact value -- falling back
+        # to the fixed config default there would silently ignore adaptive
+        # tuning and reject nearly every re-detect attempt.
+        "threshold": threshold,
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -210,6 +220,13 @@ def read_detections(path: str | Path) -> dict[int, list[Detection]]:
         int(fi): [Detection.from_dict(d) for d in dets]
         for fi, dets in payload["frames"].items()
     }
+
+
+def read_detections_threshold(path: str | Path) -> float | None:
+    """Read the effective match threshold Stage 3 recorded, if any."""
+    with open(path) as f:
+        payload = json.load(f)
+    return payload.get("threshold")
 
 
 # ---------------------------------------------------------------------------

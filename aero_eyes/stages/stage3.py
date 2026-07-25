@@ -225,7 +225,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
             except Exception:
                 pass
 
-    write_detections(detections, det_path)
+    write_detections(detections, det_path, threshold=effective_threshold)
     elapsed = time.time() - t0
     log.info("[Stage3] %s done in %.1fs -> %s (%d detection frames)",
              sample_id, elapsed, det_path, len(detections))
