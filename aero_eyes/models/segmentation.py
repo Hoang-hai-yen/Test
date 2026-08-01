@@ -98,14 +98,24 @@ class MobileSAMSegmenter:
             image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
             self._predictor.set_image(image_rgb)
 
-            # Use a central point prompt — good heuristic for reference images
-            # where the subject is typically centred
+            # Central point prompt (good heuristic: reference photos are
+            # typically subject-centred) COMBINED WITH a near-full-frame box
+            # prompt. A lone point prompt often locks onto a small sub-part
+            # of the object (a logo, a highlight, a shadow) instead of the
+            # whole thing, especially with multimask_output picking whichever
+            # candidate scores highest -- not necessarily the whole subject.
+            # The box anchors SAM to "segment the dominant thing filling
+            # roughly this region", which is far more reliable for close-up
+            # reference photos where the subject fills most of the frame.
             cx, cy = w // 2, h // 2
             point_coords = np.array([[cx, cy]])
             point_labels = np.array([1])
+            margin = 0.05
+            box = np.array([w * margin, h * margin, w * (1 - margin), h * (1 - margin)])
             masks, scores, _ = self._predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
+                box=box,
                 multimask_output=True,
             )
             # Pick the highest-scoring mask
