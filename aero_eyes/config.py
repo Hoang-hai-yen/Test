@@ -63,6 +63,14 @@ class SegmentationConfig(BaseModel):
     model: str = "mobilesam"
     weights: Optional[str] = None
     fallback_if_missing: str = "passthrough"
+    min_area_frac: float = 0.05
+    max_area_frac: float = 0.95
+    # Among SAM's 3 candidates, restrict the "prefer largest" pick to those
+    # scoring within this ratio of the best score -- prevents a low-confidence
+    # but merely area-plausible candidate (background bleeding into the mask)
+    # from winning just for being big. 1.0 = only the single best-scoring
+    # candidate is eligible (falls back to old highest-score behavior).
+    score_ratio_floor: float = 0.85
 
 
 class FeatureExtractorConfig(BaseModel):

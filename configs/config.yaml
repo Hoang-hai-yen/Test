@@ -189,6 +189,14 @@ stage123_geco2:
     model: mobilesam
     weights: null
     fallback_if_missing: passthrough
+    min_area_frac: 0.05    # reject a mask smaller than this fraction of the frame
+    max_area_frac: 0.95    # reject a mask larger than this fraction of the frame
+    # Of SAM's 3 candidate masks, only ones scoring within this ratio of the
+    # best score are eligible for the "prefer largest" pick -- raise toward
+    # 1.0 if masks are still bleeding into background (over-segmenting);
+    # lower toward 0.0 if masks are still cutting off part of the object
+    # (under-segmenting).
+    score_ratio_floor: 0.85
   image_size: 1024
   emb_dim: 256
   kernel_dim: 3

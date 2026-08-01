@@ -132,6 +132,9 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             segmenter = MobileSAMSegmenter(
                 weights_path=seg_cfg.weights,
                 fallback_if_missing=seg_cfg.fallback_if_missing,
+                min_area_frac=seg_cfg.min_area_frac,
+                max_area_frac=seg_cfg.max_area_frac,
+                score_ratio_floor=seg_cfg.score_ratio_floor,
             )
             masks = [segmenter.segment(img) for img in ref_imgs]
             # Tight box around the actual segmented object, BEFORE downscale --

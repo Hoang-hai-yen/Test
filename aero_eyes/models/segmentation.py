@@ -17,7 +17,8 @@ class MobileSAMSegmenter:
     """Segment the largest/most-central object in a reference image."""
 
     def __init__(self, weights_path: str | None = None, fallback_if_missing: str = "passthrough",
-                 min_area_frac: float = 0.05, max_area_frac: float = 0.95):
+                 min_area_frac: float = 0.05, max_area_frac: float = 0.95,
+                 score_ratio_floor: float = 0.85):
         self.weights_path = weights_path
         self.fallback_if_missing = fallback_if_missing
         # Guardrail: a single center-point prompt sometimes locks onto a tiny
@@ -28,6 +29,11 @@ class MobileSAMSegmenter:
         # downstream.
         self.min_area_frac = min_area_frac
         self.max_area_frac = max_area_frac
+        # Among area-plausible candidates, only "largest wins" among those
+        # SAM itself scored within this ratio of the best -- otherwise the
+        # largest candidate can be a low-confidence over-segmentation that
+        # bleeds into the background.
+        self.score_ratio_floor = score_ratio_floor
         self._sam = None
         self._predictor = None
         self._available = False
@@ -123,15 +129,24 @@ class MobileSAMSegmenter:
             # SAM's own predicted-IoU score does NOT reliably track "most
             # complete" -- a smaller, cleaner-edged sub-part regularly
             # outscores the full object, which was cutting off most of the
-            # subject in practice. For a close-up reference photo (one
-            # dominant subject filling most of the frame) the LARGEST
-            # candidate that still respects the area guardrails is almost
-            # always the more correct pick, so prefer that; only fall back
-            # to the highest-scoring candidate if none pass the area bounds
-            # (keeps the same "reject implausible mask" safety net below).
+            # subject in practice. But blindly picking the LARGEST
+            # area-plausible candidate overcorrects the other way: it can
+            # pick a low-confidence candidate that bled into the background
+            # just because it happens to be big ("cut too much excess").
+            # So: only let "prefer largest" pick among candidates SAM itself
+            # scored within score_ratio_floor of the best score; among
+            # those, take the largest. Falls back to the single
+            # highest-scoring candidate if nothing clears both bars.
             areas = [float(m.astype(bool).mean()) for m in masks]
-            plausible = [i for i, a in enumerate(areas)
-                         if self.min_area_frac <= a <= self.max_area_frac]
+            max_score = float(np.max(scores))
+            confident = [
+                i for i, s in enumerate(scores)
+                if s >= max_score * self.score_ratio_floor
+            ]
+            plausible = [
+                i for i in confident
+                if self.min_area_frac <= areas[i] <= self.max_area_frac
+            ]
             if plausible:
                 best_idx = max(plausible, key=lambda i: areas[i])
             else:
