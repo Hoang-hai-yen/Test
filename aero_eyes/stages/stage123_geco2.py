@@ -30,6 +30,22 @@ from aero_eyes.types import Detection
 log = logging.getLogger(__name__)
 
 
+def _apply_ref_downscale(img, downscale_factor: float):
+    """Shrink-then-upscale-back a reference image to narrow the
+    ground-to-aerial domain gap (close-up ref photos are otherwise much
+    crisper/larger-looking than how the object appears in the drone video).
+    No-op at the default 1.0 (mirrors stage1._apply_aerial_sim's downscale
+    step, minus the blur -- not needed here).
+    """
+    if downscale_factor >= 1.0:
+        return img
+    h, w = img.shape[:2]
+    small_w = max(1, int(round(w * downscale_factor)))
+    small_h = max(1, int(round(h * downscale_factor)))
+    small = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def _load_ref_images(cfg, sample_id: str) -> list:
     data_root = Path(cfg.data.data_root)
     refs_dir = data_root / sample_id / cfg.data.refs_subdir
@@ -73,6 +89,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
         prototype = GeCo2Detector.load_prototype(proto_path)
     else:
         ref_imgs = _load_ref_images(cfg, sample_id)
+        ref_imgs = [_apply_ref_downscale(img, g.ref_downscale_factor) for img in ref_imgs]
         prototype = detector.encode_exemplars(ref_imgs)
         GeCo2Detector.save_prototype(prototype, proto_path)
         log.info("[Stage123-GeCo2] %s: encoded %d reference exemplars -> %s",

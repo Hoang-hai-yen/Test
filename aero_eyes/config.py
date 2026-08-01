@@ -277,6 +277,12 @@ class Stage123Geco2Config(BaseModel):
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
     prototype_cache_name: str = "geco2_prototype.pt"
+    # Shrink-then-upscale-back each reference image before encoding it as an
+    # exemplar, to narrow the ground-to-aerial domain gap (close-up ref
+    # photos are otherwise much crisper/larger-looking than how the object
+    # actually appears in the drone video). 1.0 = no-op (default).
+    # e.g. 0.25 = shrink to 1/4 size then upscale back before encoding.
+    ref_downscale_factor: float = 1.0
 
 
 # ---------------------------------------------------------------------------
