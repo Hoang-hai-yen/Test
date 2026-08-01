@@ -108,7 +108,18 @@ class GeCo2Detector:
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing:
-            log.warning("GeCo2 checkpoint missing %d params (using random init for those)", len(missing))
+            # Group by top-level submodule (e.g. "sam_mask.*") so it's obvious
+            # at a glance whether the gap is confined to sam_mask -- the mask
+            # refinement submodule this wrapper never calls (detect_frame/
+            # encode_exemplars only use boxes+scores) -- or spills into
+            # something actually load-bearing like backbone/adapt_features.
+            prefixes = sorted({k.split(".")[0] for k in missing})
+            log.warning("GeCo2 checkpoint missing %d params (random init for those), "
+                        "grouped by submodule: %s", len(missing), prefixes)
+        if unexpected:
+            log.warning("GeCo2 checkpoint has %d unused params not in the model "
+                        "(ignored): %s", len(unexpected),
+                        sorted({k.split(".")[0] for k in unexpected}))
         self.model.eval()
         log.info("GeCo2 loaded from %s on %s", g.weights_path, self.device)
 
