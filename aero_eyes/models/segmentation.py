@@ -75,6 +75,28 @@ class MobileSAMSegmenter:
                 ) from e
 
     @staticmethod
+    def _isolate_component_at_point(mask: np.ndarray, px: int, py: int) -> np.ndarray:
+        """Keep only the connected component touching (px, py) (the point
+        prompt) -- discards any disconnected blob SAM tacked on elsewhere in
+        the frame (e.g. a same-colored patch of background), even if that
+        blob is large enough to pass the area/score gates below. Falls back
+        to the largest component if the point itself isn't foreground in
+        this particular mask.
+        """
+        mask_u8 = mask.astype(np.uint8)
+        num_labels, labels = cv2.connectedComponents(mask_u8, connectivity=8)
+        if num_labels <= 2:  # 0=background + at most 1 foreground component
+            return mask
+        py = min(max(py, 0), mask.shape[0] - 1)
+        px = min(max(px, 0), mask.shape[1] - 1)
+        label_at_point = labels[py, px]
+        if label_at_point == 0:
+            counts = np.bincount(labels.ravel())
+            counts[0] = 0
+            label_at_point = int(np.argmax(counts))
+        return labels == label_at_point
+
+    @staticmethod
     def _file_exists(path: str) -> bool:
         import os
         return os.path.isfile(path)
@@ -124,6 +146,20 @@ class MobileSAMSegmenter:
                 box=box,
                 multimask_output=True,
             )
+            # Strip any blob not connected to the point prompt FIRST, for
+            # every candidate -- SAM sometimes tacks on a same-colored patch
+            # of background as a disjoint extra region within an otherwise
+            # correct mask. Left in, that blob inflates the candidate's area
+            # and makes it win the "prefer largest" comparison below purely
+            # for being big, even though it's the highest-scoring candidate
+            # that is bloated, not the tight one (confirmed by inspecting
+            # real SAM output: the highest-score, largest-area candidate had
+            # a disconnected background chunk; a lower-scoring, smaller
+            # candidate was the correct, tight one -- no score/area
+            # threshold on the RAW masks can prefer the latter, only
+            # cleaning first can).
+            cleaned = [self._isolate_component_at_point(m, cx, cy) for m in masks]
+
             # multimask_output=True returns 3 candidates at different
             # granularities (roughly: whole object / a part / a sub-part).
             # SAM's own predicted-IoU score does NOT reliably track "most
@@ -135,9 +171,9 @@ class MobileSAMSegmenter:
             # just because it happens to be big ("cut too much excess").
             # So: only let "prefer largest" pick among candidates SAM itself
             # scored within score_ratio_floor of the best score; among
-            # those, take the largest. Falls back to the single
-            # highest-scoring candidate if nothing clears both bars.
-            areas = [float(m.astype(bool).mean()) for m in masks]
+            # those, take the largest (by CLEANED area). Falls back to the
+            # single highest-scoring candidate if nothing clears both bars.
+            areas = [float(m.mean()) for m in cleaned]
             max_score = float(np.max(scores))
             confident = [
                 i for i, s in enumerate(scores)
@@ -151,7 +187,7 @@ class MobileSAMSegmenter:
                 best_idx = max(plausible, key=lambda i: areas[i])
             else:
                 best_idx = int(np.argmax(scores))
-            mask = masks[best_idx].astype(bool)
+            mask = cleaned[best_idx]
             area_frac = mask.mean()
             if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
                 log.warning(
