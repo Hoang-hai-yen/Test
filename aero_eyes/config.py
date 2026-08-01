@@ -263,6 +263,10 @@ class Stage123Geco2Config(BaseModel):
     """
     repo_path: str = "./GECO2"
     weights_path: str = "./GECO2/CNTQG_multitrain_ca44.pth"
+    # Same MobileSAM foreground masking as stage1.segmentation (background
+    # filled with the ref image's own mean color) -- applied before
+    # ref_downscale_factor. Reuses the same SegmentationConfig shape/defaults.
+    segmentation: SegmentationConfig = SegmentationConfig()
     image_size: int = 1024
     emb_dim: int = 256
     kernel_dim: int = 3
@@ -277,11 +281,14 @@ class Stage123Geco2Config(BaseModel):
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
     prototype_cache_name: str = "geco2_prototype.pt"
-    # Shrink-then-upscale-back each reference image before encoding it as an
-    # exemplar, to narrow the ground-to-aerial domain gap (close-up ref
-    # photos are otherwise much crisper/larger-looking than how the object
-    # actually appears in the drone video). 1.0 = no-op (default).
-    # e.g. 0.25 = shrink to 1/4 size then upscale back before encoding.
+    # Shrink each reference image before encoding it as an exemplar, to
+    # narrow the ground-to-aerial domain gap (close-up ref photos are
+    # otherwise much crisper/larger-looking than how the object actually
+    # appears in the drone video). 1.0 = no-op (default). The shrunk image
+    # still gets upscaled back up to stage123_geco2.image_size by
+    # resize_and_pad -- so the effective blur amount depends on how the
+    # shrunk size compares to image_size, not just this factor alone (a
+    # given factor blurs a low-res ref photo far more than a high-res one).
     ref_downscale_factor: float = 1.0
 
 

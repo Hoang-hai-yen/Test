@@ -192,13 +192,14 @@ class GeCo2Detector:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def detect_frame(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> list[Box]:
-        """Run the query-image half of CNT.forward on one frame, cross-attend
-        with the precomputed exemplar tokens, threshold + NMS, and return
-        boxes in absolute pixel coords of `frame_bgr`.
+    def _forward_scores(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]):
+        """Shared by detect_frame() and raw_scores(): run the query-image
+        half of CNT.forward on one frame, cross-attend with the precomputed
+        exemplar tokens, and return the RAW (unfiltered) dense predictions.
+        Returns (pred_boxes [N,4] normalized xyxy in padded canvas, box_v
+        [N] raw score, scale).
         """
         from utils.box_ops import boxes_with_scores  # GECO2/utils/box_ops.py
-        from torchvision.ops import nms as torch_nms
 
         m = self.model
         padded, scale = self._load_and_pad(frame_bgr)
@@ -223,9 +224,42 @@ class GeCo2Detector:
         centerness = m.class_embed(adapted_f).view(bs, w, h, 1).permute(0, 3, 1, 2)
         outputs_coord = m.bbox_embed(adapted_f).sigmoid().view(bs, w, h, 4).permute(0, 3, 1, 2)
         outputs, _ = boxes_with_scores(centerness, outputs_coord, sort=False, validate=True)
+        return outputs[0]["pred_boxes"], outputs[0]["box_v"], scale
 
-        pred_boxes = outputs[0]["pred_boxes"]  # [N,4] normalized xyxy in padded canvas
-        box_v = outputs[0]["box_v"]  # [N] raw score
+    @torch.no_grad()
+    def raw_scores(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> np.ndarray:
+        """Diagnostic only: the raw, unfiltered per-location score map for
+        one frame (before score_threshold_ratio/NMS/top-K), as a flat
+        numpy array. Use this to check whether GeCo2's score actually
+        separates "target present" from "target absent" frames on your own
+        data -- see scripts/check_geco2_score_separation.py. GeCo2 is
+        trained/evaluated on FSC147, a counting benchmark where every image
+        is guaranteed to contain >=1 instance of the counted class, so it
+        may never have learned what a genuine "absent" frame should score
+        like; our pipeline's threshold is RELATIVE to each frame's own max
+        score (see detect_frame below), so on its own it cannot express
+        "nothing here" -- it always keeps at least the single highest-
+        scoring point.
+        """
+        _, box_v, _ = self._forward_scores(frame_bgr, prototype)
+        return box_v.cpu().numpy()
+
+    @torch.no_grad()
+    def detect_frame(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> list[Box]:
+        """Run the query-image half of CNT.forward on one frame, cross-attend
+        with the precomputed exemplar tokens, threshold + NMS, and return
+        boxes in absolute pixel coords of `frame_bgr`.
+
+        NOTE: score_threshold_ratio is RELATIVE to this frame's own max
+        score -- there is no absolute floor, so this always returns at
+        least one box whenever box_v.max() > 0, even on frames where the
+        target genuinely isn't present. See raw_scores() above and
+        scripts/check_geco2_score_separation.py before trusting this on
+        frames you expect to be mostly empty.
+        """
+        from torchvision.ops import nms as torch_nms
+
+        pred_boxes, box_v, scale = self._forward_scores(frame_bgr, prototype)
         if pred_boxes.numel() == 0:
             return []
 
