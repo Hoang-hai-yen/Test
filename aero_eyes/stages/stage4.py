@@ -25,6 +25,44 @@ from aero_eyes.types import Box
 log = logging.getLogger(__name__)
 
 
+class _DetectionConfirmer:
+    """Requires `required_hits` consecutive, spatially-agreeing detector
+    hits before trusting one -- see DetectionConfirmationConfig (config.py)
+    for why. A hit that disagrees with the pending one (IoU below
+    iou_threshold) restarts the streak from that new hit rather than
+    discarding it outright, so a real object that has moved since the last
+    detect attempt is not penalized for it.
+    """
+
+    def __init__(self, required_hits: int, iou_threshold: float):
+        self.required_hits = max(1, required_hits)
+        self.iou_threshold = iou_threshold
+        self._pending_box: Box | None = None
+        self._pending_hits = 0
+
+    def offer(self, box: Box) -> Box | None:
+        """Feed one detector hit. Returns the box once `required_hits`
+        consecutive hits have agreed; otherwise None (still pending)."""
+        from aero_eyes.utils.geometry import box_iou
+
+        if self._pending_box is not None and box_iou(self._pending_box, box) >= self.iou_threshold:
+            self._pending_hits += 1
+        else:
+            self._pending_hits = 1
+        self._pending_box = box
+        if self._pending_hits >= self.required_hits:
+            self._pending_box = None
+            self._pending_hits = 0
+            return box
+        return None
+
+    def reset(self) -> None:
+        """Call on a frame/attempt where the detector found nothing at all
+        -- a gap breaks the "consecutive" streak."""
+        self._pending_box = None
+        self._pending_hits = 0
+
+
 def run_stage4(cfg, sample_id: str) -> Path:
     """Run Stage 4. Returns path to tracks.json."""
     from aero_eyes.models.trackers import NoneTracker, build_tracker
@@ -111,6 +149,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
     tracks: dict[int, Box | None] = {}
     tracker_active = False
     track_age = 0
+    confirm_cfg = s4.confirm_detections
+    confirmer = (
+        _DetectionConfirmer(confirm_cfg.required_hits, confirm_cfg.iou_threshold)
+        if confirm_cfg.enabled else None
+    )
 
     try:
         for frame_idx, frame_bgr in frame_iterator(video_path):
@@ -120,25 +163,39 @@ def run_stage4(cfg, sample_id: str) -> Path:
             if is_none_tracker:
                 # Re-detect every frame
                 if use_geco2:
-                    box_out, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
+                    raw_box, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
                 else:
-                    box_out, source = _detect_on_frame(
+                    raw_box, source = _detect_on_frame(
                         frame_bgr, frame_idx, proposal_model, extractor,
                         prototype, per_ref_features, cfg, match_threshold
                     )
+                if confirmer is None:
+                    box_out = raw_box
+                elif raw_box is None:
+                    confirmer.reset()
+                    box_out, source = None, "none"
+                else:
+                    box_out = confirmer.offer(raw_box)
+                    source = "detect" if box_out is not None else "none"
             else:
                 if frame_idx in kf_set:
                     # Initialize or re-initialize tracker from detection
                     dets = detections[frame_idx]
                     if dets:
-                        best = max(dets, key=lambda d: d.similarity)
-                        tracker.init(frame_bgr, best.box)
-                        tracker_active = True
-                        track_age = 0
-                        box_out = best.box
-                        source = "detect"
+                        candidate = max(dets, key=lambda d: d.similarity).box
+                        confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
+                        if confirmed is not None:
+                            tracker.init(frame_bgr, confirmed)
+                            tracker_active = True
+                            track_age = 0
+                            box_out = confirmed
+                            source = "detect"
+                        else:
+                            tracker_active = False
                     else:
                         tracker_active = False
+                        if confirmer is not None:
+                            confirmer.reset()
                 elif tracker_active:
                     box, conf = tracker.update(frame_bgr)
                     track_age += 1
@@ -153,7 +210,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         if use_geco2:
                             if geco2_detector is None:
                                 geco2_detector, geco2_prototype = _load_geco2(cfg, work_dir)
-                            box_out, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
+                            raw_box, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
                         else:
                             if proposal_model is None:
                                 # Lazy-init for re-detect fallback
@@ -166,10 +223,19 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 if proto_path.exists():
                                     prototype, _, per_ref_features = read_prototype(proto_path)
 
-                            box_out, source = _detect_on_frame(
+                            raw_box, source = _detect_on_frame(
                                 frame_bgr, frame_idx, proposal_model, extractor,
                                 prototype, per_ref_features, cfg, match_threshold
                             )
+                        if confirmer is None:
+                            box_out = raw_box
+                        elif raw_box is None:
+                            confirmer.reset()
+                            box_out = None
+                        else:
+                            box_out = confirmer.offer(raw_box)
+                            if box_out is None:
+                                source = "none"
                         if box_out is not None:
                             tracker.init(frame_bgr, box_out)
                             tracker_active = True

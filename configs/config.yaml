@@ -252,6 +252,22 @@ stage4:
   tracker_conf_threshold: 0.40   # τ: below this → re-detect immediately
   max_track_age: 30          # frames a track survives without re-detection
 
+  # A single spurious "detect" (keyframe hit, or re-detect after track loss)
+  # can spawn a tracker that survives up to max_track_age frames -- far
+  # longer than stage5.min_tube_length can filter out. Matters most for
+  # pipeline.detector=geco2, whose per-frame score is relative-only (see
+  # scripts/check_geco2_score_separation.py) and so structurally cannot
+  # express "target absent this frame". When enabled, a detect is not
+  # trusted (tracker not (re)initialized) until `required_hits` consecutive
+  # detect attempts agree spatially (IoU >= iou_threshold) -- attacks the
+  # amplification directly, independent of whether the detector's raw score
+  # separates present/absent. Off by default (does not change existing
+  # runs); applies to both legacy and geco2 detectors (shared tracking loop).
+  confirm_detections:
+    enabled: false
+    required_hits: 2
+    iou_threshold: 0.3
+
 # ----------------------------------------------------------------------------
 # STAGE 5 — Spatio-temporal output
 # ----------------------------------------------------------------------------

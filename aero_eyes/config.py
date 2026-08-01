@@ -194,12 +194,39 @@ class LiteTrackConfig(BaseModel):
     input_size: int = 256
 
 
+class DetectionConfirmationConfig(BaseModel):
+    """Guards against a SINGLE spurious detection getting amplified into a
+    long false track: a detector "hit" (whether the initial keyframe scan
+    or a re-detect after track loss) is not trusted until `required_hits`
+    consecutive hits agree spatially (IoU >= iou_threshold). Only then does
+    Stage 4 initialize/re-initialize the tracker from it.
+
+    Matters most for GeCo2 (pipeline.detector=geco2): its per-frame score
+    is threshold RELATIVE to that frame's own max, so it structurally
+    always returns >=1 box -- on data where the score doesn't separate
+    "target present" from "target absent" (see
+    scripts/check_geco2_score_separation.py), a single stray keyframe hit
+    can spawn a tracker.builtin (CSRT) track that survives up to
+    max_track_age frames, which stage5.min_tube_length (typically 2) is far
+    too small to catch since the false track isn't short. Requiring N
+    agreeing hits before trusting a detection attacks that amplification
+    directly, independent of whether the detector's raw score is separable.
+
+    Applies identically to the legacy and geco2 detectors (Stage 4's
+    tracking loop is shared).
+    """
+    enabled: bool = False
+    required_hits: int = 2
+    iou_threshold: float = 0.3
+
+
 class Stage4Config(BaseModel):
     tracker: str = "builtin"
     builtin: BuiltinTrackerConfig = BuiltinTrackerConfig()
     litetrack: LiteTrackConfig = LiteTrackConfig()
     tracker_conf_threshold: float = 0.40
     max_track_age: int = 30
+    confirm_detections: DetectionConfirmationConfig = DetectionConfirmationConfig()
 
     @field_validator("tracker")
     @classmethod
