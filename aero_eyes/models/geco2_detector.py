@@ -91,6 +91,7 @@ class GeCo2Detector:
         self.device = torch.device(cfg.device())
         self.image_size = float(g.image_size)
         self.score_threshold_ratio = g.score_threshold_ratio
+        self.score_threshold_abs = g.score_threshold_abs
         self.nms_iou = g.nms_iou
         self.topk_per_keyframe = g.topk_per_keyframe
 
@@ -281,12 +282,15 @@ class GeCo2Detector:
         with the precomputed exemplar tokens, threshold + NMS, and return
         boxes in absolute pixel coords of `frame_bgr`.
 
-        NOTE: score_threshold_ratio is RELATIVE to this frame's own max
-        score -- there is no absolute floor, so this always returns at
-        least one box whenever box_v.max() > 0, even on frames where the
-        target genuinely isn't present. See raw_scores() above and
-        scripts/check_geco2_score_separation.py before trusting this on
-        frames you expect to be mostly empty.
+        score_threshold_ratio alone is RELATIVE to this frame's own max
+        score, so on its own it always returns at least one box whenever
+        box_v.max() > 0 -- it cannot express "target absent this frame".
+        score_threshold_abs adds an ABSOLUTE floor on that per-frame max: if
+        the frame's best score doesn't even clear this, the whole frame is
+        treated as empty (returns []) regardless of the relative ratio.
+        Calibrate it with scripts/check_geco2_score_separation.py on your
+        own present/absent-labeled frames -- default 0.0 keeps the old
+        always-detects-something behavior.
         """
         from torchvision.ops import nms as torch_nms
 
@@ -294,7 +298,11 @@ class GeCo2Detector:
         if pred_boxes.numel() == 0:
             return []
 
-        keep_mask = box_v > (box_v.max() * self.score_threshold_ratio)
+        max_score = box_v.max()
+        if max_score < self.score_threshold_abs:
+            return []
+
+        keep_mask = box_v > (max_score * self.score_threshold_ratio)
         if not bool(keep_mask.any()):
             return []
         cand_boxes = torch.clamp(pred_boxes[keep_mask], 0, 1)

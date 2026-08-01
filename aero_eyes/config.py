@@ -291,6 +291,16 @@ class Stage123Geco2Config(BaseModel):
     # like stage3.match_threshold -- see GECO2/demo_gradio.py's threshold
     # slider, default 0.33, for the reference implementation this mirrors).
     score_threshold_ratio: float = 0.33
+    # Absolute floor on a frame's OWN max score (box_v.max()), independent of
+    # score_threshold_ratio above -- GeCo2 was trained/evaluated on FSC147
+    # where every image guarantees >=1 instance of the counted class, so the
+    # relative-only ratio structurally cannot express "target absent this
+    # frame" (it always keeps >=1 box whenever max score > 0). If the frame's
+    # peak score doesn't clear this floor, detect_frame() returns no boxes
+    # for that frame at all. 0.0 = disabled (old always-detects-something
+    # behavior). Calibrate with scripts/check_geco2_score_separation.py on
+    # your own present/absent-labeled frames -- do NOT guess a value blind.
+    score_threshold_abs: float = 0.0
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
     prototype_cache_name: str = "geco2_prototype.pt"

@@ -214,6 +214,16 @@ stage123_geco2:
   # this can't be a fixed absolute cutoff. 0.33 mirrors GECO2/demo_gradio.py's
   # default threshold slider value.
   score_threshold_ratio: 0.33
+  # Absolute floor on a frame's OWN max score, independent of the ratio
+  # above -- GeCo2 was trained on FSC147 where every image guarantees an
+  # instance of the counted class, so score_threshold_ratio ALONE can never
+  # express "target absent this frame" (it always keeps >=1 box whenever
+  # max score > 0). If a frame's peak score doesn't clear this floor, no
+  # boxes are returned for that frame at all. 0.0 = disabled (old behavior).
+  # DO NOT guess this value -- run scripts/check_geco2_score_separation.py
+  # on your own present/absent-labeled frames first, then set it just above
+  # the highest score seen on a genuinely "absent" frame (with margin).
+  score_threshold_abs: 0.0
   nms_iou: 0.5
   topk_per_keyframe: 5
   prototype_cache_name: geco2_prototype.pt   # cached exemplar tokens (torch, not prototype.npz)

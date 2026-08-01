@@ -53,8 +53,7 @@ def _print_stats(label: str, scores: list[float]) -> None:
 
 
 def check_sample(cfg, sample_id: str, detector, num_samples: int) -> None:
-    from aero_eyes.models.geco2_detector import GeCo2Detector
-    from aero_eyes.stages.stage123_geco2 import _apply_ref_downscale, _load_ref_images
+    from aero_eyes.stages.stage123_geco2 import build_exemplar_prototype
     from aero_eyes.utils.io import load_gt
     from aero_eyes.utils.video import frame_iterator, video_info
 
@@ -84,15 +83,12 @@ def check_sample(cfg, sample_id: str, detector, num_samples: int) -> None:
         print(f"{sample_id}: every frame has a GT box -- nothing to compare against, skipping.")
         return
 
-    g = cfg.stage123_geco2
     work_dir = Path(cfg.project.work_dir) / sample_id
-    proto_path = work_dir / g.prototype_cache_name
-    if proto_path.exists():
-        prototype = GeCo2Detector.load_prototype(proto_path)
-    else:
-        ref_imgs = _load_ref_images(cfg, sample_id)
-        ref_imgs = [_apply_ref_downscale(img, g.ref_downscale_factor) for img in ref_imgs]
-        prototype = detector.encode_exemplars(ref_imgs)
+    # Same build as the real pipeline (MobileSAM masking + tight exemplar
+    # box when enabled) -- using a simpler/different exemplar here would
+    # make these scores not representative of what run_stage123_geco2
+    # actually sees, defeating the point of calibrating against it.
+    prototype = build_exemplar_prototype(cfg, sample_id, detector, work_dir)
 
     present_scores: list[float] = []
     absent_scores: list[float] = []

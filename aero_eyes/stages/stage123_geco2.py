@@ -94,6 +94,68 @@ def _load_ref_images(cfg, sample_id: str) -> list:
     return [cv2.imread(str(p)) for p in ref_paths]
 
 
+def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
+    """Exemplar-token build shared by run_stage123_geco2() (below) and
+    scripts/check_geco2_score_separation.py, so the diagnostic script always
+    scores against the SAME exemplar quality (MobileSAM-masked + tight box)
+    the real pipeline uses -- building it any simpler here would make that
+    script's calibration numbers not representative of a real run.
+
+    Uses/writes the same on-disk cache (work_dir/prototype_cache_name) as
+    run_stage123_geco2, respecting cfg.project.use_cache.
+    """
+    from aero_eyes.models.geco2_detector import GeCo2Detector
+    from aero_eyes.utils import viz as vizmod
+
+    g = cfg.stage123_geco2
+    proto_path = work_dir / g.prototype_cache_name
+    if cfg.project.use_cache and proto_path.exists():
+        log.info("[Stage123-GeCo2] %s: using cached exemplar tokens at %s", sample_id, proto_path)
+        return GeCo2Detector.load_prototype(proto_path)
+
+    ref_imgs = _load_ref_images(cfg, sample_id)
+
+    # Exemplar box passed to encode_exemplars(), in the coord system of
+    # whichever ref_imgs actually get passed to it (i.e. post-downscale
+    # below). None = whole image (encode_exemplars' default).
+    ref_boxes: list[tuple[float, float, float, float] | None] | None = None
+
+    seg_cfg = g.segmentation
+    if seg_cfg.enabled:
+        from aero_eyes.models.segmentation import MobileSAMSegmenter
+        segmenter = MobileSAMSegmenter(
+            weights_path=seg_cfg.weights,
+            fallback_if_missing=seg_cfg.fallback_if_missing,
+            min_area_frac=seg_cfg.min_area_frac,
+            max_area_frac=seg_cfg.max_area_frac,
+            score_ratio_floor=seg_cfg.score_ratio_floor,
+            max_border_touch_frac=seg_cfg.max_border_touch_frac,
+        )
+        masks = [segmenter.segment(img) for img in ref_imgs]
+        # Tight box around the actual segmented object, BEFORE downscale --
+        # RoI-align-ing the whole (masked) image instead pools in a lot of
+        # mean-color-filled background + any resize_and_pad zero-padding,
+        # diluting the exemplar token (empirically confirmed to matter).
+        raw_boxes = [_mask_bbox(m) for m in masks]
+        ref_imgs = [_apply_mask(img, m) for img, m in zip(ref_imgs, masks)]
+        if cfg.runtime.save_visualizations:
+            vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+        # Scale into the coord system _apply_ref_downscale below produces
+        # (uniform factor in both axes, matching that function).
+        f = g.ref_downscale_factor
+        ref_boxes = [
+            tuple(c * f for c in b) if b is not None else None
+            for b in raw_boxes
+        ]
+
+    ref_imgs = [_apply_ref_downscale(img, g.ref_downscale_factor) for img in ref_imgs]
+    prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
+    GeCo2Detector.save_prototype(prototype, proto_path)
+    log.info("[Stage123-GeCo2] %s: encoded %d reference exemplars -> %s",
+             sample_id, len(ref_imgs), proto_path)
+    return prototype
+
+
 def run_stage123_geco2(cfg, sample_id: str) -> Path:
     """Run the merged GeCo2 stage for one sample. Returns path to detections.json."""
     from aero_eyes.models.geco2_detector import GeCo2Detector
@@ -110,55 +172,8 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
         log.info("[Stage123-GeCo2] %s: using cached detections at %s", sample_id, det_path)
         return det_path
 
-    g = cfg.stage123_geco2
     detector = GeCo2Detector(cfg)
-
-    # ---- Exemplar tokens (Stage 1 equivalent), cached like prototype.npz ----
-    proto_path = work_dir / g.prototype_cache_name
-    if cfg.project.use_cache and proto_path.exists():
-        log.info("[Stage123-GeCo2] %s: using cached exemplar tokens at %s", sample_id, proto_path)
-        prototype = GeCo2Detector.load_prototype(proto_path)
-    else:
-        ref_imgs = _load_ref_images(cfg, sample_id)
-
-        # Exemplar box passed to encode_exemplars(), in the coord system of
-        # whichever ref_imgs actually get passed to it (i.e. post-downscale
-        # below). None = whole image (encode_exemplars' default).
-        ref_boxes: list[tuple[float, float, float, float] | None] | None = None
-
-        seg_cfg = g.segmentation
-        if seg_cfg.enabled:
-            from aero_eyes.models.segmentation import MobileSAMSegmenter
-            segmenter = MobileSAMSegmenter(
-                weights_path=seg_cfg.weights,
-                fallback_if_missing=seg_cfg.fallback_if_missing,
-                min_area_frac=seg_cfg.min_area_frac,
-                max_area_frac=seg_cfg.max_area_frac,
-                score_ratio_floor=seg_cfg.score_ratio_floor,
-                max_border_touch_frac=seg_cfg.max_border_touch_frac,
-            )
-            masks = [segmenter.segment(img) for img in ref_imgs]
-            # Tight box around the actual segmented object, BEFORE downscale --
-            # RoI-align-ing the whole (masked) image instead pools in a lot of
-            # mean-color-filled background + any resize_and_pad zero-padding,
-            # diluting the exemplar token (empirically confirmed to matter).
-            raw_boxes = [_mask_bbox(m) for m in masks]
-            ref_imgs = [_apply_mask(img, m) for img, m in zip(ref_imgs, masks)]
-            if cfg.runtime.save_visualizations:
-                vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
-            # Scale into the coord system _apply_ref_downscale below produces
-            # (uniform factor in both axes, matching that function).
-            f = g.ref_downscale_factor
-            ref_boxes = [
-                tuple(c * f for c in b) if b is not None else None
-                for b in raw_boxes
-            ]
-
-        ref_imgs = [_apply_ref_downscale(img, g.ref_downscale_factor) for img in ref_imgs]
-        prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
-        GeCo2Detector.save_prototype(prototype, proto_path)
-        log.info("[Stage123-GeCo2] %s: encoded %d reference exemplars -> %s",
-                 sample_id, len(ref_imgs), proto_path)
+    prototype = build_exemplar_prototype(cfg, sample_id, detector, work_dir)
 
     # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
@@ -173,7 +188,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     total_frames = info["total_frames"]
     log.info("[Stage123-GeCo2] %s: video=%s (%d frames)", sample_id, video_path.name, total_frames)
 
-    kf_indices = set(keyframe_indices(total_frames, g.keyframe_interval))
+    kf_indices = set(keyframe_indices(total_frames, cfg.stage123_geco2.keyframe_interval))
     viz_dir = work_dir / "viz" / "stage123_geco2"
 
     detections: dict[int, list[Detection]] = {}
