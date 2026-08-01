@@ -18,6 +18,11 @@ volume).
 | 4 | Tracking between keyframes | **builtin / litetrack / none** | `tracker`, `tracker_conf_threshold` (τ) |
 | 5 | Spatio-temporal output | tube build + smoothing + submission | smoothing, gap fill |
 
+Stage 1+2+3 can alternatively be replaced wholesale by a single merged
+stage that runs the vendored [`GECO2/`](GECO2/README.md) few-shot exemplar
+detector (`pipeline.detector: geco2`) — see `stage123_geco2` in
+`configs/config.yaml`.
+
 ## Install
 
 ```bash
@@ -43,6 +48,12 @@ python -m aero_eyes.evaluate --pred runs/exp001/s001/submission.json \
     --gt data/s001/gt.json --config configs/config.yaml
 ```
 
+`run_all` also merges every sample's own `submission.json` into
+`<work_dir>/submission_all.json` once all requested samples finish
+(upserted by `video_id`, so re-running a subset only touches their own
+entries) — pass `--no-merge` to skip it, or re-run just this step later
+with `python -m scripts.merge_submissions --config configs/config.yaml`.
+
 Override any config field inline:
 
 ```bash
@@ -52,6 +63,11 @@ python -m aero_eyes.stages.stage2 --config configs/config.yaml --sample s001 \
 
 ## Key config switches (`configs/config.yaml`)
 
+- `pipeline.detector`: `legacy` (Stage1/2/3 below) | `geco2` (single merged
+  stage using the vendored `GECO2/` few-shot exemplar detector in place of
+  Stage 1+2+3 — see `stage123_geco2.*`; requires `GECO2/`'s own deps
+  installed and its pretrained weights downloaded, see `GECO2/README.md`).
+  Stage 4/5 run unchanged either way.
 - `stage2.proposal_model`: `yolov11n` | `fastsam_s` (YOLOv8 not allowed)
 - `stage2.sahi.use_sahi`: SAHI tiling on/off
 - `stage4.tracker`: `builtin` (default, no extra weights) | `litetrack`

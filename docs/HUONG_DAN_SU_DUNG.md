@@ -248,6 +248,16 @@ Mỗi stage đọc artifact từ stage trước (trên disk) và ghi artifact c�
 .venv\Scripts\python -m aero_eyes.stages.stage5 --config configs/config.yaml --sample Backpack_0
 ```
 
+Sau khi chạy xong tất cả sample, `run_all` tự động **gộp** từng
+`submission.json` riêng của mỗi sample thành 1 file
+`runs/exp001/submission_all.json` (upsert theo `video_id` — chạy lại 1
+sample chỉ cập nhật đúng entry của sample đó, không tạo trùng lặp). Bỏ qua
+bước này bằng `--no-merge`, hoặc chạy lại riêng khi cần (không cần chạy lại
+cả pipeline):
+```powershell
+.venv\Scripts\python -m scripts.merge_submissions --config configs/config.yaml
+```
+
 ### Cách 3 — Tiếp tục từ stage bị lỗi
 
 Nếu pipeline chạy được đến stage 3 rồi bị lỗi, không cần chạy lại từ đầu:
@@ -291,7 +301,13 @@ File cấu hình chính: `configs/config.yaml`
 data:
   data_root: ./data            # ← đổi đường dẫn dataset ở đây
 
-# Model đề xuất candidate (chọn 1 trong 2, không dùng YOLOv8)
+# Chọn engine cho Stage 1+2+3
+pipeline:
+  detector: legacy             # "legacy" (Stage1/2/3 DINOv2+YOLO/FastSAM)
+                                # | "geco2" (gộp Stage1+2+3 thành 1 bước,
+                                #   dùng model GeCo2 trong thư mục GECO2/)
+
+# Model đề xuất candidate (chọn 1 trong 2, không dùng YOLOv8) — chỉ áp dụng khi pipeline.detector=legacy
 stage2:
   proposal_model: yolov11n     # "yolov11n" | "fastsam_s"
   keyframe_interval: 8         # Xử lý 1 frame mỗi N frame
@@ -308,6 +324,47 @@ stage4:
 accuracy:
   mode: baseline               # "baseline" | "cheap_boosters" | "max_accuracy"
 ```
+
+### Dùng GeCo2 thay cho Stage 1+2+3
+
+`GECO2/` là model few-shot exemplar detection/counting đã vendor sẵn trong
+repo (xem `GECO2/README.md`). Khác với DINOv2 (Stage 1 cũ), GeCo2 gộp việc
+sinh candidate box và matching thành 1 bước duy nhất — không cần YOLO/FastSAM
+proposal riêng, không cần cosine-similarity matching riêng. 3 ảnh reference
+được coi là exemplar (mỗi ảnh = 1 exemplar box trọn ảnh, vì ref vốn đã là
+ảnh cận cảnh vật thể).
+
+**Trước khi dùng**, cài dependency riêng của GECO2 và tải trọng số:
+```powershell
+# Trong thư mục GECO2/
+bash install.sh   # hoặc cài thủ công: hydra-core, omegaconf, iopath, sam2 (vendor sẵn trong GECO2/sam2)
+```
+Tải `CNTQG_multitrain_ca44.pth` (xem link trong `GECO2/README.md`) và đặt
+vào `GECO2/CNTQG_multitrain_ca44.pth` (hoặc chỉnh `stage123_geco2.weights_path`).
+
+**Bật switch:**
+```powershell
+.venv\Scripts\python -m aero_eyes.stages.run_all `
+    --config configs/config.yaml `
+    --sample Backpack_0 `
+    --set pipeline.detector=geco2
+```
+
+Pipeline khi đó chạy: 1 stage gộp (thay Stage1+2+3, ghi thẳng
+`detections.json`) → Stage 4 (tracking) → Stage 5 (xuất kết quả) — hoàn
+toàn không đổi cách dùng `run_all`/`--from-stage`/đánh giá ST-IoU ở các mục
+bên dưới.
+
+Các switch riêng của GeCo2 (mục `stage123_geco2` trong `config.yaml`):
+- `score_threshold_ratio` (mặc định 0.33): ngưỡng tương đối theo điểm cao
+  nhất của từng frame (GeCo2 không có thang điểm tuyệt đối chung như
+  `stage3.match_threshold`). Hạ xuống nếu bị 0 detection.
+- `keyframe_interval`, `nms_iou`, `topk_per_keyframe`: cùng ý nghĩa như bên
+  Stage 2/3 cũ.
+
+**Lưu ý:** nhánh GeCo2 không áp dụng SAHI tiling / multi-scale scan lên
+keyframe — vật thể quá nhỏ so với `image_size` (mặc định 1024) có thể bị
+giảm recall so với pipeline legacy.
 
 ### Bảng so sánh mode accuracy
 

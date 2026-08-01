@@ -13,6 +13,16 @@ project:
   seed: 42
 
 # ----------------------------------------------------------------------------
+# PIPELINE — which detector implementation runs Stage 1+2+3.
+# ----------------------------------------------------------------------------
+pipeline:
+  detector: legacy   # <<< "legacy" (Stage1/2/3, this file's stage1/stage2/stage3
+                      #     sections) | "geco2" (single merged stage using the
+                      #     vendored GECO2/ few-shot exemplar detector instead
+                      #     -- see the stage123_geco2 section below).
+                      # Stage4/Stage5 run unchanged either way.
+
+# ----------------------------------------------------------------------------
 # DATA  —  CONFIRM THIS LAYOUT WITH THE USER BEFORE WRITING CODE.
 # These are PLACEHOLDER assumptions; the real schema must be verified.
 # ----------------------------------------------------------------------------
@@ -149,6 +159,42 @@ stage3:
     target_metric: st_iou
     search_range: [0.40, 0.75]
     steps: 8
+
+# ----------------------------------------------------------------------------
+# STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
+# Only used when pipeline.detector == "geco2". Ignores stage1/stage2/stage3
+# above entirely; still produces detections.json for Stage 4/5 to consume.
+#
+# GeCo2 is a single-image few-shot detector: its exemplar boxes normally
+# live INSIDE the image being detected on. aero_eyes' 3 reference images are
+# separate photos, so each is treated as its own exemplar box = the whole
+# image (they're already close-up crops of the target) and encoded
+# independently; see aero_eyes/models/geco2_detector.py for the full
+# rationale. No SAHI tiling / multi-scale scan is applied on the query
+# frame here (accuracy.mode boosters below don't apply to this path) —
+# very small objects may need a smaller keyframe crop for good recall.
+#
+# Requires: the vendored GECO2/ repo's own deps (hydra-core, omegaconf,
+# iopath, its bundled sam2 package -- see GECO2/install.sh) installed, and
+# CNTQG_multitrain_ca44.pth downloaded into weights_path (see GECO2/README.md).
+# ----------------------------------------------------------------------------
+stage123_geco2:
+  repo_path: ./GECO2
+  weights_path: ./GECO2/CNTQG_multitrain_ca44.pth
+  image_size: 1024
+  emb_dim: 256
+  kernel_dim: 3
+  reduction: 16
+  keyframe_interval: 8       # same meaning as stage2.keyframe_interval
+  # Per-frame relative threshold: keep detections with score >
+  # box_v.max() * score_threshold_ratio. GeCo2's raw score is not
+  # comparable across frames/videos, so (unlike stage3.match_threshold)
+  # this can't be a fixed absolute cutoff. 0.33 mirrors GECO2/demo_gradio.py's
+  # default threshold slider value.
+  score_threshold_ratio: 0.33
+  nms_iou: 0.5
+  topk_per_keyframe: 5
+  prototype_cache_name: geco2_prototype.pt   # cached exemplar tokens (torch, not prototype.npz)
 
 # ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes

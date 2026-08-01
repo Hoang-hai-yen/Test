@@ -24,3 +24,7 @@ pytest
 
 # Optional — only needed if stage4.tracker == "litetrack"
 onnxruntime           # (or onnxruntime-gpu)
+
+# Optional — only needed if pipeline.detector == "geco2"
+# (install the GECO2/ repo's own deps instead, e.g. `bash GECO2/install.sh`:
+#  hydra-core, omegaconf, iopath, and its vendored sam2 package)

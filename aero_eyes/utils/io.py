@@ -122,6 +122,51 @@ def append_submission(
         json.dump(data, f, indent=2)
 
 
+def merge_submissions(
+    work_dir: str | Path,
+    sample_ids: list[str] | None,
+    submission_filename: str,
+    out_path: str | Path,
+) -> Path:
+    """Merge every sample's own <work_dir>/<sample_id>/<submission_filename>
+    (as written by Stage 5's write_submission) into one combined file with
+    the same schema, upserting by video_id -- re-running a subset of
+    samples only touches their own entries, matching append_submission's
+    semantics. Samples with no submission file yet are skipped (logged),
+    not treated as an error, since Stage 5 may not have run for all of them.
+    """
+    work_dir = Path(work_dir)
+    if sample_ids is None:
+        sample_ids = sorted(d.name for d in work_dir.iterdir() if d.is_dir())
+
+    out_path = Path(out_path)
+    if out_path.exists():
+        with open(out_path) as f:
+            merged = {e["video_id"]: e for e in json.load(f)}
+    else:
+        merged = {}
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    missing: list[str] = []
+    for sid in sample_ids:
+        sub_path = work_dir / sid / submission_filename
+        if not sub_path.exists():
+            missing.append(sid)
+            continue
+        with open(sub_path) as f:
+            for entry in json.load(f):
+                merged[entry["video_id"]] = entry
+
+    with open(out_path, "w") as f:
+        json.dump(list(merged.values()), f, indent=2)
+
+    if missing:
+        log.warning("merge_submissions: %d sample(s) had no submission file yet: %s",
+                     len(missing), missing)
+    log.info("merge_submissions: wrote %d video(s) -> %s", len(merged), out_path)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # prototype.npz
 # ---------------------------------------------------------------------------

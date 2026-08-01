@@ -68,22 +68,31 @@ def run_stage4(cfg, sample_id: str) -> Path:
     tracker = build_tracker(cfg)
     is_none_tracker = isinstance(tracker, NoneTracker)
     s4 = cfg.stage4
+    use_geco2 = cfg.pipeline.detector == "geco2"
 
-    # For NoneTracker, we need proposal+matching on every frame
+    # For NoneTracker, we need proposal+matching on every frame. Which
+    # detector backs re-detection must match whichever one produced
+    # detections.json (legacy DINOv2+YOLO/FastSAM prototype vs GeCo2
+    # exemplar tokens) -- they are not interchangeable artifacts.
     proposal_model = None
     extractor = None
     prototype = None
     per_ref_features = []
+    geco2_detector = None
+    geco2_prototype = None
     if is_none_tracker:
-        from aero_eyes.models.features import build_feature_extractor
-        from aero_eyes.models.proposals import build_proposal_model
-        from aero_eyes.utils.io import read_prototype
+        if use_geco2:
+            geco2_detector, geco2_prototype = _load_geco2(cfg, work_dir)
+        else:
+            from aero_eyes.models.features import build_feature_extractor
+            from aero_eyes.models.proposals import build_proposal_model
+            from aero_eyes.utils.io import read_prototype
 
-        proposal_model = build_proposal_model(cfg)
-        extractor = build_feature_extractor(cfg)
-        proto_path = work_dir / cfg.stage1.prototype.cache_name
-        if proto_path.exists():
-            prototype, _, per_ref_features = read_prototype(proto_path)
+            proposal_model = build_proposal_model(cfg)
+            extractor = build_feature_extractor(cfg)
+            proto_path = work_dir / cfg.stage1.prototype.cache_name
+            if proto_path.exists():
+                prototype, _, per_ref_features = read_prototype(proto_path)
 
     # ---- Video writer for visualizations ----
     writer = None
@@ -110,10 +119,13 @@ def run_stage4(cfg, sample_id: str) -> Path:
 
             if is_none_tracker:
                 # Re-detect every frame
-                box_out, source = _detect_on_frame(
-                    frame_bgr, frame_idx, proposal_model, extractor,
-                    prototype, per_ref_features, cfg, match_threshold
-                )
+                if use_geco2:
+                    box_out, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
+                else:
+                    box_out, source = _detect_on_frame(
+                        frame_bgr, frame_idx, proposal_model, extractor,
+                        prototype, per_ref_features, cfg, match_threshold
+                    )
             else:
                 if frame_idx in kf_set:
                     # Initialize or re-initialize tracker from detection
@@ -138,21 +150,26 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     else:
                         # Confidence too low or track too old — try re-detect
                         tracker_active = False
-                        if proposal_model is None:
-                            # Lazy-init for re-detect fallback
-                            from aero_eyes.models.features import build_feature_extractor
-                            from aero_eyes.models.proposals import build_proposal_model
-                            from aero_eyes.utils.io import read_prototype
-                            proposal_model = build_proposal_model(cfg)
-                            extractor = build_feature_extractor(cfg)
-                            proto_path = work_dir / cfg.stage1.prototype.cache_name
-                            if proto_path.exists():
-                                prototype, _, per_ref_features = read_prototype(proto_path)
+                        if use_geco2:
+                            if geco2_detector is None:
+                                geco2_detector, geco2_prototype = _load_geco2(cfg, work_dir)
+                            box_out, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
+                        else:
+                            if proposal_model is None:
+                                # Lazy-init for re-detect fallback
+                                from aero_eyes.models.features import build_feature_extractor
+                                from aero_eyes.models.proposals import build_proposal_model
+                                from aero_eyes.utils.io import read_prototype
+                                proposal_model = build_proposal_model(cfg)
+                                extractor = build_feature_extractor(cfg)
+                                proto_path = work_dir / cfg.stage1.prototype.cache_name
+                                if proto_path.exists():
+                                    prototype, _, per_ref_features = read_prototype(proto_path)
 
-                        box_out, source = _detect_on_frame(
-                            frame_bgr, frame_idx, proposal_model, extractor,
-                            prototype, per_ref_features, cfg, match_threshold
-                        )
+                            box_out, source = _detect_on_frame(
+                                frame_bgr, frame_idx, proposal_model, extractor,
+                                prototype, per_ref_features, cfg, match_threshold
+                            )
                         if box_out is not None:
                             tracker.init(frame_bgr, box_out)
                             tracker_active = True
@@ -177,6 +194,39 @@ def run_stage4(cfg, sample_id: str) -> Path:
     log.info("[Stage4] %s done in %.1fs -> %s (%d/%d frames with box)",
              sample_id, elapsed, tracks_path, present, total_frames)
     return tracks_path
+
+
+def _load_geco2(cfg, work_dir: Path):
+    """Lazily load the GeCo2 detector + its cached exemplar tokens for
+    Stage 4 re-detection. Returns (detector, prototype) or (None, None) if
+    the exemplar cache from Stage 1+2+3 (stage123_geco2.py) is missing.
+    """
+    from aero_eyes.models.geco2_detector import GeCo2Detector
+
+    proto_path = work_dir / cfg.stage123_geco2.prototype_cache_name
+    if not proto_path.exists():
+        log.warning(
+            "[Stage4] %s not found -- GeCo2 re-detection disabled for this run.",
+            proto_path,
+        )
+        return None, None
+    detector = GeCo2Detector(cfg)
+    prototype = GeCo2Detector.load_prototype(proto_path)
+    return detector, prototype
+
+
+def _detect_on_frame_geco2(frame_bgr, detector, prototype):
+    """GeCo2-backed equivalent of _detect_on_frame: single best re-detection
+    box on one frame, or (None, "none") if nothing passed threshold/NMS or
+    the detector/prototype weren't available.
+    """
+    if detector is None or prototype is None:
+        return None, "none"
+    boxes = detector.detect_frame(frame_bgr, prototype)
+    if not boxes:
+        return None, "none"
+    best = max(boxes, key=lambda b: b.score)
+    return best, "detect"
 
 
 def _detect_on_frame(

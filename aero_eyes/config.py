@@ -247,6 +247,38 @@ class EvalConfig(BaseModel):
     report_per_video: bool = True
 
 
+class PipelineConfig(BaseModel):
+    # "legacy"  = Stage1 (DINOv2 prototype) -> Stage2 (YOLO/FastSAM proposals)
+    #             -> Stage3 (cosine matching), as three separate artifacts.
+    # "geco2"   = single merged stage (stage123_geco2.py) using the vendored
+    #             GECO2/ few-shot exemplar detector in place of all three.
+    #             Stage 4/5 are unchanged either way.
+    detector: Literal["legacy", "geco2"] = "legacy"
+
+
+class Stage123Geco2Config(BaseModel):
+    """Only used when pipeline.detector == 'geco2'. Requires the vendored
+    GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
+    installed, and pretrained weights downloaded -- see GECO2/README.md.
+    """
+    repo_path: str = "./GECO2"
+    weights_path: str = "./GECO2/CNTQG_multitrain_ca44.pth"
+    image_size: int = 1024
+    emb_dim: int = 256
+    kernel_dim: int = 3
+    reduction: int = 16
+    keyframe_interval: int = 8
+    # Per-frame relative threshold: keep detections with score >
+    # box_v.max() * score_threshold_ratio (GeCo2's own score scale is not
+    # comparable across frames, so this can't be a fixed absolute cutoff
+    # like stage3.match_threshold -- see GECO2/demo_gradio.py's threshold
+    # slider, default 0.33, for the reference implementation this mirrors).
+    score_threshold_ratio: float = 0.33
+    nms_iou: float = 0.5
+    topk_per_keyframe: int = 5
+    prototype_cache_name: str = "geco2_prototype.pt"
+
+
 # ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
@@ -255,11 +287,13 @@ class AeroEyesConfig(BaseModel):
     project: ProjectConfig = ProjectConfig()
     data: DataConfig = DataConfig()
     runtime: RuntimeConfig = RuntimeConfig()
+    pipeline: PipelineConfig = PipelineConfig()
     stage1: Stage1Config = Stage1Config()
     stage2: Stage2Config = Stage2Config()
     stage3: Stage3Config = Stage3Config()
     stage4: Stage4Config = Stage4Config()
     stage5: Stage5Config = Stage5Config()
+    stage123_geco2: Stage123Geco2Config = Stage123Geco2Config()
     accuracy: AccuracyConfig = AccuracyConfig()
     eval: EvalConfig = EvalConfig()
 
