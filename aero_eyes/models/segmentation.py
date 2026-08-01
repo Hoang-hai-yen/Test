@@ -118,8 +118,24 @@ class MobileSAMSegmenter:
                 box=box,
                 multimask_output=True,
             )
-            # Pick the highest-scoring mask
-            best_idx = int(np.argmax(scores))
+            # multimask_output=True returns 3 candidates at different
+            # granularities (roughly: whole object / a part / a sub-part).
+            # SAM's own predicted-IoU score does NOT reliably track "most
+            # complete" -- a smaller, cleaner-edged sub-part regularly
+            # outscores the full object, which was cutting off most of the
+            # subject in practice. For a close-up reference photo (one
+            # dominant subject filling most of the frame) the LARGEST
+            # candidate that still respects the area guardrails is almost
+            # always the more correct pick, so prefer that; only fall back
+            # to the highest-scoring candidate if none pass the area bounds
+            # (keeps the same "reject implausible mask" safety net below).
+            areas = [float(m.astype(bool).mean()) for m in masks]
+            plausible = [i for i, a in enumerate(areas)
+                         if self.min_area_frac <= a <= self.max_area_frac]
+            if plausible:
+                best_idx = max(plausible, key=lambda i: areas[i])
+            else:
+                best_idx = int(np.argmax(scores))
             mask = masks[best_idx].astype(bool)
             area_frac = mask.mean()
             if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
