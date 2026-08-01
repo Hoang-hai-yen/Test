@@ -3,7 +3,8 @@
 Selected via config: pipeline.detector: geco2  (default stays "legacy",
 i.e. the original Stage1/2/3 DINOv2+YOLO/FastSAM pipeline).
 
-Flow:  3 reference images (whole image = exemplar box)
+Flow:  3 reference images (exemplar box = MobileSAM mask bbox if
+       stage123_geco2.segmentation.enabled, else whole image)
        -> GeCo2 exemplar tokens                      (replaces Stage 1)
        -> per-keyframe GeCo2 forward pass
           -> dense box map -> per-frame relative threshold -> NMS -> top-K
@@ -41,6 +42,14 @@ def _apply_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     bg_color = img.reshape(-1, 3).mean(axis=0)
     masked[~mask] = bg_color
     return masked
+
+
+def _mask_bbox(mask: np.ndarray) -> tuple[float, float, float, float] | None:
+    """Tight bbox around the True region of `mask`. None if mask is empty."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    return float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)
 
 
 def _apply_ref_downscale(img, downscale_factor: float):
@@ -112,6 +121,11 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     else:
         ref_imgs = _load_ref_images(cfg, sample_id)
 
+        # Exemplar box passed to encode_exemplars(), in the coord system of
+        # whichever ref_imgs actually get passed to it (i.e. post-downscale
+        # below). None = whole image (encode_exemplars' default).
+        ref_boxes: list[tuple[float, float, float, float] | None] | None = None
+
         seg_cfg = g.segmentation
         if seg_cfg.enabled:
             from aero_eyes.models.segmentation import MobileSAMSegmenter
@@ -120,12 +134,24 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 fallback_if_missing=seg_cfg.fallback_if_missing,
             )
             masks = [segmenter.segment(img) for img in ref_imgs]
+            # Tight box around the actual segmented object, BEFORE downscale --
+            # RoI-align-ing the whole (masked) image instead pools in a lot of
+            # mean-color-filled background + any resize_and_pad zero-padding,
+            # diluting the exemplar token (empirically confirmed to matter).
+            raw_boxes = [_mask_bbox(m) for m in masks]
             ref_imgs = [_apply_mask(img, m) for img, m in zip(ref_imgs, masks)]
             if cfg.runtime.save_visualizations:
                 vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+            # Scale into the coord system _apply_ref_downscale below produces
+            # (uniform factor in both axes, matching that function).
+            f = g.ref_downscale_factor
+            ref_boxes = [
+                tuple(c * f for c in b) if b is not None else None
+                for b in raw_boxes
+            ]
 
         ref_imgs = [_apply_ref_downscale(img, g.ref_downscale_factor) for img in ref_imgs]
-        prototype = detector.encode_exemplars(ref_imgs)
+        prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
         GeCo2Detector.save_prototype(prototype, proto_path)
         log.info("[Stage123-GeCo2] %s: encoded %d reference exemplars -> %s",
                  sample_id, len(ref_imgs), proto_path)

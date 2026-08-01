@@ -145,9 +145,22 @@ class GeCo2Detector:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def encode_exemplars(self, ref_images_bgr: list[np.ndarray]) -> dict[str, torch.Tensor]:
-        """Run backbone + RoI-align (whole image = exemplar box) on each
-        reference image independently, concatenating tokens across refs.
+    def encode_exemplars(
+        self,
+        ref_images_bgr: list[np.ndarray],
+        ref_boxes: list[tuple[float, float, float, float] | None] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run backbone + RoI-align on each reference image independently,
+        concatenating tokens across refs.
+
+        ref_boxes: optional per-image exemplar box (x1,y1,x2,y2) in the
+        ORIGINAL (pre-pad) pixel coords of the corresponding ref_images_bgr
+        entry -- e.g. a tight MobileSAM mask bbox, so RoI-align pools only
+        the actual object instead of also averaging in the mean-color-filled
+        background and any resize_and_pad zero-padding (empirically
+        confirmed to matter: a manual same-image test with a tight mask box
+        detected correctly, while the whole-image box this defaults to did
+        not). None (or a None entry) falls back to the whole image, as before.
 
         Returns a dict of the 3 token sets CNT.adapt_features needs as its
         `prototype_embeddings` / `hq_prototypes` arguments -- CPU tensors,
@@ -157,9 +170,19 @@ class GeCo2Detector:
         from torchvision.ops import roi_align
 
         main_tokens, l1_tokens, l2_tokens = [], [], []
-        for img in ref_images_bgr:
-            padded, _ = self._load_and_pad(img)
+        for i, img in enumerate(ref_images_bgr):
+            padded, scale = self._load_and_pad(img)
             x = padded.unsqueeze(0).to(self.device)
+
+            given_box = ref_boxes[i] if ref_boxes is not None else None
+            if given_box is not None:
+                bx1, by1, bx2, by2 = given_box
+            else:
+                h_img, w_img = img.shape[:2]
+                bx1, by1, bx2, by2 = 0.0, 0.0, float(w_img), float(h_img)
+            # Scale from original ref-image pixel coords into the padded canvas
+            # (same uniform scale resize_and_pad used above, zero_shot=True).
+            px1, py1, px2, py2 = bx1 * scale, by1 * scale, bx2 * scale, by2 * scale
 
             feats = m.backbone(x)
             src = feats["vision_features"]
@@ -168,10 +191,7 @@ class GeCo2Detector:
             bs, _, w, h = src.shape
             reduction = self.image_size / w
 
-            # Whole padded image is the exemplar box.
-            box = torch.tensor(
-                [[0.0, 0.0, 0.0, x.shape[-1], x.shape[-2]]], device=self.device
-            )  # [batch_idx, x1, y1, x2, y2]
+            box = torch.tensor([[0.0, px1, py1, px2, py2]], device=self.device)  # [batch_idx, x1, y1, x2, y2]
 
             exemplar = roi_align(src, boxes=box, output_size=1,
                                   spatial_scale=1.0 / reduction, aligned=True)
@@ -185,7 +205,7 @@ class GeCo2Detector:
                                      spatial_scale=1.0 / reduction * 2, aligned=True)
             exemplar_l2 = exemplar_l2.permute(0, 2, 3, 1).reshape(bs, 1, m.emb_dim)
 
-            box_hw = torch.tensor([[[x.shape[-1], x.shape[-2]]]], dtype=torch.float32, device=self.device)
+            box_hw = torch.tensor([[[px2 - px1, py2 - py1]]], dtype=torch.float32, device=self.device)
             shape = m.shape_or_objectness(box_hw).reshape(bs, 1, m.emb_dim)
 
             main_tokens.append(torch.cat([exemplar, shape], dim=1).cpu())
