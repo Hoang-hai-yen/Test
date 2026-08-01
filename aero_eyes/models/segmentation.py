@@ -18,7 +18,7 @@ class MobileSAMSegmenter:
 
     def __init__(self, weights_path: str | None = None, fallback_if_missing: str = "passthrough",
                  min_area_frac: float = 0.05, max_area_frac: float = 0.95,
-                 score_ratio_floor: float = 0.85):
+                 score_ratio_floor: float = 0.85, max_border_touch_frac: float = 0.02):
         self.weights_path = weights_path
         self.fallback_if_missing = fallback_if_missing
         # Guardrail: a single center-point prompt sometimes locks onto a tiny
@@ -34,6 +34,17 @@ class MobileSAMSegmenter:
         # largest candidate can be a low-confidence over-segmentation that
         # bleeds into the background.
         self.score_ratio_floor = score_ratio_floor
+        # Guardrail: the box prompt is inset `margin` (5%) from the true
+        # image edges, so a candidate whose mask actually touches the real
+        # image border is virtually never the object itself -- reference
+        # photos frame the subject with margin, but a background/ground
+        # plane commonly runs off-frame. This catches the case score+area
+        # alone cannot: a mask that is genuinely one connected, high-scoring
+        # blob because SAM's boundary leaked from the object into contiguous
+        # background (confirmed empirically -- a leaked candidate touched
+        # 79% of one edge while the correct candidate touched 0% of all
+        # four).
+        self.max_border_touch_frac = max_border_touch_frac
         self._sam = None
         self._predictor = None
         self._available = False
@@ -95,6 +106,15 @@ class MobileSAMSegmenter:
             counts[0] = 0
             label_at_point = int(np.argmax(counts))
         return labels == label_at_point
+
+    @staticmethod
+    def _border_touch_frac(mask: np.ndarray) -> float:
+        """Fraction of the image's outer-edge pixels (all 4 sides) that are
+        foreground. Near 0 for a well-framed subject; large when the mask
+        has leaked into a background plane that runs off-frame.
+        """
+        edges = np.concatenate([mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1]])
+        return float(edges.mean())
 
     @staticmethod
     def _file_exists(path: str) -> bool:
@@ -174,6 +194,7 @@ class MobileSAMSegmenter:
             # those, take the largest (by CLEANED area). Falls back to the
             # single highest-scoring candidate if nothing clears both bars.
             areas = [float(m.mean()) for m in cleaned]
+            border_touch = [self._border_touch_frac(m) for m in cleaned]
             max_score = float(np.max(scores))
             confident = [
                 i for i, s in enumerate(scores)
@@ -182,6 +203,7 @@ class MobileSAMSegmenter:
             plausible = [
                 i for i in confident
                 if self.min_area_frac <= areas[i] <= self.max_area_frac
+                and border_touch[i] <= self.max_border_touch_frac
             ]
             if plausible:
                 best_idx = max(plausible, key=lambda i: areas[i])
@@ -193,6 +215,13 @@ class MobileSAMSegmenter:
                 log.warning(
                     "MobileSAM mask area implausible (%.1f%% of frame), using passthrough mask.",
                     area_frac * 100,
+                )
+                return np.ones((h, w), dtype=bool)
+            if self._border_touch_frac(mask) > self.max_border_touch_frac:
+                log.warning(
+                    "MobileSAM mask touches the image border (%.1f%% of edge pixels), "
+                    "likely leaked into background; using passthrough mask.",
+                    self._border_touch_frac(mask) * 100,
                 )
                 return np.ones((h, w), dtype=bool)
             return mask

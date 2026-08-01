@@ -135,6 +135,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 min_area_frac=seg_cfg.min_area_frac,
                 max_area_frac=seg_cfg.max_area_frac,
                 score_ratio_floor=seg_cfg.score_ratio_floor,
+                max_border_touch_frac=seg_cfg.max_border_touch_frac,
             )
             masks = [segmenter.segment(img) for img in ref_imgs]
             # Tight box around the actual segmented object, BEFORE downscale --

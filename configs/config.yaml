@@ -197,6 +197,12 @@ stage123_geco2:
     # lower toward 0.0 if masks are still cutting off part of the object
     # (under-segmenting).
     score_ratio_floor: 0.85
+    # Reject a candidate whose mask touches the real image border more than
+    # this fraction of edge pixels (box prompt is inset 5% from the edges,
+    # so a correctly-segmented subject essentially never reaches it; a
+    # background plane commonly runs off-frame). Raise if legitimate subjects
+    # in your reference photos are shot edge-to-edge with no margin.
+    max_border_touch_frac: 0.02
   image_size: 1024
   emb_dim: 256
   kernel_dim: 3

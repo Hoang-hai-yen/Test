@@ -71,6 +71,11 @@ class SegmentationConfig(BaseModel):
     # from winning just for being big. 1.0 = only the single best-scoring
     # candidate is eligible (falls back to old highest-score behavior).
     score_ratio_floor: float = 0.85
+    # Reject a candidate whose mask touches the true image border more than
+    # this fraction of edge pixels -- the box prompt is inset 5% from the
+    # edges, so a correctly-segmented subject essentially never reaches the
+    # real border; a background plane (ground, wall, sky) commonly does.
+    max_border_touch_frac: float = 0.02
 
 
 class FeatureExtractorConfig(BaseModel):
