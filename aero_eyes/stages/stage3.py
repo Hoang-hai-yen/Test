@@ -1,14 +1,13 @@
+%%writefile /content/aero_eyes/aero_eyes/stages/stage3.py
 """Stage 3 — Cross-domain matching.
 
 Flow:  candidates.json + prototype.npz
-       -> cosine similarity
+       -> cosine similarity (Pass 1)
+       -> DYNAMIC PROTOTYPE UPDATE (CẢI TIẾN 1)
+       -> re-score similarity (Pass 2)
        -> threshold filter
        -> NMS across tiles
-       -> top-K per keyframe
        -> detections.json
-
-Reads:  prototype.npz, candidates.json (+.feats.npz)
-Writes: detections.json
 """
 from __future__ import annotations
 
@@ -25,34 +24,25 @@ log = logging.getLogger(__name__)
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two 1-D vectors (both assumed L2-normalized)."""
     return float(np.dot(a, b))
 
 
 def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.ndarray:
-    """Score every row of feats [N,D] against a single reference vector [D].
-
-    Higher score always means "more similar" regardless of metric, so the
-    rest of Stage 3 (threshold filtering, adaptive threshold, ranking) works
-    unchanged no matter which metric is selected. For distance metrics
-    (l1/l2) this means returning the negated distance.
-    """
     if metric == "cosine":
         return feats @ ref
     if metric == "l2":
         return -np.linalg.norm(feats - ref[None, :], axis=1)
     if metric == "l1":
         return -np.sum(np.abs(feats - ref[None, :]), axis=1)
-    raise ValueError(f"Unknown stage3.similarity metric '{metric}'. Must be 'cosine', 'l1', or 'l2'.")
+    raise ValueError(f"Unknown metric '{metric}'")
 
 
 def run_stage3(cfg, sample_id: str) -> Path:
-    """Run Stage 3 for the given sample. Returns path to detections.json."""
     from aero_eyes.stages.stage2 import read_candidates_with_features
     from aero_eyes.utils import viz as vizmod
     from aero_eyes.utils.geometry import nms
-    from aero_eyes.utils.io import read_prototype, write_detections
-    from aero_eyes.utils.video import read_frame, video_info
+    from aero_eyes.utils.io import read_prototype, write_detections, write_prototype
+    from aero_eyes.utils.video import read_frame
 
     t0 = time.time()
     work_dir = Path(cfg.project.work_dir) / sample_id
@@ -60,31 +50,23 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     det_path = work_dir / "detections.json"
     if cfg.project.use_cache and det_path.exists():
-        log.info("[Stage3] %s: using cached detections at %s", sample_id, det_path)
+        log.info("[Stage3] %s: using cached detections", sample_id)
         return det_path
 
-    # ---- Load prototype ----
     proto_path = work_dir / cfg.stage1.prototype.cache_name
     if not proto_path.exists():
-        raise FileNotFoundError(
-            f"prototype.npz not found at {proto_path}. Run Stage 1 first."
-        )
+        raise FileNotFoundError("prototype.npz not found.")
     prototype, meta, per_ref_features = read_prototype(proto_path)
 
-    # ---- Load candidates ----
     cand_path = work_dir / "candidates.json"
     if not cand_path.exists():
-        raise FileNotFoundError(
-            f"candidates.json not found at {cand_path}. Run Stage 2 first."
-        )
+        raise FileNotFoundError("candidates.json not found.")
     candidates, feat_matrix = read_candidates_with_features(cand_path)
 
     if feat_matrix is None or feat_matrix.shape[0] == 0:
-        log.warning("[Stage3] No candidate features found — writing empty detections.")
         write_detections({}, det_path)
         return det_path
 
-    # ---- Stage 3 config ----
     s3 = cfg.stage3
     threshold = s3.match_threshold
     use_multi_ref = (
@@ -93,14 +75,12 @@ def run_stage3(cfg, sample_id: str) -> Path:
         and len(per_ref_features) > 0
     )
 
-    # ---- Match: global top-K or per-keyframe threshold ----
     detections: dict[int, list[Detection]] = {}
     data_root = Path(cfg.data.data_root)
     video_files = list((data_root / sample_id).glob(cfg.data.video_glob))
     video_path = video_files[0] if video_files else None
     viz_dir = work_dir / "viz" / "stage3"
 
-    # Build flat list of (frame_idx, det, feat) for all candidates
     all_entries: list[tuple[int, Detection, np.ndarray]] = []
     for frame_idx, cand_dets in candidates.items():
         for det in cand_dets:
@@ -110,43 +90,89 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     if not all_entries:
         write_detections({}, det_path)
-        log.warning("[Stage3] %s: no candidate features found", sample_id)
         return det_path
 
     all_frame_idxs = [e[0] for e in all_entries]
     all_dets = [e[1] for e in all_entries]
-    all_feats = np.stack([e[2] for e in all_entries], axis=0)  # [N, D]
+    all_feats = np.stack([e[2] for e in all_entries], axis=0)
 
-    # Compute similarity for every candidate at once (higher = more similar,
-    # regardless of metric -- see _score_against_ref).
+    # --- LƯỢT 1: So khớp cơ bản ---
     if use_multi_ref:
         sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
         all_sims = np.mean(sims_per_ref, axis=0)
     else:
-        all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
+        all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
 
-    # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;
-    # already shown to hurt results (see docs/COLAB_KAGGLE_GUIDE.md), kept
-    # off by default and not extended to l1/l2.
-    if (cfg.accuracy.mode == "max_accuracy"
-            and cfg.accuracy.max_accuracy.domain_prompter.enabled):
-        if s3.similarity != "cosine":
-            raise ValueError(
-                "accuracy.max_accuracy.domain_prompter is only implemented for "
-                "stage3.similarity='cosine'. Disable domain_prompter or switch back to cosine."
+    # --- CẢI TIẾN 1 (mở rộng): DYNAMIC PROTOTYPE UPDATE với NGƯỠNG THÍCH ỨNG ---
+    # Ngưỡng cứng 0.40 trước đây chỉ "may mắn" kích hoạt được với nhóm dễ
+    # (BlackBox) vì phân phối similarity của nó cao sẵn. Với nhóm khó
+    # (CardboardBox, LifeJacket) similarity hiếm khi vượt 0.40 -> cơ chế
+    # không bao giờ kích hoạt -> prototype không được tinh chỉnh theo domain
+    # thực tế của video. Sửa: chọn "high-confidence" theo phân vị (percentile)
+    # của CHÍNH phân phối điểm số của sample này, có sàn tuyệt đối để tránh
+    # kéo theo nhiễu khi toàn bộ điểm số đều thấp, và chạy nhiều vòng để
+    # prototype hội tụ dần về đúng target trong video.
+    dyn_cfg = getattr(s3, "dynamic_prototype", None)
+    dyn_enabled = getattr(dyn_cfg, "enabled", True) if dyn_cfg is not None else True
+    dyn_rounds = getattr(dyn_cfg, "rounds", 2) if dyn_cfg is not None else 2
+    dyn_alpha = getattr(dyn_cfg, "alpha", 0.3) if dyn_cfg is not None else 0.3
+    dyn_percentile = getattr(dyn_cfg, "high_conf_percentile", 90) if dyn_cfg is not None else 90
+    dyn_abs_floor = getattr(dyn_cfg, "high_conf_abs_floor", 0.15) if dyn_cfg is not None else 0.15
+    dyn_min_support = getattr(dyn_cfg, "min_support", 2) if dyn_cfg is not None else 2
+
+    dynamic_updated = False
+    if dyn_enabled:
+        for round_idx in range(dyn_rounds):
+            adaptive_high_thresh = max(dyn_abs_floor, float(np.percentile(all_sims, dyn_percentile)))
+            high_conf_mask = all_sims >= adaptive_high_thresh
+
+            if int(high_conf_mask.sum()) < dyn_min_support:
+                break  # không đủ ứng viên tin cậy -> dừng sớm, tránh làm lệch prototype
+
+            high_conf_feats = all_feats[high_conf_mask]
+            dynamic_feat = high_conf_feats.mean(axis=0)
+            dynamic_feat /= (np.linalg.norm(dynamic_feat) + 1e-8)
+
+            log.info(
+                "[Stage3] %s: Dynamic Prototype Update vòng %d/%d — ngưỡng thích ứng=%.3f "
+                "(percentile=%d), %d candidates, alpha=%.2f",
+                sample_id, round_idx + 1, dyn_rounds, adaptive_high_thresh,
+                dyn_percentile, int(high_conf_mask.sum()), dyn_alpha,
             )
-        all_sims = _apply_domain_prompter(all_feats, prototype, all_sims, cfg)
+            dynamic_updated = True
 
-    # Always log the raw similarity distribution — the ground-to-aerial domain
-    # gap means a fixed match_threshold tuned on one dataset can silently pass
-    # zero candidates on another; this makes that visible instead of a mute
-    # "0 detection frames" result.
+            if use_multi_ref:
+                per_ref_features.append(dynamic_feat)
+                sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
+                all_sims = np.mean(sims_per_ref, axis=0)
+            else:
+                prototype = (1 - dyn_alpha) * prototype + dyn_alpha * dynamic_feat
+                prototype /= (np.linalg.norm(prototype) + 1e-8)
+                all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
+
+    # CẢI TIẾN: Ghi lại prototype đã tinh chỉnh (dynamic-updated) ra một file
+    # riêng (prototype_dynamic.npz), KHÔNG ghi đè prototype.npz gốc của Stage 1
+    # (giữ tái lập được / tránh trôi dạt qua nhiều lần rerun). Stage 4 sẽ ưu
+    # tiên đọc file này nếu có, để tracking / re-detect dùng đúng target
+    # signature đã được tinh chỉnh theo video thay vì bản gốc từ Stage 1.
+    if dynamic_updated:
+        refined_proto_path = work_dir / "prototype_dynamic.npz"
+        refined_meta = dict(meta) if isinstance(meta, dict) else {}
+        refined_meta["dynamic_updated"] = True
+        refined_meta["dynamic_rounds"] = dyn_rounds
+        write_prototype(
+            prototype=prototype,
+            meta=refined_meta,
+            per_ref_features=per_ref_features if use_multi_ref else None,
+            path=refined_proto_path,
+        )
+        log.info("[Stage3] %s: đã lưu prototype tinh chỉnh -> %s", sample_id, refined_proto_path)
+
+    # Log metrics
     log.info(
-        "[Stage3] %s: candidate score stats (metric=%s, higher=more similar) — "
-        "min=%.3f p50=%.3f mean=%.3f std=%.3f p95=%.3f max=%.3f (n=%d)",
-        sample_id, s3.similarity, float(all_sims.min()), float(np.percentile(all_sims, 50)),
-        float(all_sims.mean()), float(all_sims.std()),
-        float(np.percentile(all_sims, 95)), float(all_sims.max()), len(all_sims),
+        "[Stage3] %s: scores min=%.3f p50=%.3f mean=%.3f max=%.3f",
+        sample_id, float(all_sims.min()), float(np.percentile(all_sims, 50)),
+        float(all_sims.mean()), float(all_sims.max())
     )
 
     # ---- Compute effective threshold ----
@@ -154,19 +180,11 @@ def run_stage3(cfg, sample_id: str) -> Path:
         sim_mean = float(all_sims.mean())
         sim_std = float(all_sims.std())
         raw_threshold = sim_mean + s3.adaptive_z_score * sim_std
-        # adaptive_min_floor is calibrated for cosine's roughly [-1,1] range.
-        # l1/l2 scores are negated distances (unbounded, typically negative),
-        # so the floor has no meaningful interpretation there -- skip it.
         if s3.similarity == "cosine":
             effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
         else:
             effective_threshold = raw_threshold
-        log.info(
-            "[Stage3] %s: adaptive threshold (metric=%s) = %.3f + %.1f*%.3f = %.3f%s",
-            sample_id, s3.similarity, sim_mean, s3.adaptive_z_score, sim_std,
-            effective_threshold,
-            f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else "",
-        )
+        log.info("[Stage3] %s: adaptive threshold = %.3f", sample_id, effective_threshold)
     else:
         effective_threshold = threshold
 
@@ -176,17 +194,13 @@ def run_stage3(cfg, sample_id: str) -> Path:
         (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
         for i in range(len(all_sims)) if keep_mask[i]
     ]
-    log.info("[Stage3] %s: threshold=%.3f → %d / %d candidates pass",
-             sample_id, effective_threshold, len(selected), len(all_sims))
 
-    # ---- Apply global_topk cap (after threshold, not instead of it) ----
     global_topk = s3.global_topk
     if global_topk is not None and len(selected) > global_topk:
         selected.sort(key=lambda x: x[2], reverse=True)
         selected = selected[:global_topk]
-        log.info("[Stage3] %s: capped to global_topk=%d", sample_id, global_topk)
 
-    # Group by frame, apply NMS + topk_per_keyframe
+    # NMS
     from collections import defaultdict
     frame_groups: dict[int, list[tuple[Detection, float]]] = defaultdict(list)
     for fi, det, sim in selected:
@@ -197,33 +211,18 @@ def run_stage3(cfg, sample_id: str) -> Path:
         dets_f = [d for d, _ in det_sim_pairs]
         sims_f = [s for _, s in det_sim_pairs]
 
-        # NMS
         keep_idx = nms(
             [d.box.__class__(d.box.x1, d.box.y1, d.box.x2, d.box.y2, score=s)
              for d, s in zip(dets_f, sims_f)],
             iou_threshold=s3.nms_iou,
         )
-        post_nms = [(dets_f[i], sims_f[i]) for i in keep_idx]
-
-        # Top-K per keyframe
-        post_nms = post_nms[: s3.topk_per_keyframe]
+        post_nms = [(dets_f[i], sims_f[i]) for i in keep_idx][: s3.topk_per_keyframe]
 
         result_dets = [
             Detection(frame_idx=frame_idx, box=det.box, similarity=sim, source="detect")
             for det, sim in post_nms
         ]
         detections[frame_idx] = result_dets
-
-        if cfg.runtime.save_visualizations and video_path:
-            try:
-                frame_bgr = read_frame(video_path, frame_idx)
-                vizmod.save_stage3_detections(
-                    frame_bgr, [d.box for d in result_dets],
-                    [d.similarity for d in result_dets],
-                    frame_idx, viz_dir,
-                )
-            except Exception:
-                pass
 
     write_detections(detections, det_path, threshold=effective_threshold)
     elapsed = time.time() - t0
@@ -232,36 +231,9 @@ def run_stage3(cfg, sample_id: str) -> Path:
     return det_path
 
 
-def _apply_domain_prompter(
-    feats: np.ndarray,
-    prototype: np.ndarray,
-    sims: np.ndarray,
-    cfg,
-) -> np.ndarray:
-    """CD-ViTO-style domain feature alignment (simplified).
-
-    Synthesizes 'imaginary domain' feature shifts by interpolating between
-    the candidate feature distribution and the prototype direction,
-    then re-scores using the shifted features.
-    """
-    dp = cfg.accuracy.max_accuracy.domain_prompter
-    strength = dp.strength
-
-    # Compute the mean domain gap: shift candidate features toward prototype style
-    # by blending them with the prototype direction
-    proto_norm = prototype / (np.linalg.norm(prototype) + 1e-8)
-    shifted = feats + strength * proto_norm[None]
-    # Re-normalize
-    norms = np.linalg.norm(shifted, axis=-1, keepdims=True).clip(min=1e-8)
-    shifted = shifted / norms
-    new_sims = shifted @ prototype
-    # Blend original and new scores
-    return 0.5 * sims + 0.5 * new_sims
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
-    p = argparse.ArgumentParser(description="Stage 3 — cross-domain matching")
+    p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--sample", required=True)
     p.add_argument("--set", action="append", default=[])
