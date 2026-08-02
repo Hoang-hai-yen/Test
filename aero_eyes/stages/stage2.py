@@ -1,3 +1,4 @@
+%%writefile /content/aero_eyes/aero_eyes/stages/stage2.py
 """Stage 2 — Candidate generation (per keyframe).
 
 Flow:  drone video
