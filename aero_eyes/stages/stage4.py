@@ -1,3 +1,4 @@
+%%writefile /content/aero_eyes/aero_eyes/stages/stage4.py
 """Stage 4 — Tracking between keyframes.
 
 Flow:  detections.json + video
@@ -23,6 +24,28 @@ import numpy as np
 from aero_eyes.types import Box
 
 log = logging.getLogger(__name__)
+
+
+def _load_best_prototype(work_dir: Path, cfg):
+    """CẢI TIẾN (đồng bộ Stage3 <-> Stage4): Stage 3 có thể tinh chỉnh prototype
+    qua Dynamic Prototype Update và ghi ra `prototype_dynamic.npz`. Trước đây
+    Stage 4 luôn đọc thẳng `prototype.npz` gốc của Stage 1 khi cần re-detect
+    (mất track / NoneTracker), khiến việc tinh chỉnh ở Stage 3 không hề có tác
+    dụng lúc tracking — hai stage "lệch pha" nhau. Hàm này ưu tiên bản đã tinh
+    chỉnh nếu tồn tại, fallback về bản gốc nếu chưa có (ví dụ Stage 3 chưa
+    chạy hoặc dynamic update không kích hoạt).
+    """
+    from aero_eyes.utils.io import read_prototype
+
+    refined_path = work_dir / "prototype_dynamic.npz"
+    if refined_path.exists():
+        return read_prototype(refined_path)
+
+    base_path = work_dir / cfg.stage1.prototype.cache_name
+    if base_path.exists():
+        return read_prototype(base_path)
+
+    return None, None, []
 
 
 def run_stage4(cfg, sample_id: str) -> Path:
@@ -77,13 +100,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
     if is_none_tracker:
         from aero_eyes.models.features import build_feature_extractor
         from aero_eyes.models.proposals import build_proposal_model
-        from aero_eyes.utils.io import read_prototype
 
         proposal_model = build_proposal_model(cfg)
         extractor = build_feature_extractor(cfg)
-        proto_path = work_dir / cfg.stage1.prototype.cache_name
-        if proto_path.exists():
-            prototype, _, per_ref_features = read_prototype(proto_path)
+        prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
 
     # ---- Video writer for visualizations ----
     writer = None
@@ -142,12 +162,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             # Lazy-init for re-detect fallback
                             from aero_eyes.models.features import build_feature_extractor
                             from aero_eyes.models.proposals import build_proposal_model
-                            from aero_eyes.utils.io import read_prototype
                             proposal_model = build_proposal_model(cfg)
                             extractor = build_feature_extractor(cfg)
-                            proto_path = work_dir / cfg.stage1.prototype.cache_name
-                            if proto_path.exists():
-                                prototype, _, per_ref_features = read_prototype(proto_path)
+                            prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
 
                         box_out, source = _detect_on_frame(
                             frame_bgr, frame_idx, proposal_model, extractor,
