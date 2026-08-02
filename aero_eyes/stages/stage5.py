@@ -1,14 +1,12 @@
+%%writefile /content/aero_eyes/aero_eyes/stages/stage5.py
 """Stage 5 — Spatio-temporal output.
 
 Flow:  tracks.json
        -> aggregate into spatio-temporal tube
        -> temporal EMA smoothing
-       -> fill short gaps by linear interpolation
+       -> fill short gaps by linear interpolation (CẢI TIẾN: HÀN GAP <= 5)
        -> drop short tubes
        -> tube.json + submission file
-
-Reads:  tracks.json
-Writes: tube.json + <work_dir>/<sample_id>/submission.json
 """
 from __future__ import annotations
 
@@ -53,6 +51,9 @@ def _fill_gaps(tube: dict[int, Box], max_gap: int) -> dict[int, Box]:
         return tube
     frames = sorted(tube.keys())
     filled = dict(tube)
+
+    filled_count = 0  # Biến đếm số lượng frame được hàn
+
     for i in range(len(frames) - 1):
         f0, f1 = frames[i], frames[i + 1]
         gap = f1 - f0 - 1
@@ -67,6 +68,11 @@ def _fill_gaps(tube: dict[int, Box], max_gap: int) -> dict[int, Box]:
                     y2=b0.y2 + t * (b1.y2 - b0.y2),
                     score=(b0.score + b1.score) / 2,
                 )
+                filled_count += 1
+
+    if filled_count > 0:
+        log.info("[Stage5] Linear Interpolation: Đã hàn thành công %d frames bị đứt quãng (gaps <= %d).", filled_count, max_gap)
+
     return filled
 
 
@@ -90,8 +96,7 @@ def _split_into_segments(tube: dict[int, Box]) -> list[dict[int, Box]]:
 def run_stage5(cfg, sample_id: str) -> Path:
     """Run Stage 5. Returns path to submission file."""
     from aero_eyes.utils import viz as vizmod
-    from aero_eyes.utils.io import (append_submission, read_tracks, write_submission,
-                                     write_tube)
+    from aero_eyes.utils.io import (read_tracks, write_submission, write_tube)
     from aero_eyes.utils.video import video_info
 
     t0 = time.time()
@@ -100,15 +105,11 @@ def run_stage5(cfg, sample_id: str) -> Path:
 
     submission_path = work_dir / cfg.data.submission.path_name
 
-    # ---- Load tracks ----
     tracks_path = work_dir / "tracks.json"
     if not tracks_path.exists():
-        raise FileNotFoundError(
-            f"tracks.json not found at {tracks_path}. Run Stage 4 first."
-        )
+        raise FileNotFoundError(f"tracks.json not found at {tracks_path}. Run Stage 4 first.")
     tracks = read_tracks(tracks_path)
 
-    # Keep only non-None entries
     raw_tube: dict[int, Box] = {fi: b for fi, b in tracks.items() if b is not None}
     log.info("[Stage5] %s: %d frames with boxes before smoothing", sample_id, len(raw_tube))
 
@@ -120,8 +121,12 @@ def run_stage5(cfg, sample_id: str) -> Path:
     else:
         tube = dict(raw_tube)
 
-    # ---- Fill short gaps ----
-    tube = _fill_gaps(tube, max_gap=s5.fill_short_gaps)
+    # ---- Fill short gaps (ÉP BUỘC max_gap nếu user chưa config) ----
+    max_gap_val = getattr(s5, "fill_short_gaps", 5)
+    if max_gap_val < 5:
+        max_gap_val = 5 # Đảm bảo hàn gap tối đa 5 frames theo yêu cầu
+
+    tube = _fill_gaps(tube, max_gap=max_gap_val)
 
     # ---- Drop short tube segments ----
     segments = _split_into_segments(tube)
@@ -147,8 +152,7 @@ def run_stage5(cfg, sample_id: str) -> Path:
                 total_frames = vinfo["total_frames"]
                 viz_dir = work_dir / "viz" / "stage5"
                 viz_dir.mkdir(parents=True, exist_ok=True)
-                vizmod.save_stage5_timeline(final_tube, total_frames,
-                                            viz_dir / "timeline.jpg")
+                vizmod.save_stage5_timeline(final_tube, total_frames, viz_dir / "timeline.jpg")
             except Exception as e:
                 log.warning("[Stage5] Visualization failed: %s", e)
 
