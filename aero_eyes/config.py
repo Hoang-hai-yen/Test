@@ -187,6 +187,14 @@ class Stage4Config(BaseModel):
     litetrack: LiteTrackConfig = LiteTrackConfig()
     tracker_conf_threshold: float = 0.40
     max_track_age: int = 30
+    # OpenCV trackers (csrt/kcf/mosse/mil) report a fixed placeholder
+    # confidence on every "successful" update -- they cannot tell drift from
+    # a correct lock, so tracker_conf_threshold alone almost never fires.
+    # Every verify_interval frames while tracking, re-embed the tracked crop
+    # with DINOv2 and compare it against the prototype; treat the track as
+    # lost (trigger re-detect) if similarity falls below the match threshold.
+    # Set to 0 to disable (old behaviour: trust the tracker until max_track_age).
+    verify_interval: int = 5
 
     @field_validator("tracker")
     @classmethod

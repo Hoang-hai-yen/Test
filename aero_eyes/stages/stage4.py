@@ -91,7 +91,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
     is_none_tracker = isinstance(tracker, NoneTracker)
     s4 = cfg.stage4
 
-    # For NoneTracker, we need proposal+matching on every frame
+    # For NoneTracker, we need proposal+matching on every frame. For an
+    # active tracker, we still need extractor+prototype (but not
+    # proposal_model, which stays lazy) up front so periodic re-verification
+    # (see verify_interval below) is available from the first tracked frame,
+    # not only after a track has already been deemed lost.
     proposal_model = None
     extractor = None
     prototype = None
@@ -101,6 +105,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
         from aero_eyes.models.proposals import build_proposal_model
 
         proposal_model = build_proposal_model(cfg)
+        extractor = build_feature_extractor(cfg)
+        prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
+    elif cfg.stage4.verify_interval > 0:
+        from aero_eyes.models.features import build_feature_extractor
+
         extractor = build_feature_extractor(cfg)
         prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
 
@@ -121,6 +130,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
     tracks: dict[int, Box | None] = {}
     tracker_active = False
     track_age = 0
+    frames_since_verify = 0
 
     try:
         for frame_idx, frame_bgr in frame_iterator(video_path):
@@ -142,6 +152,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         tracker.init(frame_bgr, best.box)
                         tracker_active = True
                         track_age = 0
+                        frames_since_verify = 0
                         box_out = best.box
                         source = "detect"
                     else:
@@ -149,21 +160,47 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 elif tracker_active:
                     box, conf = tracker.update(frame_bgr)
                     track_age += 1
-                    if (conf >= s4.tracker_conf_threshold
-                            and track_age <= s4.max_track_age
-                            and box is not None):
+                    frames_since_verify += 1
+                    track_ok = (conf >= s4.tracker_conf_threshold
+                                and track_age <= s4.max_track_age
+                                and box is not None)
+
+                    # OpenCV's own "confidence" is a near-constant placeholder
+                    # (see BuiltinTracker.update) -- it cannot tell a drifted
+                    # lock from a correct one. Every verify_interval frames,
+                    # cross-check the tracked crop against the prototype with
+                    # the same DINOv2 embedding used for detection, so a
+                    # silently-drifted track gets caught within a few frames
+                    # instead of persisting for the full max_track_age.
+                    if (track_ok and box is not None and extractor is not None
+                            and prototype is not None and s4.verify_interval > 0
+                            and frames_since_verify >= s4.verify_interval):
+                        frames_since_verify = 0
+                        if not _track_still_matches(
+                            frame_bgr, box, extractor, prototype,
+                            per_ref_features, cfg, match_threshold,
+                        ):
+                            log.debug(
+                                "[Stage4] frame %d: track failed re-verification "
+                                "(likely drifted) -- forcing re-detect", frame_idx,
+                            )
+                            track_ok = False
+
+                    if track_ok:
                         box_out = box
                         source = "track"
                     else:
-                        # Confidence too low or track too old — try re-detect
+                        # Confidence too low, track too old, or failed
+                        # re-verification — try re-detect
                         tracker_active = False
                         if proposal_model is None:
                             # Lazy-init for re-detect fallback
-                            from aero_eyes.models.features import build_feature_extractor
                             from aero_eyes.models.proposals import build_proposal_model
                             proposal_model = build_proposal_model(cfg)
-                            extractor = build_feature_extractor(cfg)
-                            prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
+                            if extractor is None:
+                                from aero_eyes.models.features import build_feature_extractor
+                                extractor = build_feature_extractor(cfg)
+                                prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
 
                         box_out, source = _detect_on_frame(
                             frame_bgr, frame_idx, proposal_model, extractor,
@@ -173,6 +210,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             tracker.init(frame_bgr, box_out)
                             tracker_active = True
                             track_age = 0
+                            frames_since_verify = 0
 
             tracks[frame_idx] = box_out
 
@@ -193,6 +231,39 @@ def run_stage4(cfg, sample_id: str) -> Path:
     log.info("[Stage4] %s done in %.1fs -> %s (%d/%d frames with box)",
              sample_id, elapsed, tracks_path, present, total_frames)
     return tracks_path
+
+
+def _track_still_matches(
+    frame_bgr,
+    box: Box,
+    extractor,
+    prototype,
+    per_ref_features: list,
+    cfg,
+    match_threshold: float,
+) -> bool:
+    """Re-embed the currently-tracked crop and check it still resembles the
+    target. This is the real correctness check that `BuiltinTracker`'s own
+    fixed placeholder confidence cannot provide (see trackers.py)."""
+    feats = extractor.extract_crops(
+        frame_bgr, [box],
+        pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+        batch_size=1,
+    )
+    if feats.shape[0] == 0:
+        return False
+
+    use_multi_ref = (
+        cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+        and cfg.accuracy.cheap_boosters.multi_reference_embedding
+        and len(per_ref_features) > 0
+    )
+    if use_multi_ref:
+        sim = float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
+    else:
+        sim = float(feats[0] @ prototype)
+
+    return sim >= match_threshold
 
 
 def _detect_on_frame(

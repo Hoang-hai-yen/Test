@@ -28,12 +28,14 @@ class Tracker(ABC):
         """Advance tracker by one frame. Returns (box, confidence) or (None, 0)."""
 
 
-def _make_cv2_tracker(name: str):
-    """Create an OpenCV tracker, trying multiple API paths across versions."""
+def _resolve_cv2_tracker_ctor(name: str):
+    """Return the constructor for an OpenCV tracker, trying multiple API paths
+    across versions, or None if unavailable in the installed OpenCV build."""
     candidates = {
         "csrt":  ["cv2.legacy.TrackerCSRT_create",  "cv2.TrackerCSRT_create"],
         "kcf":   ["cv2.legacy.TrackerKCF_create",   "cv2.TrackerKCF_create"],
         "mosse": ["cv2.legacy.TrackerMOSSE_create", "cv2.TrackerMOSSE_create"],
+        "mil":   ["cv2.legacy.TrackerMIL_create",   "cv2.TrackerMIL_create"],
     }
     for dotpath in candidates[name]:
         parts = dotpath.split(".")
@@ -41,12 +43,41 @@ def _make_cv2_tracker(name: str):
         try:
             for p in parts[1:]:
                 obj = getattr(obj, p)
-            return obj()
+            return obj
         except AttributeError:
             continue
+    return None
+
+
+def _make_cv2_tracker(name: str):
+    """Create an OpenCV tracker, falling back to MIL if the requested
+    algorithm was removed from the installed OpenCV build.
+
+    OpenCV 5.x dropped CSRT/KCF/MOSSE from the Python bindings entirely (not
+    just moved to `cv2.legacy` — they no longer exist there either), so a
+    config asking for csrt/kcf/mosse would otherwise hard-fail regardless of
+    which opencv-contrib-python(-headless) version pip happens to resolve to.
+    MIL needs no extra weights and is present in both the old `cv2.legacy.*`
+    and the new top-level `cv2.*` API, so it's a safe universal fallback.
+    """
+    ctor = _resolve_cv2_tracker_ctor(name)
+    if ctor is not None:
+        return ctor()
+
+    if name != "mil":
+        fallback_ctor = _resolve_cv2_tracker_ctor("mil")
+        if fallback_ctor is not None:
+            log.warning(
+                "OpenCV tracker '%s' not available in this OpenCV build "
+                "(likely OpenCV >=5.0, which removed csrt/kcf/mosse from the "
+                "Python API) -- falling back to 'mil'.", name,
+            )
+            return fallback_ctor()
+
     raise RuntimeError(
-        f"OpenCV tracker '{name}' not found. "
-        "Install opencv-contrib-python:  pip install opencv-contrib-python-headless  "
+        f"OpenCV tracker '{name}' not found, and the 'mil' fallback is also "
+        "unavailable. Install opencv-contrib-python:  "
+        "pip install opencv-contrib-python-headless  "
         "or switch to  stage4.tracker: none  in config."
     )
 
@@ -58,6 +89,7 @@ class BuiltinTracker(Tracker):
         "csrt":  lambda: _make_cv2_tracker("csrt"),
         "kcf":   lambda: _make_cv2_tracker("kcf"),
         "mosse": lambda: _make_cv2_tracker("mosse"),
+        "mil":   lambda: _make_cv2_tracker("mil"),
     }
 
     def __init__(self, algorithm: str = "csrt"):
@@ -84,8 +116,17 @@ class BuiltinTracker(Tracker):
             return None, 0.0
         x, y, w, h = rect
         box = Box(float(x), float(y), float(x + w), float(y + h))
-        # OpenCV trackers don't expose a confidence — use a fixed high value
-        # when tracking succeeds; Stage 4 will re-detect if it fails.
+        # OpenCV trackers don't expose a real confidence score -- `success`
+        # only means the tracker didn't internally give up, NOT that the box
+        # is actually on the target (CSRT/MIL happily lock onto background
+        # clutter and keep reporting success while drifting). This 0.9 is a
+        # placeholder so callers have a well-formed (box, score) pair; it
+        # must NOT be trusted as a real quality signal. The actual
+        # correctness check lives in Stage 4 (`_should_reverify` /
+        # `_reverify_track` in stage4.py), which periodically re-embeds the
+        # tracked crop with DINOv2 and compares it against the prototype —
+        # relying on this fixed 0.9 alone would mean the
+        # `tracker_conf_threshold` gate almost never fires.
         return box, 0.9
 
 

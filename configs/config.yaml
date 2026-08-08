@@ -165,12 +165,23 @@ stage4:
                              #   litetrack = LiteTrack-B4 ONNX (needs weights)
                              #   none      = run detection on EVERY frame
   builtin:
-    algorithm: csrt          # csrt | kcf | mosse
+    algorithm: csrt          # csrt | kcf | mosse | mil
+                              # OpenCV >=5.0 removed csrt/kcf/mosse from the
+                              # Python API entirely -- if the installed OpenCV
+                              # doesn't have the requested algorithm,
+                              # aero_eyes.models.trackers auto-falls-back to
+                              # mil (logs a warning) instead of failing.
   litetrack:
     onnx_path: null          # REQUIRED if tracker=litetrack; else fail clearly
     input_size: 256
   tracker_conf_threshold: 0.40   # τ: below this → re-detect immediately
   max_track_age: 30          # frames a track survives without re-detection
+  # OpenCV trackers report a fixed placeholder confidence (see trackers.py),
+  # so tracker_conf_threshold alone rarely catches drift. Every N frames
+  # while tracking, re-embed the tracked crop with DINOv2 and compare
+  # against the prototype; below match_threshold -> forced re-detect.
+  # 0 disables this (old behaviour: trust the tracker until max_track_age).
+  verify_interval: 5
 
 # ----------------------------------------------------------------------------
 # STAGE 5 — Spatio-temporal output
