@@ -36,16 +36,30 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1) -> None:
             raise ValueError(f"No sample directories found under {data_root}")
 
     stage_fns = [run_stage1, run_stage2, run_stage3, run_stage4, run_stage5]
+    failed: list[str] = []
 
     for sid in sample_ids:
         log.info("=== Running pipeline for sample: %s (from stage %d) ===", sid, from_stage)
-        for stage_num, fn in enumerate(stage_fns, start=1):
-            if stage_num < from_stage:
-                log.debug("Skipping stage %d (--from-stage %d)", stage_num, from_stage)
-                continue
-            log.info("--- Stage %d ---", stage_num)
-            fn(cfg, sid)
+        try:
+            for stage_num, fn in enumerate(stage_fns, start=1):
+                if stage_num < from_stage:
+                    log.debug("Skipping stage %d (--from-stage %d)", stage_num, from_stage)
+                    continue
+                log.info("--- Stage %d ---", stage_num)
+                fn(cfg, sid)
+        except Exception:
+            # One sample failing (e.g. a missing optional dependency) must not
+            # discard results already computed for every other sample in the
+            # batch -- log and continue so run_all always produces whatever
+            # submissions it can.
+            log.exception("=== FAILED: %s -- continuing with remaining samples ===", sid)
+            failed.append(sid)
+            continue
         log.info("=== Done: %s ===", sid)
+
+    if failed:
+        log.warning("run_all finished with %d/%d samples failed: %s",
+                     len(failed), len(sample_ids), failed)
 
 
 def main():
