@@ -322,8 +322,15 @@ def _parse_override(s: str) -> tuple[list[str], str]:
         value: Any = True
     elif raw.lower() == "false":
         value = False
-    elif raw.lower() in ("null", "none", "~"):
+    elif raw.lower() in ("null", "~"):
         value = None
+        # NOTE: intentionally NOT treating the string "none" as an alias for
+        # null here. Several fields in this schema use "none" as a real
+        # enum value (stage4.tracker: "none" = detect every frame,
+        # stage2.proposal_model-style literals elsewhere) -- coercing it to
+        # Python None broke `--set stage4.tracker=none` with a pydantic
+        # "Input should be a valid string" error. Use "null" or "~" for an
+        # actual null override.
     else:
         try:
             value = int(raw)
