@@ -1,4 +1,3 @@
-%%writefile /content/aero_eyes/aero_eyes/stages/stage4.py
 """Stage 4 — Tracking between keyframes.
 
 Flow:  detections.json + video

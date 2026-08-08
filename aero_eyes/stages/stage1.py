@@ -1,4 +1,3 @@
-%%writefile /content/aero_eyes/aero_eyes/stages/stage1.py
 """Stage 1 — Reference processing (offline, runs once per target).
 
 Flow:  3 reference images

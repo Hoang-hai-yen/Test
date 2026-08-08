@@ -1,4 +1,3 @@
-%%writefile /content/aero_eyes/aero_eyes/stages/stage3.py
 """Stage 3 — Cross-domain matching.
 
 Flow:  candidates.json + prototype.npz

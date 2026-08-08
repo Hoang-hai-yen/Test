@@ -1,4 +1,3 @@
-%%writefile /content/aero_eyes/aero_eyes/stages/stage5.py
 """Stage 5 — Spatio-temporal output.
 
 Flow:  tracks.json
