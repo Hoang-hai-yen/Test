@@ -135,13 +135,19 @@ stage3:
   # per-video threshold = mean(sim) + adaptive_z_score * std(sim), floored at
   # adaptive_min_floor. Robust when the tiny top-down object's absolute
   # similarity to the close-up reference is unpredictable video to video.
-  adaptive_threshold: false
+  adaptive_threshold: true
   # adaptive_z_score: higher = fewer false positives, lower = more recall.
-  # Empirically swept on the aero-eyes-dataset PublicTest samples (DINOv2 +
-  # cheap_boosters): z=1.0->0.269, 1.5->0.312, 2.0->0.338 (best), 2.5->0.332,
-  # 3.0->0.268 mean ST-IoU. 2.0 is the validated default for this dataset —
-  # re-sweep if the domain gap or dataset changes.
-  adaptive_z_score: 2.0
+  # Re-swept via scripts/sweep_zscore_loocv.py on the real aero-eyes-dataset
+  # PublicTest 6-video set (baseline accuracy.mode, after fixing the stray
+  # %%writefile syntax bug in the stage modules): z=1.0->0.3744, 1.5->0.3933
+  # (best naive), 2.0->0.3480, 2.5->0.3109, 3.0->0.0983 (collapses -- 0
+  # detections on the hardest video). LOOCV honest estimate for z=1.5 (chosen
+  # for 5/6 videos without seeing the held-out one) = 0.3610, vs 0.3250 for
+  # the previous static match_threshold=0.55 -- so 1.5 is a real, non-overfit
+  # improvement, not just the best fit on this exact eval set. The earlier
+  # "2.0 is validated" note here was from a stale sweep and is superseded.
+  # Re-sweep if the domain gap, dataset, or upstream stage1/2/4/5 changes.
+  adaptive_z_score: 1.5
   adaptive_min_floor: 0.05   # hard floor: never accept sim below this even if adaptive
   # Optional auto-calibration of match_threshold on a labelled subset.
   calibrate:
