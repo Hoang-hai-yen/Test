@@ -330,6 +330,75 @@ class GeCo2Detector:
         return results
 
     # ------------------------------------------------------------------
+    # Domain calibration (stage123_geco2.domain_calibration) -- shifts
+    # exemplar appearance tokens toward this video's own feature-space
+    # region, correcting the systematic gap between running the backbone on
+    # an isolated reference photo vs. on a real video frame (two
+    # independent forward passes -> two different self-attention contexts
+    # -> different token statistics, independent of the object's true
+    # appearance).
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def frame_domain_embedding(self, frame_bgr: np.ndarray) -> dict[str, torch.Tensor]:
+        """Global-average-pooled backbone feature per scale for one frame --
+        a proxy for "what this video's own domain looks like in feature
+        space", in the same (1, 1, emb_dim) shape as a single exemplar
+        token so it can be compared/blended with prototype tokens directly.
+        """
+        padded, _ = self._load_and_pad(frame_bgr)
+        x = padded.unsqueeze(0).to(self.device)
+        feats = self.model.backbone(x)
+        return {
+            "main": feats["vision_features"].mean(dim=(2, 3)).unsqueeze(1).cpu(),
+            "l1": feats["backbone_fpn"][0].mean(dim=(2, 3)).unsqueeze(1).cpu(),
+            "l2": feats["backbone_fpn"][1].mean(dim=(2, 3)).unsqueeze(1).cpu(),
+        }
+
+    def estimate_domain_shift(self, sample_frames_bgr: list[np.ndarray]) -> dict[str, torch.Tensor]:
+        """Average frame_domain_embedding() over a handful of (unlabeled,
+        unpaired) frames sampled from the video -- an estimate of this
+        video's own mean token per scale, used as the calibration target.
+        """
+        if not sample_frames_bgr:
+            raise ValueError("estimate_domain_shift requires at least one sample frame")
+        sums: dict[str, torch.Tensor] = {}
+        for frame in sample_frames_bgr:
+            emb = self.frame_domain_embedding(frame)
+            for scale, v in emb.items():
+                sums[scale] = v if scale not in sums else sums[scale] + v
+        return {scale: v / len(sample_frames_bgr) for scale, v in sums.items()}
+
+    @staticmethod
+    def calibrate_prototype(
+        prototype: dict[str, torch.Tensor],
+        video_domain_means: dict[str, torch.Tensor],
+        num_refs: int,
+        strength: float,
+    ) -> dict[str, torch.Tensor]:
+        """Mean-shift the APPEARANCE tokens of `prototype` toward
+        `video_domain_means`, blended by `strength` (0 = no change, 1 =
+        appearance tokens' own mean fully replaced by the video's mean).
+        Shape tokens are left untouched -- they encode box (w,h), not
+        appearance, so they're not subject to the same domain gap.
+
+        Token layout per scale is [app_1, shape_1, app_2, shape_2, ...,
+        app_N, shape_N] (see GeCo2Detector.encode_exemplars: each ref image
+        contributes exactly one [exemplar, shape] pair, concatenated in
+        that order across refs) -- so appearance tokens sit at even indices
+        0, 2, 4, ... and shape tokens at odd indices.
+        """
+        app_idx = list(range(0, 2 * num_refs, 2))
+        calibrated: dict[str, torch.Tensor] = {}
+        for scale, tokens in prototype.items():
+            tokens = tokens.clone()
+            ref_mean = tokens[:, app_idx, :].mean(dim=1, keepdim=True)
+            delta = strength * (video_domain_means[scale] - ref_mean)
+            tokens[:, app_idx, :] = tokens[:, app_idx, :] + delta
+            calibrated[scale] = tokens
+        return calibrated
+
+    # ------------------------------------------------------------------
     # Prototype cache (torch tensors, not the numpy prototype.npz format)
     # ------------------------------------------------------------------
 

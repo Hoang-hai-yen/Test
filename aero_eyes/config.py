@@ -76,6 +76,22 @@ class SegmentationConfig(BaseModel):
     # edges, so a correctly-segmented subject essentially never reaches the
     # real border; a background plane (ground, wall, sky) commonly does.
     max_border_touch_frac: float = 0.02
+    # What to do with the non-mask (background) region of a reference image:
+    #   mean_fill -- flat mean-color fill (old/default behavior). Cheapest,
+    #                but a large flat, textureless region is far outside what
+    #                the backbone (pretrained on natural photos) ever saw --
+    #                empirically this can push the exemplar token into an
+    #                unnatural part of feature space.
+    #   keep_real -- leave the reference photo's real background untouched.
+    #                Only the tight mask bbox is used to pick the RoI-Align
+    #                region, so background never gets pooled into the token,
+    #                but the backbone still sees a natural image overall.
+    #   blur      -- strong Gaussian blur of the real background: keeps
+    #                natural color/texture statistics but discards fine
+    #                detail that could otherwise cause spurious background
+    #                matches.
+    background_mode: Literal["mean_fill", "keep_real", "blur"] = "mean_fill"
+    blur_sigma: float = 25.0  # Gaussian sigma (px) used when background_mode == "blur"
 
 
 class FeatureExtractorConfig(BaseModel):
@@ -296,6 +312,60 @@ class PipelineConfig(BaseModel):
     detector: Literal["legacy", "geco2"] = "legacy"
 
 
+class ScaleCalibrationConfig(BaseModel):
+    """Fixes the ground-to-aerial SIZE mismatch that ref_downscale_factor
+    cannot fix: GECO2/utils/data.py::resize_and_pad always re-normalizes the
+    WHOLE image's longer side back to stage123_geco2.image_size, so any
+    uniform pre-shrink of the reference photo (what ref_downscale_factor
+    does) gets exactly cancelled out by that re-normalization -- the
+    object's box-to-photo ratio is intrinsic to how the photo was framed
+    and is scale-invariant under uniform resize. The only lever that
+    actually changes that ratio is changing how much the object fills a
+    canvas (crop tighter/looser) -- see
+    aero_eyes/stages/stage123_geco2.py::_build_scale_calibrated_canvas,
+    which builds a synthetic canvas sized so the object occupies the same
+    fraction of the canvas as it's expected to occupy in the query video
+    frame after ITS OWN resize_and_pad.
+    """
+    enabled: bool = False
+    # Expected apparent size [width, height] in pixels of the object AS IT
+    # APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- e.g.
+    # estimated from flight altitude/GSD, or eyeballed on a sample frame.
+    # Required when enabled=true; there is no safe default (a wrong value
+    # actively hurts -- it recreates the same kind of scale mismatch this
+    # feature exists to remove, just in a different direction).
+    expected_object_px: Optional[list[float]] = None
+    # Extra padding kept around the tight mask box, as a fraction of the
+    # object's own size, before that (object+margin) footprint is calibrated
+    # to match expected_object_px -- gives the model a bit of surrounding
+    # context instead of the object filling the canvas edge-to-edge.
+    context_margin: float = 0.5
+
+    @field_validator("expected_object_px")
+    @classmethod
+    def check_expected_object_px(cls, v: Optional[list[float]]) -> Optional[list[float]]:
+        if v is not None and len(v) != 2:
+            raise ValueError("scale_calibration.expected_object_px must be [width, height]")
+        return v
+
+
+class DomainCalibrationConfig(BaseModel):
+    """Shifts exemplar APPEARANCE tokens (not shape tokens) toward the
+    feature-space region the backbone actually produces for this video's
+    own frames. Even with correct scale and a natural background
+    (background_mode != mean_fill), running the backbone on an isolated
+    reference photo vs. on a real video frame are two independent forward
+    passes with two different self-attention contexts -- see
+    GeCo2Detector.estimate_domain_shift / calibrate_prototype. This
+    computes the video's own mean token (from a few sampled frames,
+    unpaired/unlabeled) and nudges each exemplar's appearance token toward
+    it, blended by `strength`.
+    """
+    enabled: bool = False
+    num_sample_frames: int = 5
+    strength: float = 1.0  # 0 = no change, 1 = fully match the video's own mean token
+
+
 class Stage123Geco2Config(BaseModel):
     """Only used when pipeline.detector == 'geco2'. Requires the vendored
     GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
@@ -339,7 +409,29 @@ class Stage123Geco2Config(BaseModel):
     # resize_and_pad -- so the effective blur amount depends on how the
     # shrunk size compares to image_size, not just this factor alone (a
     # given factor blurs a low-res ref photo far more than a high-res one).
+    # NOTE: proven no-op on final object SIZE on the model's canvas (see
+    # ScaleCalibrationConfig docstring) -- it only affects blur/detail level.
+    # Use scale_calibration below to actually fix apparent-size mismatch.
     ref_downscale_factor: float = 1.0
+    scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
+    domain_calibration: DomainCalibrationConfig = DomainCalibrationConfig()
+
+    @model_validator(mode="after")
+    def check_scale_calibration(self) -> "Stage123Geco2Config":
+        if self.scale_calibration.enabled:
+            if not self.scale_calibration.expected_object_px:
+                raise ValueError(
+                    "stage123_geco2.scale_calibration.enabled=true requires "
+                    "stage123_geco2.scale_calibration.expected_object_px=[w,h] "
+                    "(estimated object size in the RAW video frame, pixels)."
+                )
+            if not self.segmentation.enabled:
+                raise ValueError(
+                    "stage123_geco2.scale_calibration.enabled=true requires "
+                    "stage123_geco2.segmentation.enabled=true (scale calibration builds "
+                    "its canvas around the MobileSAM tight mask box)."
+                )
+        return self
 
 
 # ---------------------------------------------------------------------------

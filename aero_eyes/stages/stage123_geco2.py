@@ -36,12 +36,42 @@ def _apply_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Fill everything outside `mask` with the image's own mean color
     (same approach as stage1.py) -- a solid-black background would be
     out-of-distribution for the backbone; the mean color is a milder,
-    less distracting stand-in.
+    less distracting stand-in. This is background_mode == "mean_fill".
     """
     masked = img.copy()
     bg_color = img.reshape(-1, 3).mean(axis=0)
     masked[~mask] = bg_color
     return masked
+
+
+def _apply_background(img: np.ndarray, mask: np.ndarray, mode: str, blur_sigma: float) -> np.ndarray:
+    """Replace (or keep) the non-mask region of `img` per
+    stage123_geco2.segmentation.background_mode:
+
+      mean_fill -- flat mean-color fill (_apply_mask above, old default).
+                   Cheapest, but a large flat, textureless region is far
+                   outside what the backbone (pretrained on natural photos)
+                   ever saw -- can push the exemplar token into an
+                   unnatural part of feature space.
+      keep_real -- leave the reference photo's real background untouched.
+                   The tight mask bbox still controls WHERE RoI-Align
+                   pools from, so background pixels never enter the token
+                   directly -- but the backbone's self-attention still
+                   sees a natural image overall (its own real photo
+                   context), not a synthetic flat region.
+      blur      -- strong Gaussian blur of the real background: keeps
+                   natural color/texture statistics but discards fine
+                   detail that could otherwise cause spurious background
+                   matches.
+    """
+    if mode == "keep_real":
+        return img
+    if mode == "blur":
+        blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=blur_sigma)
+        out = img.copy()
+        out[~mask] = blurred[~mask]
+        return out
+    return _apply_mask(img, mask)
 
 
 def _mask_bbox(mask: np.ndarray) -> tuple[float, float, float, float] | None:
@@ -77,6 +107,82 @@ def _apply_ref_downscale(img, downscale_factor: float):
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
+def _build_scale_calibrated_canvas(
+    img: np.ndarray,
+    mask: np.ndarray,
+    tight_box: tuple[float, float, float, float],
+    expected_object_px: tuple[float, float],
+    video_longer_dim: int,
+    context_margin: float,
+    background_mode: str,
+    blur_sigma: float,
+    canvas_px: int,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Build a `canvas_px` x `canvas_px` canvas where the object occupies
+    the SAME fraction of the canvas's side as it's expected to occupy in
+    the query video frame after ITS OWN resize_and_pad -- the one thing
+    stage123_geco2.ref_downscale_factor cannot do (see
+    ScaleCalibrationConfig docstring for why a uniform pre-shrink of the
+    whole photo is exactly cancelled out by resize_and_pad; only changing
+    how much the object fills a canvas -- i.e. cropping tighter/looser --
+    actually changes that ratio).
+
+    Conceptually this crops a square region of the ORIGINAL reference
+    photo, centered on the object and sized so the object (plus
+    `context_margin` of extra padding) maps to exactly `expected_object_px`
+    at native resolution -- but for a small/distant target that "ideal"
+    region can be enormous (tens of thousands of px, mostly empty
+    background) relative to the object, so it's never materialized at that
+    size: cv2.warpAffine renders directly into the final `canvas_px` output
+    (matching stage123_geco2.image_size, so the resize_and_pad call right
+    after this is a geometric no-op -- our canvas is already the right
+    size), scaling and cropping/padding in one pass regardless of how
+    large the conceptual source region is.
+
+    Returns (canvas_bgr, object_box_in_canvas_px). Pixels outside the
+    photo's own bounds are filled with the photo's mean color (there is no
+    real pixel data out there, regardless of background_mode).
+    """
+    x1, y1, x2, y2 = tight_box
+    obj_size = max(x2 - x1, y2 - y1) * (1.0 + context_margin)
+    target_ratio = max(expected_object_px) / float(video_longer_dim)
+    if target_ratio <= 0:
+        raise ValueError("scale_calibration: expected_object_px / video frame size must be > 0")
+    ideal_native_size = obj_size / target_ratio   # conceptual source-crop side, native px (can be huge)
+    resize_ratio = canvas_px / ideal_native_size    # scale applied while rendering into canvas_px
+
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    src_x1, src_y1 = cx - ideal_native_size / 2.0, cy - ideal_native_size / 2.0
+
+    processed = _apply_background(img, mask, background_mode, blur_sigma)
+    bg_color = img.reshape(-1, 3).mean(axis=0)
+    affine = np.array([
+        [resize_ratio, 0.0, -src_x1 * resize_ratio],
+        [0.0, resize_ratio, -src_y1 * resize_ratio],
+    ], dtype=np.float32)
+    canvas = cv2.warpAffine(
+        processed, affine, (canvas_px, canvas_px),
+        borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(float(c) for c in bg_color),
+    )
+
+    box_in_canvas = (
+        (x1 - src_x1) * resize_ratio, (y1 - src_y1) * resize_ratio,
+        (x2 - src_x1) * resize_ratio, (y2 - src_y1) * resize_ratio,
+    )
+    return canvas, box_in_canvas
+
+
+def _locate_video(cfg, sample_id: str) -> Path:
+    data_root = Path(cfg.data.data_root)
+    video_dir = data_root / sample_id
+    video_files = list(video_dir.glob(cfg.data.video_glob))
+    if not video_files:
+        raise FileNotFoundError(
+            f"No video matching '{cfg.data.video_glob}' found in {video_dir}."
+        )
+    return video_files[0]
+
+
 def _load_ref_images(cfg, sample_id: str) -> list:
     data_root = Path(cfg.data.data_root)
     refs_dir = data_root / sample_id / cfg.data.refs_subdir
@@ -106,6 +212,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     """
     from aero_eyes.models.geco2_detector import GeCo2Detector
     from aero_eyes.utils import viz as vizmod
+    from aero_eyes.utils.video import read_frame, video_info
 
     g = cfg.stage123_geco2
     proto_path = work_dir / g.prototype_cache_name
@@ -116,11 +223,12 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     ref_imgs = _load_ref_images(cfg, sample_id)
 
     # Exemplar box passed to encode_exemplars(), in the coord system of
-    # whichever ref_imgs actually get passed to it (i.e. post-downscale
-    # below). None = whole image (encode_exemplars' default).
+    # whichever ref_imgs actually get passed to it. None = whole image
+    # (encode_exemplars' default).
     ref_boxes: list[tuple[float, float, float, float] | None] | None = None
 
     seg_cfg = g.segmentation
+    sc_cfg = g.scale_calibration
     if seg_cfg.enabled:
         from aero_eyes.models.segmentation import MobileSAMSegmenter
         segmenter = MobileSAMSegmenter(
@@ -132,24 +240,80 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             max_border_touch_frac=seg_cfg.max_border_touch_frac,
         )
         masks = [segmenter.segment(img) for img in ref_imgs]
-        # Tight box around the actual segmented object, BEFORE downscale --
-        # RoI-align-ing the whole (masked) image instead pools in a lot of
-        # mean-color-filled background + any resize_and_pad zero-padding,
-        # diluting the exemplar token (empirically confirmed to matter).
+        # Tight box around the actual segmented object, on the ORIGINAL
+        # (pre-downscale/pre-canvas) ref photo -- RoI-align-ing the whole
+        # (masked) image instead pools in a lot of background + any
+        # resize_and_pad zero-padding, diluting the exemplar token
+        # (empirically confirmed to matter).
         raw_boxes = [_mask_bbox(m) for m in masks]
-        ref_imgs = [_apply_mask(img, m) for img, m in zip(ref_imgs, masks)]
-        if cfg.runtime.save_visualizations:
-            vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
-        # Scale into the coord system _apply_ref_downscale below produces
-        # (uniform factor in both axes, matching that function).
-        f = g.ref_downscale_factor
-        ref_boxes = [
-            tuple(c * f for c in b) if b is not None else None
-            for b in raw_boxes
-        ]
 
-    ref_imgs = [_apply_ref_downscale(img, g.ref_downscale_factor) for img in ref_imgs]
+        if sc_cfg.enabled:
+            # scale_calibration: build a canvas per ref image where the
+            # object occupies the same canvas-relative size it's expected
+            # to occupy in the query video frame -- see
+            # _build_scale_calibrated_canvas for why ref_downscale_factor
+            # alone cannot do this.
+            video_path = _locate_video(cfg, sample_id)
+            info = video_info(video_path)
+            video_longer_dim = max(info["width"], info["height"])
+            canvases, canvas_boxes = [], []
+            for img, m, b in zip(ref_imgs, masks, raw_boxes):
+                if b is None:
+                    # Empty mask (fallback/edge case) -- nothing to
+                    # calibrate against; fall back to whole-image exemplar.
+                    canvases.append(img)
+                    canvas_boxes.append(None)
+                    continue
+                canvas, box_c = _build_scale_calibrated_canvas(
+                    img, m, b, tuple(sc_cfg.expected_object_px), video_longer_dim,
+                    sc_cfg.context_margin, seg_cfg.background_mode, seg_cfg.blur_sigma,
+                    canvas_px=g.image_size,
+                )
+                canvases.append(canvas)
+                canvas_boxes.append(box_c)
+            if cfg.runtime.save_visualizations:
+                out_dir = work_dir / "viz" / "stage123_geco2" / "refs_scale_calibrated"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                for i, c in enumerate(canvases):
+                    cv2.imwrite(str(out_dir / f"ref_{i}_calibrated.jpg"), c)
+            ref_imgs = canvases
+            ref_boxes = canvas_boxes
+        else:
+            ref_imgs = [_apply_background(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
+                        for img, m in zip(ref_imgs, masks)]
+            if cfg.runtime.save_visualizations:
+                vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+            # Scale into the coord system _apply_ref_downscale below produces
+            # (uniform factor in both axes, matching that function). NOTE:
+            # this only affects blur/detail -- it does NOT change the
+            # object's final size on the model's canvas (resize_and_pad
+            # re-normalizes the whole image's longer side regardless; see
+            # ScaleCalibrationConfig docstring). Use scale_calibration above
+            # to fix apparent-size mismatch.
+            f = g.ref_downscale_factor
+            ref_boxes = [
+                tuple(c * f for c in b) if b is not None else None
+                for b in raw_boxes
+            ]
+            ref_imgs = [_apply_ref_downscale(img, f) for img in ref_imgs]
+
     prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
+
+    dc_cfg = g.domain_calibration
+    if dc_cfg.enabled:
+        video_path = _locate_video(cfg, sample_id)
+        info = video_info(video_path)
+        total_frames = info["total_frames"]
+        n = max(1, min(dc_cfg.num_sample_frames, total_frames))
+        sample_idxs = sorted(set(np.linspace(0, max(total_frames - 1, 0), num=n).astype(int).tolist()))
+        sample_frames = [read_frame(video_path, i) for i in sample_idxs]
+        video_domain_means = detector.estimate_domain_shift(sample_frames)
+        prototype = GeCo2Detector.calibrate_prototype(
+            prototype, video_domain_means, num_refs=len(ref_imgs), strength=dc_cfg.strength,
+        )
+        log.info("[Stage123-GeCo2] %s: domain-calibrated exemplar tokens using %d sample frames "
+                 "(strength=%.2f)", sample_id, len(sample_frames), dc_cfg.strength)
+
     GeCo2Detector.save_prototype(prototype, proto_path)
     log.info("[Stage123-GeCo2] %s: encoded %d reference exemplars -> %s",
              sample_id, len(ref_imgs), proto_path)

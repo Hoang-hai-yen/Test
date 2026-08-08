@@ -203,6 +203,17 @@ stage123_geco2:
     # background plane commonly runs off-frame). Raise if legitimate subjects
     # in your reference photos are shot edge-to-edge with no margin.
     max_border_touch_frac: 0.02
+    # What to do with the non-mask (background) region of a reference image:
+    #   mean_fill (default) -- flat mean-color fill. Cheapest, but a large
+    #     flat, textureless region is far outside what the backbone
+    #     (pretrained on natural photos) ever saw -- can push the exemplar
+    #     token into an unnatural part of feature space.
+    #   keep_real -- leave the reference photo's real background untouched
+    #     (mask still controls the RoI-Align box, just not the pixels).
+    #   blur -- strong Gaussian blur of the real background: keeps natural
+    #     color/texture statistics, discards fine background detail.
+    background_mode: mean_fill
+    blur_sigma: 25.0   # used when background_mode: blur
   image_size: 1024
   emb_dim: 256
   kernel_dim: 3
@@ -234,7 +245,52 @@ stage123_geco2:
   # upscaled back up to image_size by resize_and_pad -- so the effective
   # blur depends on shrunk-size vs image_size, not just this factor alone
   # (a given factor blurs a low-res ref photo far more than a high-res one).
+  # NOTE: proven a no-op on the object's final SIZE on the model's canvas --
+  # resize_and_pad always re-normalizes the whole image's longer side back
+  # to image_size regardless of any uniform pre-shrink, so this only affects
+  # blur/detail. Use scale_calibration below to fix apparent-size mismatch.
   ref_downscale_factor: 1.0   # e.g. 0.125 = resize down to 1/8 size
+
+  # --------------------------------------------------------------------
+  # Fixes the ground-to-aerial SIZE mismatch ref_downscale_factor cannot
+  # fix (see note above): builds a synthetic canvas per reference image,
+  # centered on the MobileSAM tight mask box, sized so the object occupies
+  # the same fraction of the canvas as it's expected to occupy in the query
+  # video frame after ITS OWN resize_and_pad. Requires segmentation.enabled
+  # (needs the tight mask box). See
+  # aero_eyes/stages/stage123_geco2.py::_build_scale_calibrated_canvas.
+  # --------------------------------------------------------------------
+  scale_calibration:
+    enabled: false
+    # Expected apparent size [width, height] in pixels of the object AS IT
+    # APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- estimate
+    # from flight altitude/GSD, or eyeball it on a sample frame. Required
+    # when enabled: true -- do NOT guess a value blind, a wrong estimate
+    # actively hurts (recreates the same kind of scale mismatch this exists
+    # to remove, just in a different direction).
+    expected_object_px: null   # e.g. [22, 18]
+    # Extra padding kept around the tight mask box, as a fraction of the
+    # object's own size, before that (object+margin) footprint is
+    # calibrated to expected_object_px -- gives the model a bit of
+    # surrounding context instead of the object filling the canvas
+    # edge-to-edge.
+    context_margin: 0.5
+
+  # --------------------------------------------------------------------
+  # Shifts exemplar APPEARANCE tokens (not shape tokens) toward the
+  # feature-space region the backbone actually produces for THIS video's
+  # own frames. Even with correct scale + a natural background
+  # (segmentation.background_mode != mean_fill), encoding the reference
+  # photo and the query frame are two independent backbone forward passes
+  # with two different self-attention contexts -- this corrects the
+  # resulting systematic token-statistics gap, independent of the object's
+  # true appearance. See GeCo2Detector.estimate_domain_shift /
+  # calibrate_prototype.
+  # --------------------------------------------------------------------
+  domain_calibration:
+    enabled: false
+    num_sample_frames: 5   # unlabeled video frames sampled to estimate "this video's own domain"
+    strength: 1.0           # 0 = no change, 1 = fully match the video's own mean token
 
 # ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes
