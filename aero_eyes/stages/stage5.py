@@ -120,12 +120,12 @@ def run_stage5(cfg, sample_id: str) -> Path:
     else:
         tube = dict(raw_tube)
 
-    # ---- Fill short gaps (ÉP BUỘC max_gap nếu user chưa config) ----
-    max_gap_val = getattr(s5, "fill_short_gaps", 5)
-    if max_gap_val < 5:
-        max_gap_val = 5 # Đảm bảo hàn gap tối đa 5 frames theo yêu cầu
-
-    tube = _fill_gaps(tube, max_gap=max_gap_val)
+    # ---- Fill short gaps ----
+    # Respect configs/config.yaml's stage5.fill_short_gaps as-is -- this used
+    # to be silently floored to 5 regardless of what was configured, so a
+    # stricter value (e.g. 3) had no effect and the actual behaviour didn't
+    # match the number in the config file.
+    tube = _fill_gaps(tube, max_gap=s5.fill_short_gaps)
 
     # ---- Drop short tube segments ----
     segments = _split_into_segments(tube)
