@@ -183,6 +183,22 @@ def run_stage3(cfg, sample_id: str) -> Path:
             effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
         else:
             effective_threshold = raw_threshold
+        # Cap at the video's own best observed score. mean + z*std is a
+        # statistical estimate, not a hard ceiling -- on a video where the
+        # score distribution has high spread, it can end up a hair above
+        # the actual max (seen in practice: max=0.727 vs threshold=0.736),
+        # rejecting a genuinely good top match and producing zero detections
+        # for the whole video even though a strong candidate existed. The
+        # top candidate should never be discarded purely because the
+        # threshold formula overshot the data range.
+        sim_max = float(all_sims.max())
+        if effective_threshold > sim_max:
+            log.info(
+                "[Stage3] %s: adaptive threshold %.3f exceeds max score %.3f -- "
+                "capping at max so the best candidate isn't dropped.",
+                sample_id, effective_threshold, sim_max,
+            )
+            effective_threshold = sim_max
         log.info("[Stage3] %s: adaptive threshold = %.3f", sample_id, effective_threshold)
     else:
         effective_threshold = threshold
