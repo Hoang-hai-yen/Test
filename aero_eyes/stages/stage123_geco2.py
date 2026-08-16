@@ -32,6 +32,23 @@ from aero_eyes.types import Detection
 log = logging.getLogger(__name__)
 
 
+def _center_box_mask(shape: tuple, ratio: float) -> np.ndarray:
+    """CẢI TIẾN (ported from stage1.py): fallback an toàn khi MobileSAM cho ra
+    mask diện tích phi lý (quá nhỏ hoặc quá lớn so với khung ảnh). Thay vì
+    passthrough toàn khung (kéo theo nhiễu nền/môi trường thẳng vào exemplar
+    token -> hỏng matching ở bước detect), ta giả định ảnh reference luôn có
+    vật thể nằm ở trung tâm khung hình (đặc thù ảnh chụp cận cảnh tham
+    chiếu), nên dùng 1 vùng crop trung tâm với padding hợp lý làm mask thay
+    thế.
+    """
+    h, w = shape[:2]
+    mh, mw = int(round(h * ratio)), int(round(w * ratio))
+    y0, x0 = max(0, (h - mh) // 2), max(0, (w - mw) // 2)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[y0:y0 + mh, x0:x0 + mw] = True
+    return mask
+
+
 def _apply_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Fill everything outside `mask` with the image's own mean color
     (same approach as stage1.py) -- a solid-black background would be
@@ -239,7 +256,28 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             score_ratio_floor=seg_cfg.score_ratio_floor,
             max_border_touch_frac=seg_cfg.max_border_touch_frac,
         )
-        masks = [segmenter.segment(img) for img in ref_imgs]
+        # CẢI TIẾN (từ Stage 1): nếu MobileSAM cho ra mask diện tích phi lý
+        # (quá nhỏ hoặc quá lớn so với khung ảnh reference), dùng center-crop
+        # fallback thay vì để nguyên -- một mask gần như trống hoặc gần như
+        # phủ hết khung sẽ kéo theo nhiễu nền/môi trường thẳng vào exemplar
+        # token và hỏng luôn matching ở bước detect. Có default an toàn nên
+        # KHÔNG cần sửa file config để phát huy tác dụng.
+        mask_min_ratio = getattr(seg_cfg, "min_valid_mask_ratio", 0.03)
+        mask_max_ratio = getattr(seg_cfg, "max_valid_mask_ratio", 0.92)
+        center_fallback_ratio = getattr(seg_cfg, "center_fallback_ratio", 0.75)
+
+        masks = []
+        for img in ref_imgs:
+            mask = segmenter.segment(img)
+            mask_ratio = float(mask.sum()) / float(mask.size)
+            if mask_ratio < mask_min_ratio or mask_ratio > mask_max_ratio:
+                log.warning(
+                    "[Stage123-GeCo2] %s: MobileSAM mask area implausible (%.1f%% of frame), "
+                    "dùng center-crop fallback (ratio=%.2f) thay vì passthrough toàn khung.",
+                    sample_id, mask_ratio * 100.0, center_fallback_ratio,
+                )
+                mask = _center_box_mask(img.shape, center_fallback_ratio)
+            masks.append(mask)
         # Tight box around the actual segmented object, on the ORIGINAL
         # (pre-downscale/pre-canvas) ref photo -- RoI-align-ing the whole
         # (masked) image instead pools in a lot of background + any
@@ -320,12 +358,36 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     return prototype
 
 
+def _detect_frame_raw(detector, frame_bgr: np.ndarray, prototype):
+    """Pass-1 proposals for one keyframe, BEFORE any per-frame thresholding.
+
+    detector.detect_frame() normally filters+NMS's internally against
+    cfg.stage123_geco2.score_threshold_ratio -- i.e. relative to THAT
+    frame's own max score. That is exactly the failure mode CẢI TIẾN 2/3
+    below fix: a keyframe with no real target still has a "best" box by
+    construction, so a per-frame-relative threshold always keeps something
+    (rác boxes on empty frames -- e.g. tracker bám theo bãi cỏ). We need the
+    raw, un-thresholded scores here so run_stage123_geco2 can build one
+    global score distribution across the whole video first, and only then
+    decide what counts as a real match.
+
+    `score_threshold_ratio=0.0` is the override GeCo2Detector exposes for
+    this (falls back to the detector's own configured ratio on older
+    builds that don't support the kwarg, in which case the global pass
+    below just degrades to reusing the per-frame-filtered boxes).
+    """
+    try:
+        return detector.detect_frame(frame_bgr, prototype, score_threshold_ratio=0.0)
+    except TypeError:
+        return detector.detect_frame(frame_bgr, prototype)
+
+
 def run_stage123_geco2(cfg, sample_id: str) -> Path:
     """Run the merged GeCo2 stage for one sample. Returns path to detections.json."""
     from aero_eyes.models.geco2_detector import GeCo2Detector
     from aero_eyes.utils import viz as vizmod
     from aero_eyes.utils.io import write_detections
-    from aero_eyes.utils.video import frame_iterator, keyframe_indices, video_info
+    from aero_eyes.utils.video import frame_iterator, keyframe_indices, read_frame, video_info
 
     t0 = time.time()
     work_dir = Path(cfg.project.work_dir) / sample_id
@@ -355,29 +417,93 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     kf_indices = set(keyframe_indices(total_frames, cfg.stage123_geco2.keyframe_interval))
     viz_dir = work_dir / "viz" / "stage123_geco2"
 
-    detections: dict[int, list[Detection]] = {}
+    # CẢI TIẾN 2 (từ Stage 2/3): per-frame relative thresholding filters
+    # against each frame's OWN best score, so a keyframe with no real target
+    # still keeps its "best" box -- across a whole video that means rác
+    # boxes on every empty frame. Instead: collect raw candidate boxes for
+    # every keyframe first (Pass 1), then filter using ONE global score
+    # distribution over the entire video (Pass 2), matching what stage3.py
+    # already did for the legacy pipeline.
+    per_frame_raw: dict[int, list] = {}
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
+        per_frame_raw[frame_idx] = _detect_frame_raw(detector, frame_bgr, prototype)
+        log.debug("[Stage123-GeCo2] frame %d: %d raw candidates", frame_idx, len(per_frame_raw[frame_idx]))
 
-        boxes = detector.detect_frame(frame_bgr, prototype)
+    all_scores = np.array(
+        [b.score for boxes in per_frame_raw.values() for b in boxes], dtype=np.float32
+    )
+
+    # CẢI TIẾN 3: Adaptive Global Z-Score Threshold — threshold = max(abs
+    # floor, mean + z*std) over the pooled score distribution of the whole
+    # video, rather than per-frame. Có default an toàn (getattr) nên KHÔNG
+    # cần sửa file config để phát huy tác dụng.
+    ad_enabled = getattr(cfg.stage123_geco2, "adaptive_threshold", True)
+    ad_z = getattr(cfg.stage123_geco2, "adaptive_z_score", 1.0)
+    ad_abs_floor = getattr(cfg.stage123_geco2, "adaptive_min_floor", 0.15)
+    nms_iou = getattr(cfg.stage123_geco2, "nms_iou", 0.5)
+    topk_per_keyframe = getattr(cfg.stage123_geco2, "topk_per_keyframe", None)
+
+    if ad_enabled and all_scores.size > 0:
+        sim_mean = float(all_scores.mean())
+        sim_std = float(all_scores.std())
+        raw_threshold = sim_mean + ad_z * sim_std
+        effective_threshold = max(ad_abs_floor, raw_threshold)
+
+        # Cap at the video's own best observed score -- mean + z*std is a
+        # statistical estimate, not a hard ceiling; on a high-spread video
+        # it can end up above the actual max, rejecting a genuinely good
+        # top match and producing zero detections for the whole video even
+        # though a strong candidate existed (same failure mode fixed in
+        # stage3.py's adaptive threshold).
+        sim_max = float(all_scores.max())
+        if effective_threshold > sim_max:
+            log.info(
+                "[Stage123-GeCo2] %s: adaptive threshold %.3f exceeds max score %.3f -- "
+                "capping at max so the best candidate isn't dropped.",
+                sample_id, effective_threshold, sim_max,
+            )
+            effective_threshold = sim_max
+        log.info(
+            "[Stage123-GeCo2] %s: global adaptive threshold = %.3f "
+            "(mean=%.3f std=%.3f z=%.2f, n=%d candidates over %d keyframes)",
+            sample_id, effective_threshold, sim_mean, sim_std, ad_z,
+            all_scores.size, len(per_frame_raw),
+        )
+    elif all_scores.size > 0:
+        effective_threshold = ad_abs_floor
+    else:
+        effective_threshold = None
+
+    from aero_eyes.utils.geometry import nms as do_nms
+
+    detections: dict[int, list[Detection]] = {}
+    for frame_idx, boxes in per_frame_raw.items():
+        if effective_threshold is not None:
+            boxes = [b for b in boxes if b.score >= effective_threshold]
+
+        if boxes:
+            keep = do_nms(boxes, iou_threshold=nms_iou)
+            boxes = [boxes[i] for i in keep]
+            boxes.sort(key=lambda b: b.score, reverse=True)
+            if topk_per_keyframe is not None:
+                boxes = boxes[:topk_per_keyframe]
+
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
             for b in boxes
         ]
         detections[frame_idx] = result_dets
-        log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
 
         if cfg.runtime.save_visualizations:
+            frame_bgr = read_frame(video_path, frame_idx)
             vizmod.save_stage3_detections(
                 frame_bgr, [d.box for d in result_dets], [d.similarity for d in result_dets],
                 frame_idx, viz_dir,
             )
 
-    # No single global threshold applies (GeCo2 thresholds relative to each
-    # frame's own max score) -- Stage 4's geco2-aware re-detect path reads
-    # stage123_geco2.score_threshold_ratio directly instead of this field.
-    write_detections(detections, det_path, threshold=None)
+    write_detections(detections, det_path, threshold=effective_threshold)
 
     elapsed = time.time() - t0
     log.info("[Stage123-GeCo2] %s done in %.1fs -> %s (%d detection frames)",
