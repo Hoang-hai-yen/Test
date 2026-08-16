@@ -63,16 +63,19 @@ class SegmentationConfig(BaseModel):
     model: str = "mobilesam"
     weights: Optional[str] = None
     fallback_if_missing: str = "passthrough"
+    min_area_frac: float = 0.05
+    max_area_frac: float = 0.95
+    score_ratio_floor: float = 0.85
+    max_border_touch_frac: float = 0.02
+    background_mode: Literal["mean_fill", "keep_real", "blur"] = "mean_fill"
+    blur_sigma: float = 25.0
 
 
 class FeatureExtractorConfig(BaseModel):
     model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
-    # DINOv3 weights are gated on HuggingFace (facebook/dinov3-*) -- request
-    # access on the model page and set HF_TOKEN before using this.
     dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
-    clip_variant: str = "vit-b/32"   # "vit-b/32" (512-d) or "vit-l/14" (768-d)
-    # SigLIP: open access (no gating), vision-only encoder.
+    clip_variant: str = "vit-b/32"
     siglip_variant: Literal["base", "large", "so400m"] = "base"
     weights: Optional[str] = None
     image_size: int = 224
@@ -85,12 +88,9 @@ class PrototypeConfig(BaseModel):
 
 
 class AerialSimConfig(BaseModel):
-    """Degrade reference images to look more like a distant aerial capture
-    before feature extraction, to shrink the domain gap between crisp
-    close-up references and the drone's actual view of the object."""
     enabled: bool = False
-    downscale_factor: float = 1.0  # e.g. 0.25 = shrink to 1/4 then upscale back (simulate distance)
-    blur_ksize: int = 0  # Gaussian blur kernel size in px, 0 = off (simulate motion/optical blur)
+    downscale_factor: float = 1.0
+    blur_ksize: int = 0
 
 
 class Stage1Config(BaseModel):
@@ -159,16 +159,10 @@ class Stage3Config(BaseModel):
     match_threshold: float = 0.55
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
-    # When cross-domain gap is large, absolute threshold fails.
-    # global_topk: cap on how many candidates to keep globally (applied AFTER filtering).
-    # None = no cap.  Recommended: 30–100 when domain gap is large.
     global_topk: Optional[int] = None
-    # adaptive_threshold: compute per-video threshold as mean + z_score * std.
-    # Robust to domain gap — adapts to the actual similarity distribution.
-    # Replaces match_threshold when enabled.
     adaptive_threshold: bool = False
-    adaptive_z_score: float = 2.0   # higher = fewer FP, lower = more recall (see configs/config.yaml for the sweep)
-    adaptive_min_floor: float = 0.05  # hard floor: never accept sim below this
+    adaptive_z_score: float = 2.0
+    adaptive_min_floor: float = 0.05
     calibrate: CalibrateConfig = CalibrateConfig()
 
 
@@ -181,20 +175,20 @@ class LiteTrackConfig(BaseModel):
     input_size: int = 256
 
 
+class DetectionConfirmationConfig(BaseModel):
+    enabled: bool = False
+    required_hits: int = 2
+    iou_threshold: float = 0.3
+
+
 class Stage4Config(BaseModel):
     tracker: str = "builtin"
     builtin: BuiltinTrackerConfig = BuiltinTrackerConfig()
     litetrack: LiteTrackConfig = LiteTrackConfig()
     tracker_conf_threshold: float = 0.40
     max_track_age: int = 30
-    # OpenCV trackers (csrt/kcf/mosse/mil) report a fixed placeholder
-    # confidence on every "successful" update -- they cannot tell drift from
-    # a correct lock, so tracker_conf_threshold alone almost never fires.
-    # Every verify_interval frames while tracking, re-embed the tracked crop
-    # with DINOv2 and compare it against the prototype; treat the track as
-    # lost (trigger re-detect) if similarity falls below the match threshold.
-    # Set to 0 to disable (old behaviour: trust the tracker until max_track_age).
     verify_interval: int = 5
+    confirm_detections: DetectionConfirmationConfig = DetectionConfirmationConfig()
 
     @field_validator("tracker")
     @classmethod
@@ -255,6 +249,65 @@ class EvalConfig(BaseModel):
     report_per_video: bool = True
 
 
+class PipelineConfig(BaseModel):
+    detector: Literal["legacy", "geco2"] = "legacy"
+
+
+class ScaleCalibrationConfig(BaseModel):
+    enabled: bool = False
+    expected_object_px: Optional[list[float]] = None
+    context_margin: float = 0.5
+
+    @field_validator("expected_object_px")
+    @classmethod
+    def check_expected_object_px(cls, v: Optional[list[float]]) -> Optional[list[float]]:
+        if v is not None and len(v) != 2:
+            raise ValueError("scale_calibration.expected_object_px must be [width, height]")
+        return v
+
+
+class DomainCalibrationConfig(BaseModel):
+    enabled: bool = False
+    num_sample_frames: int = 5
+    strength: float = 1.0
+
+
+class Stage123Geco2Config(BaseModel):
+    repo_path: str = "./GECO2"
+    weights_path: str = "./GECO2/CNTQG_multitrain_ca44.pth"
+    segmentation: SegmentationConfig = SegmentationConfig()
+    image_size: int = 1024
+    emb_dim: int = 256
+    kernel_dim: int = 3
+    reduction: int = 16
+    keyframe_interval: int = 8
+    score_threshold_ratio: float = 0.33
+    score_threshold_abs: float = 0.0
+    nms_iou: float = 0.5
+    topk_per_keyframe: int = 5
+    prototype_cache_name: str = "geco2_prototype.pt"
+    ref_downscale_factor: float = 1.0
+    scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
+    domain_calibration: DomainCalibrationConfig = DomainCalibrationConfig()
+
+    @model_validator(mode="after")
+    def check_scale_calibration(self) -> "Stage123Geco2Config":
+        if self.scale_calibration.enabled:
+            if not self.scale_calibration.expected_object_px:
+                raise ValueError(
+                    "stage123_geco2.scale_calibration.enabled=true requires "
+                    "stage123_geco2.scale_calibration.expected_object_px=[w,h] "
+                    "(estimated object size in the RAW video frame, pixels)."
+                )
+            if not self.segmentation.enabled:
+                raise ValueError(
+                    "stage123_geco2.scale_calibration.enabled=true requires "
+                    "stage123_geco2.segmentation.enabled=true (scale calibration builds "
+                    "its canvas around the MobileSAM tight mask box)."
+                )
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
@@ -263,11 +316,13 @@ class AeroEyesConfig(BaseModel):
     project: ProjectConfig = ProjectConfig()
     data: DataConfig = DataConfig()
     runtime: RuntimeConfig = RuntimeConfig()
+    pipeline: PipelineConfig = PipelineConfig()
     stage1: Stage1Config = Stage1Config()
     stage2: Stage2Config = Stage2Config()
     stage3: Stage3Config = Stage3Config()
     stage4: Stage4Config = Stage4Config()
     stage5: Stage5Config = Stage5Config()
+    stage123_geco2: Stage123Geco2Config = Stage123Geco2Config()
     accuracy: AccuracyConfig = AccuracyConfig()
     eval: EvalConfig = EvalConfig()
 
@@ -300,7 +355,6 @@ class AeroEyesConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge override into base."""
     result = dict(base)
     for k, v in override.items():
         if k in result and isinstance(result[k], dict) and isinstance(v, dict):
@@ -311,26 +365,17 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _parse_override(s: str) -> tuple[list[str], str]:
-    """Parse 'a.b.c=value' into (['a','b','c'], 'value')."""
     m = re.match(r"^([\w.]+)=(.*)$", s, re.DOTALL)
     if not m:
         raise ValueError(f"Invalid override '{s}'; expected dotted.key=value")
     keys = m.group(1).split(".")
     raw = m.group(2)
-    # Try to coerce to Python primitive types
     if raw.lower() == "true":
         value: Any = True
     elif raw.lower() == "false":
         value = False
     elif raw.lower() in ("null", "~"):
         value = None
-        # NOTE: intentionally NOT treating the string "none" as an alias for
-        # null here. Several fields in this schema use "none" as a real
-        # enum value (stage4.tracker: "none" = detect every frame,
-        # stage2.proposal_model-style literals elsewhere) -- coercing it to
-        # Python None broke `--set stage4.tracker=none` with a pydantic
-        # "Input should be a valid string" error. Use "null" or "~" for an
-        # actual null override.
     else:
         try:
             value = int(raw)
@@ -338,7 +383,6 @@ def _parse_override(s: str) -> tuple[list[str], str]:
             try:
                 value = float(raw)
             except ValueError:
-                # Try JSON (handles lists like [640,640] and dicts)
                 if raw.startswith(("[", "{")):
                     try:
                         import json as _json
