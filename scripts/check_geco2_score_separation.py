@@ -139,6 +139,13 @@ def main():
     from aero_eyes.models.geco2_detector import GeCo2Detector
 
     cfg = load_config(args.config, args.set)
+    # Plain print (not gated by log level, unlike GeCo2Detector's own
+    # "GeCo2 loaded from %s" INFO log, which basicConfig(WARNING) above
+    # silently swallows) -- makes it unambiguous which checkpoint file this
+    # run actually loaded, so a --set stage123_geco2.weights_path=... typo
+    # or a stale/reused shell variable is immediately visible in the output
+    # instead of producing silently-identical-looking results across runs.
+    print(f">>> Loading GeCo2 weights from: {cfg.stage123_geco2.weights_path}")
     detector = GeCo2Detector(cfg)
 
     if args.sample:

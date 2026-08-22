@@ -212,7 +212,7 @@ stage123_geco2:
     #     (mask still controls the RoI-Align box, just not the pixels).
     #   blur -- strong Gaussian blur of the real background: keeps natural
     #     color/texture statistics, discards fine background detail.
-    background_mode: mean_fill
+    background_mode: keep_real
     blur_sigma: 25.0   # used when background_mode: blur
   image_size: 1024
   emb_dim: 256
