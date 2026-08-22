@@ -4,6 +4,10 @@ Flow:  drone video
        -> keyframe sampling every N frames
        -> OPTIONAL SAHI tiling
        -> class-agnostic proposals via YOLOv11n OR FastSAM-s
+       -> OPTIONAL dense-scan fallback (stage2.dense_scan): when the
+          proposal path starves a keyframe, a DINOv2 patch-similarity scan
+          against the Stage-1 prototype adds candidates the proposal model
+          never proposed at all (e.g. flat/small objects like ID cards)
        -> DINOv2 features per candidate crop
        -> candidates.json
 
@@ -63,6 +67,52 @@ def _proposals_for_frame(
     return boxes[:max_candidates]
 
 
+def _dense_scan_boxes(
+    frame_bgr: np.ndarray,
+    extractor,
+    prototype: np.ndarray,
+    use_sahi: bool,
+    sahi_tile: list[int],
+    sahi_overlap: float,
+    sim_threshold: float,
+    min_blob_patches: int,
+    min_area: float,
+    max_candidates: int,
+) -> list[Box]:
+    """DINOv2 patch-similarity scan against the Stage-1 prototype -- a
+    fallback candidate source for when proposal_model (YOLOv11n/FastSAM-s)
+    starves a keyframe, e.g. it essentially never proposes a box near a
+    flat/small object like an ID card from a top-down drone view. Only
+    called when the feature extractor is DINOv2 (the only one with a
+    patch-token grid method)."""
+    from aero_eyes.utils.geometry import dense_patches_to_boxes, nms, sahi_tiles
+
+    h, w = frame_bgr.shape[:2]
+    all_boxes: list[Box] = []
+
+    if use_sahi:
+        for tile in sahi_tiles(w, h, sahi_tile, sahi_overlap):
+            tile_img = frame_bgr[tile.y1:tile.y2, tile.x1:tile.x2]
+            if tile_img.size == 0:
+                continue
+            grid, scale_x, scale_y = extractor.extract_dense_grid(tile_img)
+            all_boxes.extend(dense_patches_to_boxes(
+                grid, prototype, sim_threshold, min_blob_patches,
+                scale_x, scale_y, offset_x=tile.x1, offset_y=tile.y1,
+            ))
+        keep = nms(all_boxes, iou_threshold=0.5)
+        all_boxes = [all_boxes[i] for i in keep]
+    else:
+        grid, scale_x, scale_y = extractor.extract_dense_grid(frame_bgr)
+        all_boxes = dense_patches_to_boxes(
+            grid, prototype, sim_threshold, min_blob_patches, scale_x, scale_y,
+        )
+
+    all_boxes = [b for b in all_boxes if b.area() >= min_area]
+    all_boxes.sort(key=lambda b: b.score, reverse=True)
+    return all_boxes[:max_candidates]
+
+
 def run_stage2(cfg, sample_id: str) -> Path:
     """Run Stage 2 for the given sample. Returns path to candidates.json."""
     from aero_eyes.models.features import build_feature_extractor
@@ -110,6 +160,27 @@ def run_stage2(cfg, sample_id: str) -> Path:
 
     cand_cfg = cfg.stage2.candidate
     sahi_cfg = cfg.stage2.sahi
+    dscfg = cfg.stage2.dense_scan
+
+    # ---- Optional dense-scan fallback candidate source ----
+    dense_prototype = None
+    if dscfg.enabled:
+        if cfg.stage1.feature_extractor.model != "dinov2":
+            log.warning(
+                "[Stage2] %s: stage2.dense_scan.enabled=true but "
+                "stage1.feature_extractor.model='%s' (only 'dinov2' supports "
+                "the dense patch-token scan) -- dense scan disabled for this run.",
+                sample_id, cfg.stage1.feature_extractor.model,
+            )
+        else:
+            proto_path = work_dir / cfg.stage1.prototype.cache_name
+            if not proto_path.exists():
+                raise FileNotFoundError(
+                    f"stage2.dense_scan.enabled=true but prototype.npz not found "
+                    f"at {proto_path}. Run Stage 1 first."
+                )
+            from aero_eyes.utils.io import read_prototype
+            dense_prototype, _, _ = read_prototype(proto_path)
 
     candidates: dict[int, list[Detection]] = {}
     viz_dir = work_dir / "viz" / "stage2"
@@ -154,6 +225,34 @@ def run_stage2(cfg, sample_id: str) -> Path:
         keep = do_nms(all_boxes, iou_threshold=0.5)
         final_boxes = [all_boxes[i] for i in keep]
         final_boxes = final_boxes[:cand_cfg.max_candidates_per_keyframe]
+        box_sources = ["candidate"] * len(final_boxes)
+
+        # Dense-scan fallback: only when the proposal path starved this
+        # keyframe (see dense_prototype / dscfg above).
+        if dense_prototype is not None and len(final_boxes) < dscfg.trigger_min_proposals:
+            dense_boxes = _dense_scan_boxes(
+                frame_bgr, extractor, dense_prototype,
+                use_sahi=sahi_cfg.use_sahi, sahi_tile=sahi_cfg.tile,
+                sahi_overlap=sahi_cfg.overlap,
+                sim_threshold=dscfg.sim_threshold, min_blob_patches=dscfg.min_blob_patches,
+                min_area=cand_cfg.min_box_area,
+                max_candidates=dscfg.max_dense_candidates_per_keyframe,
+            )
+            if dense_boxes:
+                log.info(
+                    "[Stage2] %s frame %d: proposal path found only %d candidate(s) "
+                    "(< trigger_min_proposals=%d) -- dense scan added %d more.",
+                    sample_id, frame_idx, len(final_boxes),
+                    dscfg.trigger_min_proposals, len(dense_boxes),
+                )
+                dense_id_set = {id(b) for b in dense_boxes}
+                merged = final_boxes + dense_boxes
+                keep = do_nms(merged, iou_threshold=0.5)
+                final_boxes = [merged[i] for i in keep][:cand_cfg.max_candidates_per_keyframe]
+                box_sources = [
+                    "candidate_dense" if id(b) in dense_id_set else "candidate"
+                    for b in final_boxes
+                ]
 
         # Extract DINOv2 features for each candidate crop
         if final_boxes:
@@ -169,7 +268,7 @@ def run_stage2(cfg, sample_id: str) -> Path:
         for i, box in enumerate(final_boxes):
             # Store feature as extra metadata in Detection (we encode as source)
             # We'll use a special source key to carry the feature vector
-            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="candidate")
+            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source=box_sources[i])
             # Attach feature as attribute (not part of dataclass, but we handle in write)
             d._feature = feats[i]  # type: ignore[attr-defined]
             detections.append(d)

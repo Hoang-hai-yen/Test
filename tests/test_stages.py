@@ -248,6 +248,55 @@ def test_stage2_produces_candidates(cfg, synth_fixture):
     assert len(data["frames"]) > 0
 
 
+def test_stage2_dense_scan_fallback(cfg, synth_fixture):
+    """When the proposal model finds nothing, stage2.dense_scan should add
+    DINOv2-patch-similarity fallback candidates tagged 'candidate_dense'."""
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    from aero_eyes.utils.io import read_prototype
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    prototype, _, _ = read_prototype(work_dir / cfg.stage1.prototype.cache_name)
+
+    cfg_dict = cfg.model_dump()
+    cfg_dict["stage2"]["dense_scan"] = {
+        "enabled": True, "trigger_min_proposals": 1, "sim_threshold": 0.5,
+        "min_blob_patches": 1, "max_dense_candidates_per_keyframe": 5,
+    }
+    from aero_eyes.config import AeroEyesConfig
+    cfg2 = AeroEyesConfig.model_validate(cfg_dict)
+
+    # Proposal model finds nothing on any keyframe -- forces the fallback.
+    mock_prop_empty = MagicMock()
+    mock_prop_empty.propose.side_effect = lambda image_bgr: []
+
+    def mock_extract_dense_grid(image_bgr, target_size=630):
+        grid = np.zeros((4, 4, feat_dim), dtype=np.float32)
+        grid[1:3, 1:3] = prototype  # guaranteed cosine sim == 1.0 vs the prototype
+        return grid, 10.0, 10.0
+
+    mock_extractor.extract_dense_grid = MagicMock(side_effect=mock_extract_dense_grid)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop_empty):
+        from aero_eyes.stages.stage2 import run_stage2
+        cand_path = run_stage2(cfg2, FIXTURE_ID)
+
+    from aero_eyes.stages.stage2 import read_candidates_with_features
+    candidates, feat_matrix = read_candidates_with_features(cand_path)
+    assert feat_matrix is not None and feat_matrix.shape[0] > 0
+    all_sources = [d.source for dets in candidates.values() for d in dets]
+    assert "candidate_dense" in all_sources
+
+
 def test_stage3_produces_detections(cfg, synth_fixture):
     """Stage 3 reads prototype + candidates and writes detections.json."""
     # First run stages 1 and 2 with mocks
@@ -403,3 +452,37 @@ def test_geometry_iou():
     assert 0 in keep
     assert 2 in keep
     assert 1 not in keep
+
+
+def test_dense_patches_to_boxes():
+    """A blob of patches matching the prototype should become one Box with
+    score == the blob's cosine similarity, in the expected pixel coords."""
+    from aero_eyes.utils.geometry import dense_patches_to_boxes
+
+    grid = np.zeros((10, 10, 4), dtype=np.float32)
+    proto = np.array([1, 0, 0, 0], dtype=np.float32)
+    grid[3:6, 3:6] = proto  # 3x3 blob of patches exactly matching the prototype
+
+    boxes = dense_patches_to_boxes(
+        grid, proto, sim_threshold=0.5, min_blob_patches=2,
+        scale_x=1.0, scale_y=1.0, patch_size=14,
+    )
+    assert len(boxes) == 1
+    b = boxes[0]
+    assert abs(b.score - 1.0) < 1e-5
+    assert abs(b.x1 - 3 * 14) < 1e-3
+    assert abs(b.y1 - 3 * 14) < 1e-3
+    assert abs(b.x2 - 6 * 14) < 1e-3
+    assert abs(b.y2 - 6 * 14) < 1e-3
+
+    # Below threshold everywhere -> no boxes.
+    assert dense_patches_to_boxes(
+        grid, proto, sim_threshold=1.5, min_blob_patches=1,
+        scale_x=1.0, scale_y=1.0,
+    ) == []
+
+    # Blob too small (< min_blob_patches) -> filtered out.
+    assert dense_patches_to_boxes(
+        grid, proto, sim_threshold=0.5, min_blob_patches=100,
+        scale_x=1.0, scale_y=1.0,
+    ) == []

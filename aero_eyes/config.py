@@ -127,6 +127,30 @@ class CandidateConfig(BaseModel):
     feature_crop_pad: float = 0.10
 
 
+class DenseScanConfig(BaseModel):
+    """Fallback candidate source: DINOv2 patch-similarity scan against the
+    Stage-1 prototype, run alongside (never instead of) the proposal_model
+    above. Only fires when the proposal model starves a keyframe -- targets
+    cases like a flat/small object (e.g. an ID card) that YOLOv11n/FastSAM-s
+    essentially never proposes a box for from a top-down drone view. Only
+    supported when stage1.feature_extractor.model == 'dinov2' (the only
+    extractor with a patch-token grid method)."""
+    enabled: bool = False
+    # Only run the dense scan on a keyframe if the proposal path found fewer
+    # than this many candidates -- keeps the extra ViT forward passes rare on
+    # videos where YOLO/FastSAM already works.
+    trigger_min_proposals: int = 3
+    # Pre-filter bar for patch cosine similarity vs the prototype. Kept low
+    # on purpose: Stage 3's own (usually adaptive) match_threshold is the
+    # real accept/reject decision -- this only needs to avoid missing the
+    # target region entirely.
+    sim_threshold: float = 0.12
+    # Minimum connected-component size (in ViT patches, 14px each) to keep a
+    # blob as a candidate box; filters single-patch noise.
+    min_blob_patches: int = 2
+    max_dense_candidates_per_keyframe: int = 20
+
+
 class Stage2Config(BaseModel):
     keyframe_interval: int = 8
     sahi: SAHIConfig = SAHIConfig()
@@ -134,6 +158,7 @@ class Stage2Config(BaseModel):
     yolov11n: Yolov11nConfig = Yolov11nConfig()
     fastsam_s: FastSamSConfig = FastSamSConfig()
     candidate: CandidateConfig = CandidateConfig()
+    dense_scan: DenseScanConfig = DenseScanConfig()
 
     @field_validator("proposal_model")
     @classmethod

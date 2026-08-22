@@ -156,6 +156,63 @@ def remap_box_from_tile(box: Box, tile: TileRect) -> Box:
     )
 
 
+def dense_patches_to_boxes(
+    grid,
+    prototype,
+    sim_threshold: float,
+    min_blob_patches: int,
+    scale_x: float,
+    scale_y: float,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    patch_size: int = 14,
+) -> list[Box]:
+    """Convert a DINOv2 dense patch-similarity grid into candidate boxes.
+
+    `grid` is the [Hp, Wp, dim] L2-normalized patch-token grid from
+    `DINOv2FeatureExtractor.extract_dense_grid`; `prototype` is the Stage-1
+    target signature (also L2-normalized). Cosine-scores every patch,
+    thresholds, and groups connected above-threshold patches into blobs via
+    `cv2.connectedComponentsWithStats` -- one Box per blob, `score` = the
+    blob's max patch similarity. `scale_x`/`scale_y` are
+    `extract_dense_grid`'s own return values (resized-square -> tile-native
+    pixels); `offset_x`/`offset_y` additionally translate into full-frame
+    coordinates when the grid came from a tile, mirroring
+    `remap_box_from_tile`'s translation-only convention.
+    """
+    import cv2
+    import numpy as np
+
+    sim = grid @ prototype  # [Hp, Wp]
+    mask = (sim >= sim_threshold).astype(np.uint8)
+    if not mask.any():
+        return []
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    boxes: list[Box] = []
+    for label in range(1, num_labels):  # label 0 = background
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_blob_patches:
+            continue
+        gx = int(stats[label, cv2.CC_STAT_LEFT])
+        gy = int(stats[label, cv2.CC_STAT_TOP])
+        gw = int(stats[label, cv2.CC_STAT_WIDTH])
+        gh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        blob_sim = float(sim[labels == label].max())
+
+        px1 = gx * patch_size * scale_x
+        py1 = gy * patch_size * scale_y
+        px2 = (gx + gw) * patch_size * scale_x
+        py2 = (gy + gh) * patch_size * scale_y
+
+        boxes.append(Box(
+            x1=px1 + offset_x, y1=py1 + offset_y,
+            x2=px2 + offset_x, y2=py2 + offset_y,
+            score=blob_sim,
+        ))
+    return boxes
+
+
 # ---------------------------------------------------------------------------
 # Crop helper
 # ---------------------------------------------------------------------------

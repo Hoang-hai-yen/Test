@@ -118,6 +118,24 @@ stage2:
     max_candidates_per_keyframe: 400
     feature_crop_pad: 0.10   # pad each candidate crop before DINOv2
 
+  # dense_scan: fallback candidate source, runs ALONGSIDE proposal_model
+  # (never replaces it -- proposal_model stays locked to yolov11n/fastsam_s).
+  # Diagnosed root cause this targets: YOLOv11n (COCO-pretrained,
+  # class-agnostic) essentially never proposes a box near a flat/small
+  # object (e.g. an ID card) from a top-down drone view (best-IoU ~0.01-0.03
+  # measured via scripts/check_stage2_recall.py) -- no amount of Stage3/4
+  # tuning can recover a candidate that was never generated. Only fires when
+  # proposal_model starves a keyframe, and only when
+  # stage1.feature_extractor.model == 'dinov2' (the only extractor with a
+  # patch-token grid method). Opt-in (off by default) until validated on
+  # Kaggle against the PublicTest/PrivateTest baselines.
+  dense_scan:
+    enabled: false
+    trigger_min_proposals: 3   # only scan if proposal_model found fewer than this
+    sim_threshold: 0.12        # low pre-filter bar; Stage3's own threshold does the real filtering
+    min_blob_patches: 2        # min connected 14px-patches to keep a blob as a candidate
+    max_dense_candidates_per_keyframe: 20
+
 # ----------------------------------------------------------------------------
 # STAGE 3 — Cross-domain matching
 # ----------------------------------------------------------------------------
