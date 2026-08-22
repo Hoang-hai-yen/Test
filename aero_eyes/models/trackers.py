@@ -73,13 +73,41 @@ class BuiltinTracker(Tracker):
         self._tracker = self._FACTORY[self.algorithm]()
         x1, y1 = int(box.x1), int(box.y1)
         w, h = int(box.x2 - box.x1), int(box.y2 - box.y1)
-        self._tracker.init(frame_bgr, (x1, y1, w, h))
-        self._initialized = True
+        # Guard against a degenerate (near-zero-area) detection box -- CSRT's
+        # init() itself may not raise on this, but its internal search-window
+        # bookkeeping can later divide/scale down to an empty region and
+        # crash inside a SUBSEQUENT update() call with a raw C++ assertion
+        # (cv2.error, not a Python exception any caller here was catching).
+        # That crash is unrecoverable and propagates all the way up through
+        # run_all(), aborting every remaining sample in the batch -- not just
+        # this one frame. Refusing to initialize on an already-degenerate box
+        # (and catching cv2.error below as a second line of defense for
+        # degeneracy that only manifests after a few tracked frames) turns
+        # this into an ordinary "tracking lost" signal, which Stage 4's
+        # existing re-detect-on-low-confidence path already handles.
+        if w <= 0 or h <= 0:
+            log.warning(
+                "BuiltinTracker.init: degenerate box (w=%d, h=%d) -- refusing to "
+                "initialize, treating as tracker-not-active.", w, h,
+            )
+            self._initialized = False
+            return
+        try:
+            self._tracker.init(frame_bgr, (x1, y1, w, h))
+            self._initialized = True
+        except cv2.error as e:
+            log.warning("BuiltinTracker.init failed (%s) -- treating as tracker-not-active.", e)
+            self._initialized = False
 
     def update(self, frame_bgr: np.ndarray) -> tuple[Box | None, float]:
         if not self._initialized or self._tracker is None:
             return None, 0.0
-        success, rect = self._tracker.update(frame_bgr)
+        try:
+            success, rect = self._tracker.update(frame_bgr)
+        except cv2.error as e:
+            log.warning("BuiltinTracker.update failed (%s) -- treating as tracking lost.", e)
+            self._initialized = False
+            return None, 0.0
         if not success:
             return None, 0.0
         x, y, w, h = rect
