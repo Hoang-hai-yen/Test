@@ -118,9 +118,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
     per_ref_features = []
     geco2_detector = None
     geco2_prototype = None
+    geco2_color_sig = None
     if is_none_tracker:
         if use_geco2:
-            geco2_detector, geco2_prototype = _load_geco2(cfg, work_dir)
+            geco2_detector, geco2_prototype, geco2_color_sig = _load_geco2(cfg, sample_id, work_dir)
         else:
             from aero_eyes.models.features import build_feature_extractor
             from aero_eyes.models.proposals import build_proposal_model
@@ -163,7 +164,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
             if is_none_tracker:
                 # Re-detect every frame
                 if use_geco2:
-                    raw_box, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
+                    raw_box, source = _detect_on_frame_geco2(
+                        frame_bgr, geco2_detector, geco2_prototype, geco2_color_sig, cfg.stage123_geco2.color_postfilter,
+                    )
                 else:
                     raw_box, source = _detect_on_frame(
                         frame_bgr, frame_idx, proposal_model, extractor,
@@ -209,8 +212,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         tracker_active = False
                         if use_geco2:
                             if geco2_detector is None:
-                                geco2_detector, geco2_prototype = _load_geco2(cfg, work_dir)
-                            raw_box, source = _detect_on_frame_geco2(frame_bgr, geco2_detector, geco2_prototype)
+                                geco2_detector, geco2_prototype, geco2_color_sig = _load_geco2(cfg, sample_id, work_dir)
+                            raw_box, source = _detect_on_frame_geco2(
+                                frame_bgr, geco2_detector, geco2_prototype, geco2_color_sig, cfg.stage123_geco2.color_postfilter,
+                            )
                         else:
                             if proposal_model is None:
                                 # Lazy-init for re-detect fallback
@@ -262,10 +267,19 @@ def run_stage4(cfg, sample_id: str) -> Path:
     return tracks_path
 
 
-def _load_geco2(cfg, work_dir: Path):
+def _load_geco2(cfg, sample_id: str, work_dir: Path):
     """Lazily load the GeCo2 detector + its cached exemplar tokens for
-    Stage 4 re-detection. Returns (detector, prototype) or (None, None) if
-    the exemplar cache from Stage 1+2+3 (stage123_geco2.py) is missing.
+    Stage 4 re-detection. Returns (detector, prototype, color_sig) --
+    detector/prototype are (None, None) if the exemplar cache from Stage
+    1+2+3 (stage123_geco2.py) is missing; color_sig is None if
+    color_postfilter is disabled.
+
+    Loading color_sig here (not just in stage123_geco2.py's own keyframe
+    loop) matters: without it, Stage 4's OWN re-detection below
+    (_detect_on_frame_geco2, triggered whenever the tracker loses
+    confidence or ages out -- precisely the highest-risk moment for
+    latching onto a same-shape-different-color confuser) would silently
+    bypass color filtering entirely, even with color_postfilter.enabled=true.
     """
     from aero_eyes.models.geco2_detector import GeCo2Detector
 
@@ -275,20 +289,29 @@ def _load_geco2(cfg, work_dir: Path):
             "[Stage4] %s not found -- GeCo2 re-detection disabled for this run.",
             proto_path,
         )
-        return None, None
+        return None, None, None
     detector = GeCo2Detector(cfg)
     prototype = GeCo2Detector.load_prototype(proto_path)
-    return detector, prototype
+    color_sig = None
+    if cfg.stage123_geco2.color_postfilter.enabled:
+        from aero_eyes.stages.stage123_geco2 import build_color_signature
+        color_sig = build_color_signature(cfg, sample_id, work_dir)
+    return detector, prototype, color_sig
 
 
-def _detect_on_frame_geco2(frame_bgr, detector, prototype):
+def _detect_on_frame_geco2(frame_bgr, detector, prototype, color_sig=None, cpf_cfg=None):
     """GeCo2-backed equivalent of _detect_on_frame: single best re-detection
     box on one frame, or (None, "none") if nothing passed threshold/NMS or
-    the detector/prototype weren't available.
+    the detector/prototype weren't available. Applies the same color
+    post-filter as stage123_geco2.py's keyframe loop when color_sig is
+    given -- see _load_geco2's docstring for why this path needs it too.
     """
     if detector is None or prototype is None:
         return None, "none"
     boxes = detector.detect_frame(frame_bgr, prototype)
+    if color_sig is not None:
+        from aero_eyes.stages.stage123_geco2 import apply_color_postfilter
+        boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
     if not boxes:
         return None, "none"
     best = max(boxes, key=lambda b: b.score)
