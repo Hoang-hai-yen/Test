@@ -366,6 +366,38 @@ class DomainCalibrationConfig(BaseModel):
     strength: float = 1.0  # 0 = no change, 1 = fully match the video's own mean token
 
 
+class ColorPostfilterConfig(BaseModel):
+    """Cheap post-detection filter for GeCo2's blind spot: it's a few-shot
+    COUNTING model matching shape/texture via its vision backbone -- it has
+    no explicit color signal, so same-silhouette-different-color objects
+    are a common false positive. Compares each candidate box's HSV
+    hue+saturation histogram (brightness/value ignored -- robust to
+    lighting differences between the close-up reference photo and the
+    video frame) against the reference object's own color signature
+    (computed once from the MobileSAM-masked reference photos, cached to
+    color_signature.npz). Pure OpenCV, no extra model, no finetuning -- see
+    aero_eyes/utils/color.py and stage123_geco2.py::build_color_signature /
+    apply_color_postfilter.
+
+    Falls back to the WHOLE reference photo's color (diluted by
+    background) if segmentation.enabled=false -- still works, just less
+    precise; a warning is logged when that happens.
+    """
+    enabled: bool = False
+    hue_bins: int = 30
+    sat_bins: int = 32
+    metric: Literal["bhattacharyya", "correlation"] = "bhattacharyya"
+    # Candidates scoring below this similarity (roughly 0..1, higher = more
+    # similar) against EVERY reference photo are dropped outright.
+    # 0.0 = never hard-drop (rely on reweight only).
+    min_similarity: float = 0.3
+    # If true, surviving candidates' scores are multiplied by their color
+    # similarity (soft penalty) and the list is re-sorted by the new score
+    # -- lets a borderline-color match still surface if GeCo2's own
+    # confidence is otherwise much higher than competing candidates.
+    reweight: bool = True
+
+
 class Stage123Geco2Config(BaseModel):
     """Only used when pipeline.detector == 'geco2'. Requires the vendored
     GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
@@ -427,6 +459,9 @@ class Stage123Geco2Config(BaseModel):
     #   use_shape_token=true,  scale_calibration=true  -- both paths fixed
     #   use_shape_token=false, scale_calibration=true  -- path (2) fixed, path (1) removed
     use_shape_token: bool = True
+    color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
+
+    @model_validator(mode="after")
     def check_scale_calibration(self) -> "Stage123Geco2Config":
         if self.scale_calibration.enabled:
             if not self.scale_calibration.expected_object_px:

@@ -27,7 +27,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from aero_eyes.types import Detection
+from aero_eyes.types import Box, Detection
 
 log = logging.getLogger(__name__)
 
@@ -321,6 +321,83 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     return prototype
 
 
+def build_color_signature(cfg, sample_id: str, work_dir: Path) -> list[np.ndarray]:
+    """Color histogram of each reference image's masked object region --
+    used by apply_color_postfilter() to catch same-shape-different-color
+    false positives that GeCo2 itself cannot distinguish (it has no color
+    signal, see stage123_geco2.color_postfilter). Cached independently of
+    geco2_prototype.pt (this is pure OpenCV, does not need the GeCo2 model
+    at all) -- so it's computed even on a cache hit for the prototype file,
+    and vice versa; the two caches don't need to be in sync.
+
+    Note: if segmentation.enabled, this runs its OWN MobileSAM pass over
+    the reference images -- independent from (and possibly duplicating)
+    the one build_exemplar_prototype already ran, since that function may
+    have taken its cached-prototype early-return path without computing
+    masks at all this run. Kept decoupled for simplicity; MobileSAM
+    (ViT-tiny) is cheap relative to GeCo2's own SAM2-Hiera-base backbone.
+    """
+    from aero_eyes.utils.color import compute_hs_histogram
+
+    cpf = cfg.stage123_geco2.color_postfilter
+    sig_path = work_dir / "color_signature.npz"
+    if cfg.project.use_cache and sig_path.exists():
+        data = np.load(sig_path)
+        return [data[k] for k in sorted(data.files)]
+
+    ref_imgs = _load_ref_images(cfg, sample_id)
+    seg_cfg = cfg.stage123_geco2.segmentation
+    masks: list[np.ndarray | None] = [None] * len(ref_imgs)
+    if seg_cfg.enabled:
+        from aero_eyes.models.segmentation import MobileSAMSegmenter
+        segmenter = MobileSAMSegmenter(
+            weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
+            min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
+            score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
+        )
+        masks = [segmenter.segment(img) for img in ref_imgs]
+    else:
+        log.warning(
+            "[Stage123-GeCo2] %s: color_postfilter.enabled but segmentation.enabled=false -- "
+            "color signature built from the WHOLE reference photo (diluted by background), "
+            "not just the object.",
+            sample_id,
+        )
+
+    hists = [
+        compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins)
+        for img, mask in zip(ref_imgs, masks)
+    ]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(sig_path, **{f"hist_{i}": h for i, h in enumerate(hists)})
+    return hists
+
+
+def apply_color_postfilter(
+    frame_bgr: np.ndarray, boxes: list[Box], color_sig: list[np.ndarray], cpf_cfg,
+) -> list[Box]:
+    """Drop/downweight candidate boxes whose color doesn't match ANY of the
+    reference object's own color signatures (best-of-N-refs match, so
+    legitimate lighting/angle variation across the 3 reference photos isn't
+    penalized). See aero_eyes/utils/color.py for the histogram math and
+    stage123_geco2.color_postfilter for why this exists.
+    """
+    from aero_eyes.utils.color import compute_hs_histogram, histogram_similarity
+    from aero_eyes.utils.geometry import crop_with_pad
+
+    kept: list[Box] = []
+    for box in boxes:
+        crop = crop_with_pad(frame_bgr, box, pad_ratio=0.0)
+        hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins)
+        sim = max(histogram_similarity(hist, ref_hist, cpf_cfg.metric) for ref_hist in color_sig)
+        if sim < cpf_cfg.min_similarity:
+            continue
+        kept.append(Box(box.x1, box.y1, box.x2, box.y2, score=box.score * sim) if cpf_cfg.reweight else box)
+    if cpf_cfg.reweight:
+        kept.sort(key=lambda b: b.score, reverse=True)
+    return kept
+
+
 def run_stage123_geco2(cfg, sample_id: str) -> Path:
     """Run the merged GeCo2 stage for one sample. Returns path to detections.json."""
     from aero_eyes.models.geco2_detector import GeCo2Detector
@@ -339,6 +416,9 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
     detector = GeCo2Detector(cfg)
     prototype = build_exemplar_prototype(cfg, sample_id, detector, work_dir)
+
+    cpf_cfg = cfg.stage123_geco2.color_postfilter
+    color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
 
     # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
@@ -362,6 +442,8 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             continue
 
         boxes = detector.detect_frame(frame_bgr, prototype)
+        if color_sig is not None:
+            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
             for b in boxes

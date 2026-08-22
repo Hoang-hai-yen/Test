@@ -307,6 +307,33 @@ stage123_geco2:
   # --------------------------------------------------------------------
   use_shape_token: true
 
+  # --------------------------------------------------------------------
+  # Cheap post-detection filter for GeCo2's blind spot: it's a few-shot
+  # COUNTING model matching shape/texture via its vision backbone -- no
+  # explicit color signal, so same-silhouette-different-color objects are
+  # a common false positive. Compares each candidate box's HSV
+  # hue+saturation histogram (brightness/value ignored -- robust to
+  # lighting differences between the close-up reference photo and the
+  # video frame) against the reference object's own color signature
+  # (built once from the MobileSAM-masked reference photos, cached to
+  # color_signature.npz). Pure OpenCV, no extra model, no finetuning.
+  # Falls back to the WHOLE reference photo's color (diluted by
+  # background, less precise) if segmentation.enabled=false.
+  # --------------------------------------------------------------------
+  color_postfilter:
+    enabled: false
+    hue_bins: 30
+    sat_bins: 32
+    metric: bhattacharyya   # bhattacharyya | correlation
+    # Candidates scoring below this similarity (~0..1, higher=more similar)
+    # against EVERY reference photo are dropped outright. 0.0 = never
+    # hard-drop (rely on reweight only).
+    min_similarity: 0.3
+    # Multiply surviving candidates' score by their color similarity (soft
+    # penalty) and re-sort -- lets a borderline-color match still surface
+    # if GeCo2's own confidence is otherwise much higher than competitors.
+    reweight: true
+
 # ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes
 # ----------------------------------------------------------------------------
