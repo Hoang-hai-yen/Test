@@ -44,7 +44,14 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
         data_root = Path(cfg.data.data_root)
         if not data_root.exists():
             raise FileNotFoundError(f"data_root not found: {data_root}")
-        sample_ids = [d.name for d in sorted(data_root.iterdir()) if d.is_dir()]
+        # Skip dotfiles/dirs (e.g. .ipynb_checkpoints -- Jupyter creates this
+        # inside whatever directory it's browsing/editing, including
+        # data_root itself if a notebook was ever opened from there) -- not
+        # a real sample, but bare iterdir() picks it up like any other dir.
+        sample_ids = [
+            d.name for d in sorted(data_root.iterdir())
+            if d.is_dir() and not d.name.startswith(".")
+        ]
         if not sample_ids:
             raise ValueError(f"No sample directories found under {data_root}")
 

@@ -292,6 +292,21 @@ stage123_geco2:
     num_sample_frames: 5   # unlabeled video frames sampled to estimate "this video's own domain"
     strength: 1.0           # 0 = no change, 1 = fully match the video's own mean token
 
+  # --------------------------------------------------------------------
+  # DIAGNOSTIC/ABLATION: box size feeds the exemplar prototype through TWO
+  # independent paths -- (1) shape_or_objectness(w,h) -> a dedicated shape
+  # token, and (2) the box coordinates that define the RoI-Align pooling
+  # REGION for the appearance token (main/l1/l2). use_shape_token: false
+  # disables ONLY path (1) -- it does NOT fix path (2) (a wrong-scaled box
+  # still pools the wrong region for appearance either way). Combine with
+  # scale_calibration.enabled to isolate which path matters:
+  #   true,  scale_calibration=false -- current default (both paths "wrong")
+  #   false, scale_calibration=false -- isolates path (1) alone
+  #   true,  scale_calibration=true  -- both paths fixed
+  #   false, scale_calibration=true  -- path (2) fixed, path (1) removed entirely
+  # --------------------------------------------------------------------
+  use_shape_token: true
+
 # ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes
 # ----------------------------------------------------------------------------

@@ -310,6 +310,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
         video_domain_means = detector.estimate_domain_shift(sample_frames)
         prototype = GeCo2Detector.calibrate_prototype(
             prototype, video_domain_means, num_refs=len(ref_imgs), strength=dc_cfg.strength,
+            tokens_per_ref=2 if g.use_shape_token else 1,
         )
         log.info("[Stage123-GeCo2] %s: domain-calibrated exemplar tokens using %d sample frames "
                  "(strength=%.2f)", sample_id, len(sample_frames), dc_cfg.strength)

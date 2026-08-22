@@ -415,8 +415,18 @@ class Stage123Geco2Config(BaseModel):
     ref_downscale_factor: float = 1.0
     scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
     domain_calibration: DomainCalibrationConfig = DomainCalibrationConfig()
-
-    @model_validator(mode="after")
+    # Diagnostic/ablation toggle: box size feeds the exemplar prototype
+    # through TWO independent paths -- (1) shape_or_objectness(w,h) -> a
+    # dedicated shape token, and (2) the box coordinates that define the
+    # RoI-Align pooling region for the appearance token (main/l1/l2).
+    # use_shape_token=false disables ONLY path (1) -- it does NOT fix path
+    # (2) (a wrong-scaled box still pools the wrong region for appearance).
+    # Combine with scale_calibration.enabled to test all 4 combinations:
+    #   use_shape_token=true,  scale_calibration=false -- current default
+    #   use_shape_token=false, scale_calibration=false -- isolates path (1)
+    #   use_shape_token=true,  scale_calibration=true  -- both paths fixed
+    #   use_shape_token=false, scale_calibration=true  -- path (2) fixed, path (1) removed
+    use_shape_token: bool = True
     def check_scale_calibration(self) -> "Stage123Geco2Config":
         if self.scale_calibration.enabled:
             if not self.scale_calibration.expected_object_px:

@@ -94,6 +94,7 @@ class GeCo2Detector:
         self.score_threshold_abs = g.score_threshold_abs
         self.nms_iou = g.nms_iou
         self.topk_per_keyframe = g.topk_per_keyframe
+        self.use_shape_token = g.use_shape_token
 
         args = _GeCo2Args(
             image_size=g.image_size,
@@ -163,9 +164,22 @@ class GeCo2Detector:
         detected correctly, while the whole-image box this defaults to did
         not). None (or a None entry) falls back to the whole image, as before.
 
+        Note: this same box also drives the RoI-Align pooling REGION for
+        the appearance tokens below -- self.use_shape_token=false removes
+        ONLY the explicit (w,h) -> shape_or_objectness signal, it does NOT
+        change what region gets pooled for `exemplar`/`exemplar_l1`/
+        `exemplar_l2`. A wrong-scaled `ref_boxes` still produces a
+        wrong-scaled appearance token either way (see
+        stage123_geco2.scale_calibration for the fix that DOES change the
+        pooling region).
+
         Returns a dict of the 3 token sets CNT.adapt_features needs as its
         `prototype_embeddings` / `hq_prototypes` arguments -- CPU tensors,
-        safe to cache to disk via torch.save.
+        safe to cache to disk via torch.save. Each ref image contributes 2
+        tokens per scale ([exemplar, shape]) normally, or 1 token
+        ([exemplar] only) when self.use_shape_token is False -- see
+        GeCo2Detector.calibrate_prototype's `tokens_per_ref` for why
+        callers that index into this layout need to know which.
         """
         m = self.model
         from torchvision.ops import roi_align
@@ -206,12 +220,16 @@ class GeCo2Detector:
                                      spatial_scale=1.0 / reduction * 2, aligned=True)
             exemplar_l2 = exemplar_l2.permute(0, 2, 3, 1).reshape(bs, 1, m.emb_dim)
 
-            box_hw = torch.tensor([[[px2 - px1, py2 - py1]]], dtype=torch.float32, device=self.device)
-            shape = m.shape_or_objectness(box_hw).reshape(bs, 1, m.emb_dim)
-
-            main_tokens.append(torch.cat([exemplar, shape], dim=1).cpu())
-            l1_tokens.append(torch.cat([exemplar_l1, shape], dim=1).cpu())
-            l2_tokens.append(torch.cat([exemplar_l2, shape], dim=1).cpu())
+            if self.use_shape_token:
+                box_hw = torch.tensor([[[px2 - px1, py2 - py1]]], dtype=torch.float32, device=self.device)
+                shape = m.shape_or_objectness(box_hw).reshape(bs, 1, m.emb_dim)
+                main_tokens.append(torch.cat([exemplar, shape], dim=1).cpu())
+                l1_tokens.append(torch.cat([exemplar_l1, shape], dim=1).cpu())
+                l2_tokens.append(torch.cat([exemplar_l2, shape], dim=1).cpu())
+            else:
+                main_tokens.append(exemplar.cpu())
+                l1_tokens.append(exemplar_l1.cpu())
+                l2_tokens.append(exemplar_l2.cpu())
 
         return {
             "main": torch.cat(main_tokens, dim=1),
@@ -375,20 +393,23 @@ class GeCo2Detector:
         video_domain_means: dict[str, torch.Tensor],
         num_refs: int,
         strength: float,
+        tokens_per_ref: int = 2,
     ) -> dict[str, torch.Tensor]:
         """Mean-shift the APPEARANCE tokens of `prototype` toward
         `video_domain_means`, blended by `strength` (0 = no change, 1 =
         appearance tokens' own mean fully replaced by the video's mean).
-        Shape tokens are left untouched -- they encode box (w,h), not
-        appearance, so they're not subject to the same domain gap.
+        Shape tokens (if present) are left untouched -- they encode box
+        (w,h), not appearance, so they're not subject to the same domain gap.
 
         Token layout per scale is [app_1, shape_1, app_2, shape_2, ...,
-        app_N, shape_N] (see GeCo2Detector.encode_exemplars: each ref image
-        contributes exactly one [exemplar, shape] pair, concatenated in
-        that order across refs) -- so appearance tokens sit at even indices
-        0, 2, 4, ... and shape tokens at odd indices.
+        app_N, shape_N] when GeCo2Detector.use_shape_token is True (each ref
+        image contributes one [exemplar, shape] pair, concatenated in that
+        order across refs -- appearance at even indices 0,2,4,..., shape at
+        odd indices), or just [app_1, app_2, ..., app_N] (every index is
+        appearance) when use_shape_token is False. Pass
+        tokens_per_ref=1 in that case -- see encode_exemplars.
         """
-        app_idx = list(range(0, 2 * num_refs, 2))
+        app_idx = list(range(0, tokens_per_ref * num_refs, tokens_per_ref))
         calibrated: dict[str, torch.Tensor] = {}
         for scale, tokens in prototype.items():
             tokens = tokens.clone()
