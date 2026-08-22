@@ -322,8 +322,19 @@ stage123_geco2:
   # --------------------------------------------------------------------
   color_postfilter:
     enabled: false
-    hue_bins: 30
-    sat_bins: 32
+    # Deliberately COARSE (not the ~30x32 "whole photo" tutorial default):
+    # candidate crops here can be as small as ~20x10px (~200 pixels).
+    # EMPIRICALLY CONFIRMED: a 960-bin (30x32) histogram from that few
+    # pixels is severely under-sampled -- even a GENUINELY correct-color
+    # match only scored ~0.49 similarity (barely above min_similarity's
+    # default floor, easily pushed below it by real-world noise), while
+    # 12x8=96 bins scored ~0.83 on the identical case, with NO loss of
+    # discrimination against a truly different color (both scored ~0.0).
+    # This was the actual root cause of a catastrophic real-world failure
+    # (ST-IoU 0.4264 -> 0.0094, detected frames dropped ~75%) before this
+    # default was lowered. Re-validate with your own crop sizes if raised.
+    hue_bins: 12
+    sat_bins: 8
     metric: bhattacharyya   # bhattacharyya | correlation
     # Candidates scoring below this similarity (~0..1, higher=more similar)
     # against EVERY reference photo are dropped outright. 0.0 = never

@@ -393,8 +393,17 @@ class ColorPostfilterConfig(BaseModel):
     hurting accuracy on them.
     """
     enabled: bool = False
-    hue_bins: int = 30
-    sat_bins: int = 32
+    # Deliberately COARSE (not the ~30x32 "whole photo" tutorial default):
+    # candidate crops here can be as small as ~20x10px (~200 pixels) --
+    # empirically confirmed a 30x32=960-bin histogram from that few pixels
+    # is severely under-sampled, so even a GENUINELY correct-color match
+    # only scored ~0.49 similarity (barely above min_similarity's default
+    # floor, easily pushed below it by real-world noise) while 12x8=96
+    # bins scored ~0.83 on the identical case -- with NO loss of
+    # discrimination against a truly different color (both still scored
+    # ~0.0). Re-validate with your own crop sizes if you raise these.
+    hue_bins: int = 12
+    sat_bins: int = 8
     metric: Literal["bhattacharyya", "correlation"] = "bhattacharyya"
     # Candidates scoring below this similarity (roughly 0..1, higher = more
     # similar) against EVERY reference photo are dropped outright.
