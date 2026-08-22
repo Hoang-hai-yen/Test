@@ -357,13 +357,25 @@ stage123_geco2:
     value_bins: 8   # for the separate Value-only histogram, same small-crop reasoning
     metric: bhattacharyya   # bhattacharyya | correlation
     # Candidates scoring below this similarity (~0..1, higher=more similar)
-    # against EVERY reference photo are dropped outright. 0.0 = never
-    # hard-drop (rely on reweight only).
+    # against EVERY reference photo are dropped outright. This is the ONLY
+    # mechanism that should filter by color -- see reweight below for why
+    # letting color CHANGE surviving candidates' scores is dangerous.
+    # 0.0 = color_postfilter becomes a pure no-op.
     min_similarity: 0.3
-    # Multiply surviving candidates' score by their color similarity (soft
-    # penalty) and re-sort -- lets a borderline-color match still surface
-    # if GeCo2's own confidence is otherwise much higher than competitors.
-    reweight: true
+    # DEFAULT FALSE -- EMPIRICALLY CONFIRMED HARMFUL, not just theoretical.
+    # aero_eyes/stages/stage4.py picks the keyframe candidate to
+    # (re)initialize the tracker from via `max(dets, key=lambda d:
+    # d.similarity)` -- i.e. it re-runs argmax over exactly this score, so
+    # reweighting by a noisy signal (Value/brightness is lighting-sensitive)
+    # can flip WHICH candidate wins even when NOTHING is ever hard-dropped,
+    # silently swapping in a wrong box that then persists via tracking for
+    # up to max_track_age frames. Confirmed on real data: reweight=true
+    # with min_similarity=0.0 (no hard-drop -- identical candidate sets
+    # survive as min_similarity=0.3) produced the exact same degraded
+    # ST-IoU as min_similarity=0.3, proving 100% of the harm was the score
+    # multiplication itself. Leave false; let min_similarity above be the
+    # only thing that changes which candidates survive.
+    reweight: false
     # Blend ramp (NOT a hard on/off cutoff): below min_ref_saturation,
     # color_confidence=0 (100% Value-based comparison); at/above
     # saturation_full_confidence, confidence=1 (100% Hue+Saturation);

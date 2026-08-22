@@ -421,14 +421,29 @@ class ColorPostfilterConfig(BaseModel):
     value_bins: int = 8
     metric: Literal["bhattacharyya", "correlation"] = "bhattacharyya"
     # Candidates scoring below this similarity (roughly 0..1, higher = more
-    # similar) against EVERY reference photo are dropped outright.
-    # 0.0 = never hard-drop (rely on reweight only).
+    # similar) against EVERY reference photo are dropped outright. This is
+    # the ONLY mechanism that should filter by color -- see `reweight`
+    # below for why letting color CHANGE surviving candidates' scores is
+    # dangerous. 0.0 = color_postfilter becomes a pure no-op.
     min_similarity: float = 0.3
+    # DEFAULT FALSE -- EMPIRICALLY CONFIRMED HARMFUL, not just theoretical.
     # If true, surviving candidates' scores are multiplied by their color
-    # similarity (soft penalty) and the list is re-sorted by the new score
-    # -- lets a borderline-color match still surface if GeCo2's own
-    # confidence is otherwise much higher than competing candidates.
-    reweight: bool = True
+    # similarity. This sounds like a harmless "soft penalty", but
+    # aero_eyes/stages/stage4.py picks the keyframe candidate to
+    # (re)initialize the tracker from via `max(dets, key=lambda d:
+    # d.similarity)` -- i.e. it re-runs argmax over EXACTLY this score.
+    # Reweighting by a noisy signal (Value/brightness is lighting-sensitive
+    # -- see the class docstring) can flip WHICH candidate wins that argmax
+    # even when zero candidates are ever hard-dropped, silently swapping in
+    # a wrong box at a keyframe that then persists via tracking for up to
+    # max_track_age frames. Confirmed on real data: with reweight=true,
+    # min_similarity=0.0 (no hard-drop at all, i.e. IDENTICAL candidate
+    # sets survive at every keyframe as min_similarity=0.3) produced the
+    # exact same degraded ST-IoU as min_similarity=0.3 -- proving 100% of
+    # the harm came from the score multiplication itself, not from
+    # anything being removed. Leave false; only min_similarity above
+    # should ever change which candidates survive.
+    reweight: bool = False
     # Color-trust ramp: below min_ref_saturation, confidence=0 (color
     # signal fully suppressed -- catches near-WHITE/gray objects); at/above
     # saturation_full_confidence, confidence=1 (full effect); linearly
