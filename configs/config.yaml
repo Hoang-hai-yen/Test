@@ -311,14 +311,33 @@ stage123_geco2:
   # Cheap post-detection filter for GeCo2's blind spot: it's a few-shot
   # COUNTING model matching shape/texture via its vision backbone -- no
   # explicit color signal, so same-silhouette-different-color objects are
-  # a common false positive. Compares each candidate box's HSV
-  # hue+saturation histogram (brightness/value ignored -- robust to
-  # lighting differences between the close-up reference photo and the
-  # video frame) against the reference object's own color signature
-  # (built once from the MobileSAM-masked reference photos, cached to
-  # color_signature.npz). Pure OpenCV, no extra model, no finetuning.
-  # Falls back to the WHOLE reference photo's color (diluted by
-  # background, less precise) if segmentation.enabled=false.
+  # a common false positive. Compares each candidate box against the
+  # reference object's own color signature (built once from the
+  # MobileSAM-masked reference photos, cached to color_signature.npz).
+  # Pure OpenCV, no extra model, no finetuning. Falls back to the WHOLE
+  # reference photo's color (diluted by background) if
+  # segmentation.enabled=false.
+  #
+  # TWO signals are blended by color_confidence:
+  #   - Hue+Saturation histogram (brightness ignored -- robust to lighting
+  #     differences between the reference photo and the video frame) --
+  #     reliable for colorful objects, but Hue is unstable/noisy for
+  #     near-achromatic (black/white/gray) ones.
+  #   - Value/brightness histogram -- the ONE property that reliably
+  #     separates black from white/gray, exactly where Hue+Saturation
+  #     carries no signal. More lighting-sensitive, so down-weighted for
+  #     colorful objects (see saturation_value_confidence in
+  #     aero_eyes/utils/color.py).
+  # effective_similarity = confidence*sim_hue_sat + (1-confidence)*sim_value
+  #
+  # EMPIRICALLY CONFIRMED (not just theoretical), in this order: (1) a
+  # black-ish reference object (mean saturation=60.1, value=121.3) saw
+  # ST-IoU DROP even with a correctly-sized histogram (0.4264 -> 0.3902)
+  # using Hue+Saturation alone; (2) Value was blended in specifically
+  # because, even after that fix, the detector still visibly confused a
+  # similarly-shaped WHITE object in the output video -- Hue+Saturation
+  # structurally cannot catch that (both black and white can have
+  # arbitrary/unstable Hue), only Value can.
   # --------------------------------------------------------------------
   color_postfilter:
     enabled: false
@@ -335,6 +354,7 @@ stage123_geco2:
     # default was lowered. Re-validate with your own crop sizes if raised.
     hue_bins: 12
     sat_bins: 8
+    value_bins: 8   # for the separate Value-only histogram, same small-crop reasoning
     metric: bhattacharyya   # bhattacharyya | correlation
     # Candidates scoring below this similarity (~0..1, higher=more similar)
     # against EVERY reference photo are dropped outright. 0.0 = never
@@ -344,31 +364,21 @@ stage123_geco2:
     # penalty) and re-sort -- lets a borderline-color match still surface
     # if GeCo2's own confidence is otherwise much higher than competitors.
     reweight: true
-    # Color-trust ramp (NOT a hard on/off cutoff): below min_ref_saturation,
-    # color_confidence=0 (color signal fully suppressed -- effectively
-    # disabled, catches near-WHITE/gray objects); at/above
-    # saturation_full_confidence, confidence=1 (full effect); linearly
-    # interpolated in between. mean saturation = 0-255, over the masked
-    # object pixels, averaged across all 3 ref photos.
-    # EMPIRICALLY CONFIRMED (not just theoretical): on a black-ish object
-    # (mean saturation=60.1, value=121.3 -- ABOVE naive hard-cutoff floors
-    # of 40/50), enabling color_postfilter still dropped ST-IoU
-    # 0.4264 -> 0.3902 even after fixing the histogram bin-count bug above
-    # -- there's no single hard cutoff that cleanly separates every
-    # dataset's "trustworthy" from "not", hence the graduated ramp. On a
-    # saturated-color (orange) object it IMPROVED 0.5170 -> 0.5448 under
-    # equivalent settings. The actual computed values + resulting
-    # color_confidence are always logged at build time.
+    # Blend ramp (NOT a hard on/off cutoff): below min_ref_saturation,
+    # color_confidence=0 (100% Value-based comparison); at/above
+    # saturation_full_confidence, confidence=1 (100% Hue+Saturation);
+    # linearly interpolated in between. mean saturation = 0-255, over the
+    # masked object pixels, averaged across all 3 ref photos.
     min_ref_saturation: 40.0
     saturation_full_confidence: 130.0
-    # Same ramp, triggered by mean HSV value/brightness -- catches
-    # near-BLACK objects. Needed because saturation=(max-min)/max is a
-    # RATIO: for dark pixels, small absolute sensor noise gets amplified
-    # into a spuriously HIGH saturation reading, so the saturation ramp
-    # alone can under-react to dark objects (confirmed: a synthetic
-    # near-black pixel with only +-4/255 noise computed mean saturation
-    # ~50, above min_ref_saturation's default). Overall color_confidence
-    # used is the MINIMUM of the saturation ramp and this value ramp.
+    # Same ramp, triggered by mean HSV value/brightness. Needed because
+    # saturation=(max-min)/max is a RATIO: for dark pixels, small absolute
+    # sensor noise gets amplified into a spuriously HIGH saturation
+    # reading, so the saturation ramp alone can under-react to dark
+    # objects (confirmed: a synthetic near-black pixel with only +-4/255
+    # noise computed mean saturation ~50, above min_ref_saturation's
+    # default). Overall color_confidence used is the MINIMUM of the
+    # saturation ramp and this value ramp.
     min_ref_value: 50.0
     value_full_confidence: 160.0
 

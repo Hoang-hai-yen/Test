@@ -71,6 +71,23 @@ def compute_mean_value(img_bgr: np.ndarray, mask: np.ndarray | None = None) -> f
     return float(val.mean()) if val.size else 0.0
 
 
+def compute_value_histogram(img_bgr: np.ndarray, mask: np.ndarray | None = None, val_bins: int = 8) -> np.ndarray:
+    """1D histogram of HSV value/brightness, L1-normalized. Unlike Hue and
+    Saturation, brightness is exactly the ONE property that reliably tells
+    black from white/gray objects apart -- deliberately kept as a SEPARATE
+    signal from compute_hs_histogram (which excludes V for lighting
+    robustness) so callers can fall back to it for near-achromatic
+    reference objects, where Hue+Saturation carries no usable signal but a
+    black-vs-white confuser is otherwise indistinguishable. See
+    ColorPostfilterConfig / apply_color_postfilter's confidence blend.
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    mask_u8 = (mask.astype(np.uint8) * 255) if mask is not None else None
+    hist = cv2.calcHist([hsv], [2], mask_u8, [val_bins], [0, 256])
+    cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
+    return hist
+
+
 def saturation_value_confidence(
     mean_saturation: float, mean_value: float,
     sat_low: float, sat_high: float, val_low: float, val_high: float,

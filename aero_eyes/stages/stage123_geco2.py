@@ -321,8 +321,22 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     return prototype
 
 
-def build_color_signature(cfg, sample_id: str, work_dir: Path) -> tuple[list[np.ndarray], float]:
-    """Color histogram of each reference image's masked object region --
+class ColorSignature:
+    """Reference object color signature: TWO independent per-ref-image
+    histogram sets (Hue+Saturation, and Value alone) plus the blend weight
+    between them -- see ColorPostfilterConfig docstring for why both are
+    needed (Hue+Sat is lighting-robust but useless for near-achromatic
+    objects; Value is the only reliable signal for exactly those, at the
+    cost of being lighting-sensitive)."""
+
+    def __init__(self, hs_hists: list[np.ndarray], v_hists: list[np.ndarray], confidence: float):
+        self.hs_hists = hs_hists
+        self.v_hists = v_hists
+        self.confidence = confidence
+
+
+def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature:
+    """Color histograms of each reference image's masked object region --
     used by apply_color_postfilter() to catch same-shape-different-color
     false positives that GeCo2 itself cannot distinguish (it has no color
     signal, see stage123_geco2.color_postfilter). Cached independently of
@@ -330,15 +344,11 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> tuple[list[np.
     at all) -- so it's computed even on a cache hit for the prototype file,
     and vice versa; the two caches don't need to be in sync.
 
-    Returns (histograms, color_confidence). color_confidence in [0,1] comes
-    from saturation_value_confidence() -- 0 means the reference object is
-    too near-achromatic (black/white/gray) for Hue-based comparison to be
-    trustworthy, and apply_color_postfilter() will then be a no-op
-    regardless of what it computes (EMPIRICALLY CONFIRMED: Hue-based
-    comparison actively hurts accuracy in that regime, not just unhelpful
-    -- see ColorPostfilterConfig docstring). A graduated value between 0
-    and 1 softens the effect proportionally rather than needing a single
-    hard cutoff.
+    .confidence in [0,1] (see saturation_value_confidence) controls how
+    apply_color_postfilter() blends the two histogram sets: 1 = trust
+    Hue+Saturation fully (colorful reference object), 0 = trust Value
+    fully (near-achromatic reference object, where Hue+Saturation is pure
+    noise but Value still reliably tells e.g. black from white).
 
     Note: if segmentation.enabled, this runs its OWN MobileSAM pass over
     the reference images -- independent from (and possibly duplicating)
@@ -348,14 +358,16 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> tuple[list[np.
     (ViT-tiny) is cheap relative to GeCo2's own SAM2-Hiera-base backbone.
     """
     from aero_eyes.utils.color import (
-        compute_hs_histogram, compute_mean_saturation, compute_mean_value, saturation_value_confidence,
+        compute_hs_histogram, compute_mean_saturation, compute_mean_value,
+        compute_value_histogram, saturation_value_confidence,
     )
 
     cpf = cfg.stage123_geco2.color_postfilter
     sig_path = work_dir / "color_signature.npz"
     if cfg.project.use_cache and sig_path.exists():
         data = np.load(sig_path)
-        hists = [data[k] for k in sorted(data.files) if k.startswith("hist_")]
+        hs_hists = [data[k] for k in sorted(data.files) if k.startswith("hshist_")]
+        v_hists = [data[k] for k in sorted(data.files) if k.startswith("vhist_")]
         mean_sat = float(data["mean_saturation"])
         mean_val = float(data["mean_value"])
     else:
@@ -378,14 +390,19 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> tuple[list[np.
                 sample_id,
             )
 
-        hists = [
+        hs_hists = [
             compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins)
+            for img, mask in zip(ref_imgs, masks)
+        ]
+        v_hists = [
+            compute_value_histogram(img, mask, cpf.value_bins)
             for img, mask in zip(ref_imgs, masks)
         ]
         mean_sat = float(np.mean([compute_mean_saturation(img, mask) for img, mask in zip(ref_imgs, masks)]))
         mean_val = float(np.mean([compute_mean_value(img, mask) for img, mask in zip(ref_imgs, masks)]))
         work_dir.mkdir(parents=True, exist_ok=True)
-        save_kwargs = {f"hist_{i}": h for i, h in enumerate(hists)}
+        save_kwargs = {f"hshist_{i}": h for i, h in enumerate(hs_hists)}
+        save_kwargs.update({f"vhist_{i}": h for i, h in enumerate(v_hists)})
         save_kwargs["mean_saturation"] = np.array(mean_sat)
         save_kwargs["mean_value"] = np.array(mean_val)
         np.savez(sig_path, **save_kwargs)
@@ -396,42 +413,44 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> tuple[list[np.
         cpf.min_ref_value, cpf.value_full_confidence,
     )
     log.info("[Stage123-GeCo2] %s: reference object mean HSV saturation=%.1f, value=%.1f "
-             "[0-255 scale] -> color_confidence=%.2f", sample_id, mean_sat, mean_val, confidence)
+             "[0-255 scale] -> color_confidence=%.2f (1=trust Hue+Sat, 0=trust Value only)",
+             sample_id, mean_sat, mean_val, confidence)
     if confidence < 1.0:
         log.warning(
-            "[Stage123-GeCo2] %s: color_postfilter effect scaled to %.0f%% -- reference "
-            "object's color (saturation=%.1f, value=%.1f) is not fully trustworthy for "
-            "Hue-based comparison (near-achromatic objects give unstable Hue). 0%% = fully "
-            "suppressed (equivalent to disabled).",
-            sample_id, confidence * 100, mean_sat, mean_val,
+            "[Stage123-GeCo2] %s: color_postfilter blending %.0f%% Value-based comparison "
+            "in (and %.0f%% Hue+Saturation) -- reference object's color (saturation=%.1f, "
+            "value=%.1f) is not fully trustworthy for Hue-based comparison alone "
+            "(near-achromatic objects give unstable Hue; Value still separates e.g. black "
+            "from white).",
+            sample_id, (1 - confidence) * 100, confidence * 100, mean_sat, mean_val,
         )
-    return hists, confidence
+    return ColorSignature(hs_hists, v_hists, confidence)
 
 
 def apply_color_postfilter(
-    frame_bgr: np.ndarray, boxes: list[Box], color_sig: list[np.ndarray], cpf_cfg, color_confidence: float = 1.0,
+    frame_bgr: np.ndarray, boxes: list[Box], color_sig: ColorSignature, cpf_cfg,
 ) -> list[Box]:
-    """Drop/downweight candidate boxes whose color doesn't match ANY of the
-    reference object's own color signatures (best-of-N-refs match, so
-    legitimate lighting/angle variation across the 3 reference photos isn't
-    penalized). See aero_eyes/utils/color.py for the histogram math and
-    stage123_geco2.color_postfilter for why this exists.
-
-    color_confidence in [0,1] (see build_color_signature) blends the raw
-    similarity toward 1.0 (= "no penalty") as confidence drops toward 0 --
-    at confidence=0 this function is a pure no-op (effective similarity is
-    always 1.0, so nothing is ever hard-dropped or reweighted down),
-    regardless of what the raw histogram similarity computes to.
+    """Drop/downweight candidate boxes whose color doesn't match the
+    reference object's own color signature (best-of-N-refs match per
+    signal, so legitimate lighting/angle variation across the 3 reference
+    photos isn't penalized). Blends Hue+Saturation similarity and Value
+    similarity by color_sig.confidence -- see ColorSignature /
+    build_color_signature and ColorPostfilterConfig for why both signals
+    exist and how they're weighted (Hue+Sat alone cannot tell e.g. black
+    from white; Value alone is more lighting-sensitive).
     """
-    from aero_eyes.utils.color import compute_hs_histogram, histogram_similarity
+    from aero_eyes.utils.color import compute_hs_histogram, compute_value_histogram, histogram_similarity
     from aero_eyes.utils.geometry import crop_with_pad
 
+    conf = color_sig.confidence
     kept: list[Box] = []
     for box in boxes:
         crop = crop_with_pad(frame_bgr, box, pad_ratio=0.0)
-        hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins)
-        sim = max(histogram_similarity(hist, ref_hist, cpf_cfg.metric) for ref_hist in color_sig)
-        effective_sim = 1.0 - color_confidence * (1.0 - sim)
+        hs_hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins)
+        v_hist = compute_value_histogram(crop, None, cpf_cfg.value_bins)
+        sim_hs = max(histogram_similarity(hs_hist, r, cpf_cfg.metric) for r in color_sig.hs_hists)
+        sim_v = max(histogram_similarity(v_hist, r, cpf_cfg.metric) for r in color_sig.v_hists)
+        effective_sim = conf * sim_hs + (1.0 - conf) * sim_v
         if effective_sim < cpf_cfg.min_similarity:
             continue
         kept.append(Box(box.x1, box.y1, box.x2, box.y2, score=box.score * effective_sim) if cpf_cfg.reweight else box)
@@ -460,9 +479,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     prototype = build_exemplar_prototype(cfg, sample_id, detector, work_dir)
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
-    color_sig, color_confidence = (
-        build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else (None, 0.0)
-    )
+    color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
 
     # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
@@ -486,8 +503,8 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             continue
 
         boxes = detector.detect_frame(frame_bgr, prototype)
-        if color_sig is not None and color_confidence > 0.0:
-            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg, color_confidence)
+        if color_sig is not None:
+            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
             for b in boxes

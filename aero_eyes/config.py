@@ -370,31 +370,38 @@ class ColorPostfilterConfig(BaseModel):
     """Cheap post-detection filter for GeCo2's blind spot: it's a few-shot
     COUNTING model matching shape/texture via its vision backbone -- it has
     no explicit color signal, so same-silhouette-different-color objects
-    are a common false positive. Compares each candidate box's HSV
-    hue+saturation histogram (brightness/value ignored -- robust to
-    lighting differences between the close-up reference photo and the
-    video frame) against the reference object's own color signature
-    (computed once from the MobileSAM-masked reference photos, cached to
-    color_signature.npz). Pure OpenCV, no extra model, no finetuning -- see
-    aero_eyes/utils/color.py and stage123_geco2.py::build_color_signature /
+    are a common false positive. Compares each candidate box's color
+    against the reference object's own color signature (computed once from
+    the MobileSAM-masked reference photos, cached to color_signature.npz).
+    Pure OpenCV, no extra model, no finetuning -- see aero_eyes/utils/
+    color.py and stage123_geco2.py::build_color_signature /
     apply_color_postfilter.
 
     Falls back to the WHOLE reference photo's color (diluted by
     background) if segmentation.enabled=false -- still works, just less
     precise; a warning is logged when that happens.
 
-    IMPORTANT (empirically confirmed, not just theoretical): Hue is
-    unstable/noisy for near-achromatic (black/white/gray) objects -- a
-    black-ish reference object (mean saturation=60.1, value=121.3) saw
-    ST-IoU DROP even after fixing the histogram under-sampling bug (0.4264
-    -> 0.3902), while a saturated-color (orange) object saw it IMPROVE
-    (0.5170 -> 0.5448) under equivalent settings. Because that black-ish
-    object's own saturation/value sat ABOVE naive hard-cutoff floors yet
-    still measurably hurt, min_ref_saturation/min_ref_value below define a
-    GRADUATED confidence ramp (see saturation_value_confidence in
-    aero_eyes/utils/color.py) rather than a single hard on/off cutoff --
-    there's no one cutoff value that cleanly separates every dataset's
-    "trustworthy" from "not".
+    TWO signals are compared and blended by color_confidence (see
+    saturation_value_confidence in aero_eyes/utils/color.py):
+      - Hue+Saturation histogram (brightness/value ignored -- robust to
+        lighting differences between the reference photo and the video
+        frame) -- reliable for colorful objects, but Hue is
+        unstable/noisy for near-achromatic (black/white/gray) ones.
+      - Value/brightness histogram -- the ONE property that reliably
+        separates black from white/gray, exactly where Hue+Saturation
+        carries no signal. More lighting-sensitive than Hue+Saturation,
+        so it's down-weighted (not solely relied on) for colorful objects.
+    color_confidence (0=achromatic, 1=colorful) linearly blends the two:
+    effective_similarity = confidence*sim_hue_sat + (1-confidence)*sim_value.
+
+    EMPIRICALLY CONFIRMED (not just theoretical), in this order:
+    (1) a black-ish reference object (mean saturation=60.1, value=121.3)
+    saw ST-IoU DROP even with a correctly-sized histogram (0.4264 ->
+    0.3902) using Hue+Saturation alone; (2) blending in Value at low
+    confidence was added specifically because, even after that fix, the
+    detector still visibly confused a similarly-shaped WHITE object in the
+    output video -- Hue+Saturation structurally cannot catch that (both
+    black and white can have arbitrary/unstable Hue), only Value can.
     """
     enabled: bool = False
     # Deliberately COARSE (not the ~30x32 "whole photo" tutorial default):
@@ -408,6 +415,10 @@ class ColorPostfilterConfig(BaseModel):
     # ~0.0). Re-validate with your own crop sizes if you raise these.
     hue_bins: int = 12
     sat_bins: int = 8
+    # Bins for the separate Value/brightness histogram (see class
+    # docstring) -- kept coarse for the same small-crop-sample-size reason
+    # as hue_bins/sat_bins above.
+    value_bins: int = 8
     metric: Literal["bhattacharyya", "correlation"] = "bhattacharyya"
     # Candidates scoring below this similarity (roughly 0..1, higher = more
     # similar) against EVERY reference photo are dropped outright.
