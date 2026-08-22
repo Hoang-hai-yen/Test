@@ -429,6 +429,7 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
 
 def apply_color_postfilter(
     frame_bgr: np.ndarray, boxes: list[Box], color_sig: ColorSignature, cpf_cfg,
+    stats_out: list[tuple[float, float, float]] | None = None,
 ) -> list[Box]:
     """Drop/downweight candidate boxes whose color doesn't match the
     reference object's own color signature (best-of-N-refs match per
@@ -438,6 +439,14 @@ def apply_color_postfilter(
     build_color_signature and ColorPostfilterConfig for why both signals
     exist and how they're weighted (Hue+Sat alone cannot tell e.g. black
     from white; Value alone is more lighting-sensitive).
+
+    stats_out: if given, appends (sim_hs, sim_v, effective_sim) for EVERY
+    candidate evaluated (before the min_similarity cutoff) -- lets a
+    caller collect the REAL distribution of similarity scores seen on
+    actual video frames, since a threshold picked from a synthetic/clean
+    test image (as this codebase already learned the hard way once, with
+    score_threshold_abs) may not reflect what real footage produces. See
+    run_stage123_geco2's end-of-run summary log.
     """
     from aero_eyes.utils.color import compute_hs_histogram, compute_value_histogram, histogram_similarity
     from aero_eyes.utils.geometry import crop_with_pad
@@ -451,6 +460,8 @@ def apply_color_postfilter(
         sim_hs = max(histogram_similarity(hs_hist, r, cpf_cfg.metric) for r in color_sig.hs_hists)
         sim_v = max(histogram_similarity(v_hist, r, cpf_cfg.metric) for r in color_sig.v_hists)
         effective_sim = conf * sim_hs + (1.0 - conf) * sim_v
+        if stats_out is not None:
+            stats_out.append((sim_hs, sim_v, effective_sim))
         if effective_sim < cpf_cfg.min_similarity:
             continue
         kept.append(Box(box.x1, box.y1, box.x2, box.y2, score=box.score * effective_sim) if cpf_cfg.reweight else box)
@@ -497,6 +508,8 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     kf_indices = set(keyframe_indices(total_frames, cfg.stage123_geco2.keyframe_interval))
     viz_dir = work_dir / "viz" / "stage123_geco2"
 
+    color_stats: list[tuple[float, float, float]] | None = [] if color_sig is not None else None
+
     detections: dict[int, list[Detection]] = {}
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
@@ -504,7 +517,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
         boxes = detector.detect_frame(frame_bgr, prototype)
         if color_sig is not None:
-            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
+            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats)
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
             for b in boxes
@@ -517,6 +530,20 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 frame_bgr, [d.box for d in result_dets], [d.similarity for d in result_dets],
                 frame_idx, viz_dir,
             )
+
+    if color_stats:
+        arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim
+        log.info(
+            "[Stage123-GeCo2] %s: color_postfilter similarity stats over %d candidates "
+            "(min_similarity=%.2f) -- sim_hs p10/p50/p90=%.3f/%.3f/%.3f, "
+            "sim_v p10/p50/p90=%.3f/%.3f/%.3f, effective_sim p10/p50/p90=%.3f/%.3f/%.3f, "
+            "%% below min_similarity=%.1f%%",
+            sample_id, len(color_stats), cpf_cfg.min_similarity,
+            *np.percentile(arr[:, 0], [10, 50, 90]),
+            *np.percentile(arr[:, 1], [10, 50, 90]),
+            *np.percentile(arr[:, 2], [10, 50, 90]),
+            100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
+        )
 
     # No single global threshold applies (GeCo2 thresholds relative to each
     # frame's own max score) -- Stage 4's geco2-aware re-detect path reads
