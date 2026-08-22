@@ -382,6 +382,15 @@ class ColorPostfilterConfig(BaseModel):
     Falls back to the WHOLE reference photo's color (diluted by
     background) if segmentation.enabled=false -- still works, just less
     precise; a warning is logged when that happens.
+
+    IMPORTANT (empirically confirmed, not just theoretical): Hue is
+    unstable/noisy for near-achromatic (black/white/gray) objects -- a
+    black-colored reference object saw ST-IoU DROP (0.4264 -> 0.3560, with
+    reweight-only / no hard-drop) when this was enabled, while a
+    saturated-color (orange) object saw it IMPROVE (0.5170 -> 0.5448) under
+    the identical settings. min_ref_saturation below auto-disables this
+    filter for low-saturation reference objects instead of silently
+    hurting accuracy on them.
     """
     enabled: bool = False
     hue_bins: int = 30
@@ -396,6 +405,22 @@ class ColorPostfilterConfig(BaseModel):
     # -- lets a borderline-color match still surface if GeCo2's own
     # confidence is otherwise much higher than competing candidates.
     reweight: bool = True
+    # Auto-disables the ENTIRE color_postfilter (returns to plain GeCo2
+    # output) for a sample whose reference object's own mean HSV saturation
+    # (0-255, averaged over the masked object pixels across all 3 ref
+    # photos) is below this floor -- catches near-WHITE/gray objects.
+    # NOTE: not sufficient alone for DARK objects -- see min_ref_value.
+    # The actual computed value is always logged at build time (even when
+    # not disabling), so inspect real numbers across your samples first.
+    min_ref_saturation: float = 40.0
+    # Same auto-disable, triggered by LOW mean HSV value/brightness --
+    # catches near-BLACK objects. Needed because saturation = (max-min)/max
+    # is a RATIO: for dark pixels, small absolute sensor noise gets
+    # amplified into a spuriously HIGH saturation reading, so
+    # min_ref_saturation alone can miss dark objects entirely (confirmed:
+    # a synthetic near-black pixel with only +-4/255 noise computed mean
+    # saturation ~50, above the min_ref_saturation default).
+    min_ref_value: float = 50.0
 
 
 class Stage123Geco2Config(BaseModel):

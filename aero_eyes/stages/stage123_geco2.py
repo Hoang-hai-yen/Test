@@ -321,7 +321,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     return prototype
 
 
-def build_color_signature(cfg, sample_id: str, work_dir: Path) -> list[np.ndarray]:
+def build_color_signature(cfg, sample_id: str, work_dir: Path) -> list[np.ndarray] | None:
     """Color histogram of each reference image's masked object region --
     used by apply_color_postfilter() to catch same-shape-different-color
     false positives that GeCo2 itself cannot distinguish (it has no color
@@ -330,6 +330,16 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> list[np.ndarra
     at all) -- so it's computed even on a cache hit for the prototype file,
     and vice versa; the two caches don't need to be in sync.
 
+    Returns None (caller must then skip color post-filtering entirely) if
+    the reference object's own mean saturation OR mean value/brightness is
+    below its floor (min_ref_saturation / min_ref_value -- catches
+    near-white/gray objects and near-black/dark objects respectively; see
+    compute_mean_saturation's docstring for why BOTH checks are needed,
+    not saturation alone). Hue-based comparison is unreliable for
+    near-achromatic objects, EMPIRICALLY CONFIRMED to actively hurt
+    accuracy in that regime rather than merely being unhelpful (see
+    ColorPostfilterConfig docstring).
+
     Note: if segmentation.enabled, this runs its OWN MobileSAM pass over
     the reference images -- independent from (and possibly duplicating)
     the one build_exemplar_prototype already ran, since that function may
@@ -337,39 +347,60 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> list[np.ndarra
     masks at all this run. Kept decoupled for simplicity; MobileSAM
     (ViT-tiny) is cheap relative to GeCo2's own SAM2-Hiera-base backbone.
     """
-    from aero_eyes.utils.color import compute_hs_histogram
+    from aero_eyes.utils.color import compute_hs_histogram, compute_mean_saturation, compute_mean_value
 
     cpf = cfg.stage123_geco2.color_postfilter
     sig_path = work_dir / "color_signature.npz"
     if cfg.project.use_cache and sig_path.exists():
         data = np.load(sig_path)
-        return [data[k] for k in sorted(data.files)]
-
-    ref_imgs = _load_ref_images(cfg, sample_id)
-    seg_cfg = cfg.stage123_geco2.segmentation
-    masks: list[np.ndarray | None] = [None] * len(ref_imgs)
-    if seg_cfg.enabled:
-        from aero_eyes.models.segmentation import MobileSAMSegmenter
-        segmenter = MobileSAMSegmenter(
-            weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
-            min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
-            score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
-        )
-        masks = [segmenter.segment(img) for img in ref_imgs]
+        hists = [data[k] for k in sorted(data.files) if k.startswith("hist_")]
+        mean_sat = float(data["mean_saturation"])
+        mean_val = float(data["mean_value"])
     else:
-        log.warning(
-            "[Stage123-GeCo2] %s: color_postfilter.enabled but segmentation.enabled=false -- "
-            "color signature built from the WHOLE reference photo (diluted by background), "
-            "not just the object.",
-            sample_id,
-        )
+        ref_imgs = _load_ref_images(cfg, sample_id)
+        seg_cfg = cfg.stage123_geco2.segmentation
+        masks: list[np.ndarray | None] = [None] * len(ref_imgs)
+        if seg_cfg.enabled:
+            from aero_eyes.models.segmentation import MobileSAMSegmenter
+            segmenter = MobileSAMSegmenter(
+                weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
+                min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
+                score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
+            )
+            masks = [segmenter.segment(img) for img in ref_imgs]
+        else:
+            log.warning(
+                "[Stage123-GeCo2] %s: color_postfilter.enabled but segmentation.enabled=false -- "
+                "color signature built from the WHOLE reference photo (diluted by background), "
+                "not just the object.",
+                sample_id,
+            )
 
-    hists = [
-        compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins)
-        for img, mask in zip(ref_imgs, masks)
-    ]
-    work_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(sig_path, **{f"hist_{i}": h for i, h in enumerate(hists)})
+        hists = [
+            compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins)
+            for img, mask in zip(ref_imgs, masks)
+        ]
+        mean_sat = float(np.mean([compute_mean_saturation(img, mask) for img, mask in zip(ref_imgs, masks)]))
+        mean_val = float(np.mean([compute_mean_value(img, mask) for img, mask in zip(ref_imgs, masks)]))
+        work_dir.mkdir(parents=True, exist_ok=True)
+        save_kwargs = {f"hist_{i}": h for i, h in enumerate(hists)}
+        save_kwargs["mean_saturation"] = np.array(mean_sat)
+        save_kwargs["mean_value"] = np.array(mean_val)
+        np.savez(sig_path, **save_kwargs)
+
+    log.info("[Stage123-GeCo2] %s: reference object mean HSV saturation=%.1f (floor=%.1f), "
+             "value=%.1f (floor=%.1f) [0-255 scale]", sample_id, mean_sat, cpf.min_ref_saturation,
+             mean_val, cpf.min_ref_value)
+    if mean_sat < cpf.min_ref_saturation or mean_val < cpf.min_ref_value:
+        reason = "low saturation (near-white/gray)" if mean_sat < cpf.min_ref_saturation else "low value (near-black/dark)"
+        log.warning(
+            "[Stage123-GeCo2] %s: color_postfilter AUTO-DISABLED -- reference object is %s "
+            "(saturation=%.1f, value=%.1f). Hue-based color comparison is unreliable for "
+            "near-achromatic objects and empirically confirmed to HURT accuracy in this "
+            "regime, not just be unhelpful.",
+            sample_id, reason, mean_sat, mean_val,
+        )
+        return None
     return hists
 
 

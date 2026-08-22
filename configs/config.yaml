@@ -333,6 +333,25 @@ stage123_geco2:
     # penalty) and re-sort -- lets a borderline-color match still surface
     # if GeCo2's own confidence is otherwise much higher than competitors.
     reweight: true
+    # Auto-disables the ENTIRE color_postfilter for a sample whose
+    # reference object's own mean HSV saturation (0-255, over the masked
+    # object pixels, averaged across all 3 ref photos) is below this floor.
+    # EMPIRICALLY CONFIRMED (not just theoretical): on a black-colored
+    # object, enabling color_postfilter DROPPED ST-IoU 0.4264 -> 0.3560
+    # (reweight-only, no hard-drop) -- Hue is unstable/noisy for
+    # near-achromatic objects. On a saturated-color (orange) object it
+    # IMPROVED 0.5170 -> 0.5448 under identical settings. The actual
+    # computed value is always logged at build time, so inspect real
+    # numbers across your own samples before tuning this.
+    min_ref_saturation: 40.0
+    # Same auto-disable, triggered by LOW mean HSV value/brightness --
+    # catches near-BLACK objects. Needed because saturation=(max-min)/max
+    # is a RATIO: for dark pixels, small absolute sensor noise gets
+    # amplified into a spuriously HIGH saturation reading, so
+    # min_ref_saturation alone can miss dark objects (confirmed: a
+    # synthetic near-black pixel with only +-4/255 noise computed mean
+    # saturation ~50, above the min_ref_saturation default above).
+    min_ref_value: 50.0
 
 # ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes
