@@ -71,6 +71,34 @@ def compute_mean_value(img_bgr: np.ndarray, mask: np.ndarray | None = None) -> f
     return float(val.mean()) if val.size else 0.0
 
 
+def saturation_value_confidence(
+    mean_saturation: float, mean_value: float,
+    sat_low: float, sat_high: float, val_low: float, val_high: float,
+) -> float:
+    """How much to trust Hue-based color comparison for this reference
+    object, in [0,1] -- 0 = fully suppress (near-achromatic, Hue is
+    noise), 1 = fully trust. Linearly ramps from `_low` (confidence 0) to
+    `_high` (confidence 1) for each of saturation and value/brightness
+    independently, then takes the MINIMUM of the two (either weak signal
+    is enough reason to distrust the comparison -- a dark AND desaturated
+    object is even less trustworthy than either alone).
+
+    A graduated ramp instead of a hard on/off cutoff: a real reference
+    object (mean saturation=60.1, value=121.3) sat ABOVE naive hard-cutoff
+    floors (40 / 50) yet the color signal still measurably hurt accuracy
+    (ST-IoU 0.4264 -> 0.3902) -- there is no single "correct" cutoff value
+    that cleanly separates "trustworthy" from "not" across different
+    objects/datasets, so this degrades gracefully around the boundary
+    instead.
+    """
+    def ramp(x: float, lo: float, hi: float) -> float:
+        if hi <= lo:
+            return 1.0 if x >= hi else 0.0
+        return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+
+    return min(ramp(mean_saturation, sat_low, sat_high), ramp(mean_value, val_low, val_high))
+
+
 def histogram_similarity(hist_a: np.ndarray, hist_b: np.ndarray, metric: str = "bhattacharyya") -> float:
     """Similarity in [0,1] (higher = more similar), normalized so callers
     don't need to know each OpenCV metric's own return convention.

@@ -385,12 +385,16 @@ class ColorPostfilterConfig(BaseModel):
 
     IMPORTANT (empirically confirmed, not just theoretical): Hue is
     unstable/noisy for near-achromatic (black/white/gray) objects -- a
-    black-colored reference object saw ST-IoU DROP (0.4264 -> 0.3560, with
-    reweight-only / no hard-drop) when this was enabled, while a
-    saturated-color (orange) object saw it IMPROVE (0.5170 -> 0.5448) under
-    the identical settings. min_ref_saturation below auto-disables this
-    filter for low-saturation reference objects instead of silently
-    hurting accuracy on them.
+    black-ish reference object (mean saturation=60.1, value=121.3) saw
+    ST-IoU DROP even after fixing the histogram under-sampling bug (0.4264
+    -> 0.3902), while a saturated-color (orange) object saw it IMPROVE
+    (0.5170 -> 0.5448) under equivalent settings. Because that black-ish
+    object's own saturation/value sat ABOVE naive hard-cutoff floors yet
+    still measurably hurt, min_ref_saturation/min_ref_value below define a
+    GRADUATED confidence ramp (see saturation_value_confidence in
+    aero_eyes/utils/color.py) rather than a single hard on/off cutoff --
+    there's no one cutoff value that cleanly separates every dataset's
+    "trustworthy" from "not".
     """
     enabled: bool = False
     # Deliberately COARSE (not the ~30x32 "whole photo" tutorial default):
@@ -414,22 +418,23 @@ class ColorPostfilterConfig(BaseModel):
     # -- lets a borderline-color match still surface if GeCo2's own
     # confidence is otherwise much higher than competing candidates.
     reweight: bool = True
-    # Auto-disables the ENTIRE color_postfilter (returns to plain GeCo2
-    # output) for a sample whose reference object's own mean HSV saturation
-    # (0-255, averaged over the masked object pixels across all 3 ref
-    # photos) is below this floor -- catches near-WHITE/gray objects.
-    # NOTE: not sufficient alone for DARK objects -- see min_ref_value.
-    # The actual computed value is always logged at build time (even when
-    # not disabling), so inspect real numbers across your samples first.
+    # Color-trust ramp: below min_ref_saturation, confidence=0 (color
+    # signal fully suppressed -- catches near-WHITE/gray objects); at/above
+    # saturation_full_confidence, confidence=1 (full effect); linearly
+    # interpolated in between. mean saturation = 0-255, averaged over the
+    # masked object pixels across all 3 ref photos.
     min_ref_saturation: float = 40.0
-    # Same auto-disable, triggered by LOW mean HSV value/brightness --
-    # catches near-BLACK objects. Needed because saturation = (max-min)/max
-    # is a RATIO: for dark pixels, small absolute sensor noise gets
-    # amplified into a spuriously HIGH saturation reading, so
-    # min_ref_saturation alone can miss dark objects entirely (confirmed:
-    # a synthetic near-black pixel with only +-4/255 noise computed mean
-    # saturation ~50, above the min_ref_saturation default).
+    saturation_full_confidence: float = 130.0
+    # Same ramp, triggered by mean HSV value/brightness -- catches
+    # near-BLACK objects. Needed because saturation=(max-min)/max is a
+    # RATIO: for dark pixels, small absolute sensor noise gets amplified
+    # into a spuriously HIGH saturation reading, so the saturation ramp
+    # alone can under-react to dark objects (confirmed: a synthetic
+    # near-black pixel with only +-4/255 noise computed mean saturation
+    # ~50, above min_ref_saturation's default). Overall confidence used is
+    # the MINIMUM of the saturation ramp and this value ramp.
     min_ref_value: float = 50.0
+    value_full_confidence: float = 160.0
 
 
 class Stage123Geco2Config(BaseModel):
