@@ -514,3 +514,24 @@ def test_fuse_feature_pyramid():
     assert np.allclose(np.linalg.norm(fused2, axis=-1), 1.0, atol=1e-5)
     assert not np.allclose(fused2[0, 0], v, atol=1e-2)
     assert not np.allclose(fused2[0, 0], v2, atol=1e-2)
+
+
+def test_box_to_yolo_label():
+    """Absolute-pixel xyxy Box -> normalized YOLO (cx, cy, w, h)."""
+    from aero_eyes.types import Box
+    from scripts.prepare_yolo_finetune_data import box_to_yolo_label
+
+    box = Box(100, 50, 200, 150)
+    cx, cy, w, h = box_to_yolo_label(box, img_w=400, img_h=300)
+    assert abs(cx - 0.375) < 1e-6
+    assert abs(cy - (100 / 300)) < 1e-6
+    assert abs(w - 0.25) < 1e-6
+    assert abs(h - (100 / 300)) < 1e-6
+
+    # A box covering the whole frame -> cx=cy=0.5, w=h=1.0.
+    full = Box(0, 0, 640, 480)
+    cx, cy, w, h = box_to_yolo_label(full, img_w=640, img_h=480)
+    assert abs(cx - 0.5) < 1e-6
+    assert abs(cy - 0.5) < 1e-6
+    assert abs(w - 1.0) < 1e-6
+    assert abs(h - 1.0) < 1e-6
