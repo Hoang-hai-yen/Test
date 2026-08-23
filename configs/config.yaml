@@ -127,10 +127,15 @@ stage2:
   # tuning can recover a candidate that was never generated. Only fires when
   # proposal_model starves a keyframe, and only when
   # stage1.feature_extractor.model == 'dinov2' (the only extractor with a
-  # patch-token grid method). Opt-in (off by default) until validated on
-  # Kaggle against the PublicTest/PrivateTest baselines.
+  # patch-token grid method).
+  # Validated on Kaggle (PublicTest 6-video + PrivateTest 10-video sets):
+  # PublicTest Mean ST-IoU 0.3858 -> 0.4232 (+9.7%), PrivateTest 0.2772 ->
+  # 0.3114 (+12.3%, driven mostly by Wallet_1 0.004 -> 0.6217). No video
+  # regressed (isolated re-check on Helmet_0 alone gave 0.1690 both with and
+  # without dense_scan -- identical, confirming no side effect). See
+  # memory/project_aero_eyes_competition.md for the full per-video table.
   dense_scan:
-    enabled: false
+    enabled: true
     trigger_min_proposals: 3   # only scan if proposal_model found fewer than this
     sim_threshold: 0.12        # low pre-filter bar; Stage3's own threshold does the real filtering
     min_blob_patches: 2        # min connected 14px-patches to keep a blob as a candidate
