@@ -1,28 +1,28 @@
-"""Convert competition GT annotations into a YOLO training dataset, for
-fine-tuning YOLOv11n as a class-agnostic single-class detector.
+"""Convert GT annotations into a YOLO training dataset, for fine-tuning
+YOLOv11n as a class-agnostic single-class detector.
 
-No first-party train split exists for this competition -- the only labeled
-data is the PublicTest (6 videos) + PrivateTest (10 videos) sets themselves,
-already used to validate the pipeline. To fine-tune without leaking (train
-and evaluate on the exact same video), pair this script with a 4-fold
-category-grouped cross-validation scheme: for each fold, call this script
-once with --train-videos = the other 3 folds' 12 videos and --val-videos =
-this fold's 4 held-out videos, train a checkpoint on the resulting dataset,
-then evaluate the aero_eyes pipeline (--set stage2.yolov11n.weights=<ckpt>)
-ONLY on the held-out videos. Repeat for all 4 folds; pooling all 16 videos'
-results (each scored by a checkpoint that never saw it during training)
-gives one honest, full-coverage Mean ST-IoU.
+A separate first-party train set exists (Kaggle dataset
+zerunagiryu/training-aeroeyes, path .../train/samples/{video_id}/ +
+.../train/annotations/annotations.json), covering 7 categories (Backpack,
+Jacket, Laptop, Lifering, MobilePhone, Person1, WaterBottle) that do NOT
+overlap with the 8 PublicTest/PrivateTest categories (BlackBox,
+CardboardBox, LifeJacket, Helmet, IDCard, Motorbike, Person2, Wallet). Since
+train and eval videos are disjoint by category, there is no leakage risk --
+train once on the full train set (--train-videos = all 14 of its videos)
+and evaluate the resulting checkpoint on the full 16-video Public+PrivateTest
+set directly. No cross-validation needed.
 
 Usage:
     python -m scripts.prepare_yolo_finetune_data \
         --config configs/config.yaml \
-        --gt-files "PublicTest/samples/annotations (1).json" \
-                   "annotations_converted (1).json" \
-        --train-videos BlackBox_0 BlackBox_1 CardboardBox_0 CardboardBox_1 \
-                       LifeJacket_0 LifeJacket_1 Helmet_0 Helmet_1 \
-                       Motorbike_0 Motorbike_1 Person2_0 Person2_1 \
-        --val-videos IDCard_0 IDCard_1 Wallet_0 Wallet_1 \
-        --out /kaggle/working/yolo_ft/fold3
+        --gt-files /kaggle/input/datasets/zerunagiryu/training-aeroeyes/train/annotations/annotations.json \
+        --data-roots /kaggle/input/datasets/zerunagiryu/training-aeroeyes/train/samples \
+        --train-videos Backpack_0 Backpack_1 Jacket_0 Jacket_1 Laptop_0 Laptop_1 \
+                       Lifering_0 Lifering_1 MobilePhone_0 Person1_0 Person1_1 \
+                       WaterBottle_0 \
+        --val-videos MobilePhone_1 WaterBottle_1 \
+        --frame-stride 6 \
+        --out /kaggle/working/yolo_ft/full
 """
 from __future__ import annotations
 
