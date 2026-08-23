@@ -78,24 +78,29 @@ def _dense_scan_boxes(
     min_blob_patches: int,
     min_area: float,
     max_candidates: int,
+    use_fpn_pyramid: bool = False,
 ) -> list[Box]:
     """DINOv2 patch-similarity scan against the Stage-1 prototype -- a
     fallback candidate source for when proposal_model (YOLOv11n/FastSAM-s)
     starves a keyframe, e.g. it essentially never proposes a box near a
     flat/small object like an ID card from a top-down drone view. Only
     called when the feature extractor is DINOv2 (the only one with a
-    patch-token grid method)."""
+    patch-token grid method). `use_fpn_pyramid` swaps the single-resolution
+    grid for a multi-scale, FPN-fused one (`extract_pyramid_grid`) -- targets
+    box precision (oversized/imprecise blobs at a single resolution), not
+    just recall."""
     from aero_eyes.utils.geometry import dense_patches_to_boxes, nms, sahi_tiles
 
     h, w = frame_bgr.shape[:2]
     all_boxes: list[Box] = []
+    extract = extractor.extract_pyramid_grid if use_fpn_pyramid else extractor.extract_dense_grid
 
     if use_sahi:
         for tile in sahi_tiles(w, h, sahi_tile, sahi_overlap):
             tile_img = frame_bgr[tile.y1:tile.y2, tile.x1:tile.x2]
             if tile_img.size == 0:
                 continue
-            grid, scale_x, scale_y = extractor.extract_dense_grid(tile_img)
+            grid, scale_x, scale_y = extract(tile_img)
             all_boxes.extend(dense_patches_to_boxes(
                 grid, prototype, sim_threshold, min_blob_patches,
                 scale_x, scale_y, offset_x=tile.x1, offset_y=tile.y1,
@@ -103,7 +108,7 @@ def _dense_scan_boxes(
         keep = nms(all_boxes, iou_threshold=0.5)
         all_boxes = [all_boxes[i] for i in keep]
     else:
-        grid, scale_x, scale_y = extractor.extract_dense_grid(frame_bgr)
+        grid, scale_x, scale_y = extract(frame_bgr)
         all_boxes = dense_patches_to_boxes(
             grid, prototype, sim_threshold, min_blob_patches, scale_x, scale_y,
         )
@@ -237,6 +242,7 @@ def run_stage2(cfg, sample_id: str) -> Path:
                 sim_threshold=dscfg.sim_threshold, min_blob_patches=dscfg.min_blob_patches,
                 min_area=cand_cfg.min_box_area,
                 max_candidates=dscfg.max_dense_candidates_per_keyframe,
+                use_fpn_pyramid=dscfg.use_fpn_pyramid,
             )
             if dense_boxes:
                 log.info(

@@ -149,6 +149,15 @@ class DenseScanConfig(BaseModel):
     # blob as a candidate box; filters single-patch noise.
     min_blob_patches: int = 2
     max_dense_candidates_per_keyframe: int = 20
+    # FPN-style multi-scale fusion: instead of a single-resolution patch
+    # grid, extract grids at several input resolutions and fuse them
+    # top-down (coarse -> fine) before scoring. Targets blob-precision, not
+    # just recall -- a validated failure mode (see configs/config.yaml) is
+    # that a single loose-threshold scale merges genuinely-matching patches
+    # with noise into an oversized, imprecise bounding box. Opt-in until
+    # validated on Kaggle -- roughly triples the DINOv2 forward-pass cost of
+    # every dense-scan trigger.
+    use_fpn_pyramid: bool = False
 
 
 class Stage2Config(BaseModel):

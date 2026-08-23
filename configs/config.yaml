@@ -140,6 +140,15 @@ stage2:
     sim_threshold: 0.12        # low pre-filter bar; Stage3's own threshold does the real filtering
     min_blob_patches: 2        # min connected 14px-patches to keep a blob as a candidate
     max_dense_candidates_per_keyframe: 20
+    # FPN-style multi-scale fusion (coarse-scale patch grid upsampled +
+    # added into the finer grid, top-down, then re-normalized) instead of a
+    # single-resolution grid. Targets box PRECISION, not just recall: at a
+    # single resolution, connected-components can merge a real match with
+    # surrounding noise into an oversized blob -- root cause diagnosed when
+    # lowering sim_threshold to 0.05 made IDCard recall worse, not better.
+    # Opt-in (off by default) until validated on Kaggle -- roughly triples
+    # the DINOv2 forward-pass cost of every dense-scan trigger.
+    use_fpn_pyramid: false
 
 # ----------------------------------------------------------------------------
 # STAGE 3 — Cross-domain matching

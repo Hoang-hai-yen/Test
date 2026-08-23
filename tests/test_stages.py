@@ -486,3 +486,31 @@ def test_dense_patches_to_boxes():
         grid, proto, sim_threshold=0.5, min_blob_patches=100,
         scale_x=1.0, scale_y=1.0,
     ) == []
+
+
+def test_fuse_feature_pyramid():
+    """Coarse-to-fine top-down fusion: the same constant vector at every
+    scale should fuse to that same (still unit) vector; output shape
+    matches the finest grid; every fused token stays unit-norm."""
+    from aero_eyes.utils.geometry import fuse_feature_pyramid
+
+    v = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    coarse = np.tile(v, (2, 2, 1)).astype(np.float32)
+    mid = np.tile(v, (4, 4, 1)).astype(np.float32)
+    fine = np.tile(v, (8, 8, 1)).astype(np.float32)
+
+    fused = fuse_feature_pyramid([coarse, mid, fine])
+    assert fused.shape == fine.shape
+    assert np.allclose(np.linalg.norm(fused, axis=-1), 1.0, atol=1e-5)
+    assert np.allclose(fused, fine, atol=1e-5)
+
+    # Different vectors at coarse vs fine -> fused direction should be a mix
+    # of both (still unit-norm), not exactly either pure vector.
+    v2 = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    coarse2 = np.tile(v, (2, 2, 1)).astype(np.float32)
+    fine2 = np.tile(v2, (4, 4, 1)).astype(np.float32)
+    fused2 = fuse_feature_pyramid([coarse2, fine2])
+    assert fused2.shape == fine2.shape
+    assert np.allclose(np.linalg.norm(fused2, axis=-1), 1.0, atol=1e-5)
+    assert not np.allclose(fused2[0, 0], v, atol=1e-2)
+    assert not np.allclose(fused2[0, 0], v2, atol=1e-2)

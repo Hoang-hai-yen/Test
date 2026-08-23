@@ -214,6 +214,64 @@ def dense_patches_to_boxes(
 
 
 # ---------------------------------------------------------------------------
+# FPN-style multi-scale feature pyramid fusion
+# ---------------------------------------------------------------------------
+
+def _bilinear_resize_grid(grid, new_h: int, new_w: int):
+    """Resize a [H, W, C] float array to [new_h, new_w, C] via bilinear
+    interpolation, pure numpy (no cv2 -- OpenCV's resize doesn't reliably
+    support arbitrary channel counts like a 768-dim DINOv2 feature grid)."""
+    import numpy as np
+
+    h, w, _ = grid.shape
+    if (h, w) == (new_h, new_w):
+        return grid
+
+    y = (np.arange(new_h) + 0.5) * h / new_h - 0.5
+    x = (np.arange(new_w) + 0.5) * w / new_w - 0.5
+    y = np.clip(y, 0, h - 1)
+    x = np.clip(x, 0, w - 1)
+    y0 = np.floor(y).astype(int)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    x0 = np.floor(x).astype(int)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    wy = (y - y0)[:, None, None]
+    wx = (x - x0)[None, :, None]
+
+    top = grid[y0][:, x0] * (1 - wx) + grid[y0][:, x1] * wx
+    bot = grid[y1][:, x0] * (1 - wx) + grid[y1][:, x1] * wx
+    return top * (1 - wy) + bot * wy
+
+
+def fuse_feature_pyramid(grids: list):
+    """FPN-style top-down fusion of multi-scale DINOv2 patch-token grids.
+
+    `grids` must be ordered coarsest -> finest and must all come from the
+    SAME crop at different resolutions (identical field of view, only grid
+    resolution differs) -- that's what makes plain bilinear upsampling
+    spatially valid here; this is not a general-purpose spatial pyramid
+    across different crops/tiles.
+
+    Starting from the coarsest grid (large receptive field per token,
+    semantically strong, less prone to single-patch noise), each step
+    upsamples it to the next-finer grid's resolution and adds it in,
+    L2-renormalizing after every step so the fused tokens stay unit vectors
+    (comparable to a plain DINOv2 grid for cosine similarity -- callers like
+    `dense_patches_to_boxes` need no changes). Returns the finest grid,
+    fused, same shape as `grids[-1]`.
+    """
+    import numpy as np
+
+    fused = grids[0].astype(np.float32)
+    for grid in grids[1:]:
+        h, w = grid.shape[:2]
+        fused = _bilinear_resize_grid(fused, h, w) + grid
+        norm = np.linalg.norm(fused, axis=-1, keepdims=True)
+        fused = fused / np.clip(norm, 1e-8, None)
+    return fused.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Crop helper
 # ---------------------------------------------------------------------------
 
