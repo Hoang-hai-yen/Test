@@ -93,24 +93,30 @@ def _load_gt_any(gt_files: list[Path], video_id: str) -> dict[int, Box]:
     raise KeyError(f"'{video_id}' not found in any of {gt_files}")
 
 
-def _find_video(data_root: Path, video_id: str, video_glob: str) -> Path:
-    matches = list((data_root / video_id).glob(video_glob))
-    if not matches:
-        raise FileNotFoundError(f"No video matching '{video_glob}' in {data_root / video_id}")
-    return matches[0]
+def _find_video(data_roots: list[Path], video_id: str, video_glob: str) -> Path:
+    """The competition's videos live under two separate dataset roots on
+    Kaggle (PublicTest vs PrivateTest) -- try each until one has this
+    video_id, same try-until-found pattern as `_load_gt_any`."""
+    for data_root in data_roots:
+        matches = list((data_root / video_id).glob(video_glob))
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(
+        f"No video matching '{video_glob}' for '{video_id}' in any of {data_roots}"
+    )
 
 
 def build_split(
     cfg,
     gt_files: list[Path],
+    data_roots: list[Path],
     video_ids: list[str],
     images_dir: Path,
     labels_dir: Path,
 ) -> None:
-    data_root = Path(cfg.data.data_root)
     for video_id in video_ids:
         gt = _load_gt_any(gt_files, video_id)
-        video_path = _find_video(data_root, video_id, cfg.data.video_glob)
+        video_path = _find_video(data_roots, video_id, cfg.data.video_glob)
         written = convert_video_to_yolo(video_path, gt, video_id, images_dir, labels_dir)
         log.info("[prepare_yolo_finetune_data] %s: wrote %d/%d GT frames",
                  video_id, written, len(gt))
@@ -134,6 +140,9 @@ def main():
     p.add_argument("--config", required=True)
     p.add_argument("--gt-files", nargs="+", required=True,
                    help="One or more GT annotation JSON files (PublicTest + PrivateTest).")
+    p.add_argument("--data-roots", nargs="+", required=True,
+                   help="One or more data_root dirs (PublicTest/samples, privatetest/samples) "
+                        "-- videos are searched across all of them.")
     p.add_argument("--train-videos", nargs="+", required=True)
     p.add_argument("--val-videos", nargs="+", required=True)
     p.add_argument("--out", required=True, help="Output dir for the YOLO dataset.")
@@ -145,10 +154,11 @@ def main():
 
     out_dir = Path(args.out)
     gt_files = [Path(f) for f in args.gt_files]
+    data_roots = [Path(r) for r in args.data_roots]
 
-    build_split(cfg, gt_files, args.train_videos,
+    build_split(cfg, gt_files, data_roots, args.train_videos,
                 out_dir / "images" / "train", out_dir / "labels" / "train")
-    build_split(cfg, gt_files, args.val_videos,
+    build_split(cfg, gt_files, data_roots, args.val_videos,
                 out_dir / "images" / "val", out_dir / "labels" / "val")
 
     data_yaml = write_data_yaml(out_dir)
