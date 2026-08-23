@@ -535,3 +535,37 @@ def test_box_to_yolo_label():
     assert abs(cy - 0.5) < 1e-6
     assert abs(w - 1.0) < 1e-6
     assert abs(h - 1.0) < 1e-6
+
+
+def test_convert_video_to_yolo_stride(synth_fixture, tmp_path):
+    """frame_stride=1 writes every GT frame as an image+label pair;
+    frame_stride=3 keeps every 3rd one. Uses the existing synthetic fixture
+    (21 GT frames) so this runs offline, no real dataset needed."""
+    from aero_eyes.utils.io import load_gt
+    from scripts.prepare_yolo_finetune_data import convert_video_to_yolo
+
+    video_path = synth_fixture / FIXTURE_ID / "video.mp4"
+    gt_path = synth_fixture / FIXTURE_ID / "gt.json"
+    gt = load_gt(gt_path, FIXTURE_ID)
+    assert len(gt) == 21
+
+    images_dir = tmp_path / "images"
+    labels_dir = tmp_path / "labels"
+    written = convert_video_to_yolo(video_path, gt, FIXTURE_ID, images_dir, labels_dir,
+                                    frame_stride=1)
+    assert written == 21
+    assert len(list(images_dir.glob("*.jpg"))) == 21
+    assert len(list(labels_dir.glob("*.txt"))) == 21
+
+    for label_file in labels_dir.glob("*.txt"):
+        cls, cx, cy, w, h = label_file.read_text().split()
+        assert cls == "0"
+        cx, cy, w, h = float(cx), float(cy), float(w), float(h)
+        assert 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0
+        assert 0.0 < w <= 1.0 and 0.0 < h <= 1.0
+
+    written_strided = convert_video_to_yolo(
+        video_path, gt, FIXTURE_ID,
+        tmp_path / "images_stride3", tmp_path / "labels_stride3", frame_stride=3,
+    )
+    assert written_strided == 7  # ceil(21 / 3)

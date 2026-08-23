@@ -51,11 +51,24 @@ def convert_video_to_yolo(
     video_id: str,
     images_dir: Path,
     labels_dir: Path,
+    frame_stride: int = 1,
 ) -> int:
-    """Write every GT-labeled frame of one video as a YOLO image+label pair.
+    """Write GT-labeled frames of one video as YOLO image+label pairs.
     Reuses `frame_iterator` (sequential decode) rather than seeking per
     frame -- much faster for compressed video, same pattern stage2.py uses.
-    Returns the number of frames written, to sanity-check against len(gt)."""
+
+    `frame_stride`: keep only every Nth GT-labeled frame (counted among the
+    GT frames actually present, not raw frame_idx -- GT frames are already
+    sparse and unevenly spaced). Consecutive video frames are near-duplicates
+    (the object barely moves frame to frame), so training on every single
+    one adds little signal while multiplying training time -- a video with
+    ~1000-4000 GT frames is common in this dataset; stride=1 (default, no
+    subsampling) can make a single fold's training set exceed 20k images.
+
+    Returns the number of frames written, to sanity-check against len(gt)
+    (with stride > 1, written < len(gt) by design -- that's expected, not a
+    bug).
+    """
     import cv2
 
     from aero_eyes.utils.video import frame_iterator, video_info
@@ -67,9 +80,13 @@ def convert_video_to_yolo(
     img_w, img_h = info["width"], info["height"]
 
     written = 0
+    gt_seen = 0
     for frame_idx, frame_bgr in frame_iterator(video_path):
         box = gt.get(frame_idx)
         if box is None:
+            continue
+        gt_seen += 1
+        if (gt_seen - 1) % frame_stride != 0:
             continue
         stem = f"{video_id}_{frame_idx}"
         cv2.imwrite(str(images_dir / f"{stem}.jpg"), frame_bgr)
@@ -113,13 +130,15 @@ def build_split(
     video_ids: list[str],
     images_dir: Path,
     labels_dir: Path,
+    frame_stride: int = 1,
 ) -> None:
     for video_id in video_ids:
         gt = _load_gt_any(gt_files, video_id)
         video_path = _find_video(data_roots, video_id, cfg.data.video_glob)
-        written = convert_video_to_yolo(video_path, gt, video_id, images_dir, labels_dir)
-        log.info("[prepare_yolo_finetune_data] %s: wrote %d/%d GT frames",
-                 video_id, written, len(gt))
+        written = convert_video_to_yolo(video_path, gt, video_id, images_dir, labels_dir,
+                                        frame_stride=frame_stride)
+        log.info("[prepare_yolo_finetune_data] %s: wrote %d/%d GT frames (stride=%d)",
+                 video_id, written, len(gt), frame_stride)
 
 
 def write_data_yaml(out_dir: Path) -> Path:
@@ -145,6 +164,11 @@ def main():
                         "-- videos are searched across all of them.")
     p.add_argument("--train-videos", nargs="+", required=True)
     p.add_argument("--val-videos", nargs="+", required=True)
+    p.add_argument("--frame-stride", type=int, default=1,
+                   help="Keep only every Nth GT-labeled frame per video (default 1 = "
+                        "no subsampling). Consecutive frames are near-duplicates -- a "
+                        "handful of videos alone can exceed 20k GT frames, so a stride "
+                        "of ~4-8 is recommended to keep training tractable.")
     p.add_argument("--out", required=True, help="Output dir for the YOLO dataset.")
     p.add_argument("--set", action="append", default=[])
     args = p.parse_args()
@@ -157,9 +181,11 @@ def main():
     data_roots = [Path(r) for r in args.data_roots]
 
     build_split(cfg, gt_files, data_roots, args.train_videos,
-                out_dir / "images" / "train", out_dir / "labels" / "train")
+                out_dir / "images" / "train", out_dir / "labels" / "train",
+                frame_stride=args.frame_stride)
     build_split(cfg, gt_files, data_roots, args.val_videos,
-                out_dir / "images" / "val", out_dir / "labels" / "val")
+                out_dir / "images" / "val", out_dir / "labels" / "val",
+                frame_stride=args.frame_stride)
 
     data_yaml = write_data_yaml(out_dir)
     log.info("[prepare_yolo_finetune_data] wrote data.yaml -> %s", data_yaml)
