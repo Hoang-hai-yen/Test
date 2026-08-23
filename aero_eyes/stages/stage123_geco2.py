@@ -274,8 +274,20 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             if cfg.runtime.save_visualizations:
                 out_dir = work_dir / "viz" / "stage123_geco2" / "refs_scale_calibrated"
                 out_dir.mkdir(parents=True, exist_ok=True)
-                for i, c in enumerate(canvases):
+                for i, (c, box_c) in enumerate(zip(canvases, canvas_boxes)):
                     cv2.imwrite(str(out_dir / f"ref_{i}_calibrated.jpg"), c)
+                    # ALSO save a copy with the actual RoI-Align pooling box
+                    # drawn on top -- background_mode=keep_real (or a huge
+                    # conceptual crop region relative to the reference photo)
+                    # can make the canvas visually look "unsegmented" even
+                    # when the pooling region itself is correctly tight;
+                    # this makes what GeCo2 actually pools from unambiguous,
+                    # independent of background_mode.
+                    if box_c is not None:
+                        annotated = c.copy()
+                        from aero_eyes.utils.viz import draw_box
+                        draw_box(annotated, Box(*box_c), "RoI-Align region", (0, 255, 0))
+                        cv2.imwrite(str(out_dir / f"ref_{i}_calibrated_box.jpg"), annotated)
             ref_imgs = canvases
             ref_boxes = canvas_boxes
         else:

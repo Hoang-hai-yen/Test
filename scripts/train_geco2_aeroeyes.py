@@ -61,7 +61,10 @@ def build_targets(gt_box_canvas: tuple[float, float, float, float] | None, image
     return torch.tensor([gt_box_canvas], dtype=torch.float32).clamp(0, image_size) / image_size
 
 
-def compute_step_loss(criterion, out, target_boxes: torch.Tensor, aux_weight: float, image_size: float):
+def compute_step_loss(
+    criterion, out, target_boxes: torch.Tensor, aux_weight: float, image_size: float,
+    aux_size_threshold_px: float = 25.0,
+):
     """Loss recipe adapted from GECO2/train.py, with two deliberate,
     documented deviations from the reference implementation (see
     docs/GECO2_FINETUNE_PLAN.md point 8):
@@ -75,6 +78,16 @@ def compute_step_loss(criterion, out, target_boxes: torch.Tensor, aux_weight: fl
        term, not `l['loss_bbox']` (the main head's) -- train.py has an
        apparent copy-paste bug reusing the main head's box loss for the
        aux term; fixed rather than reproduced.
+
+    `aux_size_threshold_px` (train.py hardcodes this at 25) gates the aux
+    loss to present frames whose mean GT box dimension (on the 1024 canvas)
+    is below this many pixels -- a small-object emphasis that made sense
+    for FSC147's mixed-size counting targets. AERO EYES objects are
+    typically 20-150px, so a lot of present frames fall ABOVE 25px and
+    currently give the aux head literally zero gradient signal all run --
+    exposed as a tunable here (not hardcoded) so this can be raised (e.g.
+    to 100-150) to actually exercise the aux head on this dataset, an
+    identified low-risk lever from the first finetune attempt's post-mortem.
     """
     targets = [{"boxes": target_boxes, "labels": torch.zeros(len(target_boxes), dtype=torch.long)}]
     l = criterion(out.main, targets, out.centerness, out.ref_points)
@@ -85,7 +98,7 @@ def compute_step_loss(criterion, out, target_boxes: torch.Tensor, aux_weight: fl
     else:
         mean_h = (target_boxes[:, 3] - target_boxes[:, 1]).mean().item() * image_size
         mean_w = (target_boxes[:, 2] - target_boxes[:, 0]).mean().item() * image_size
-        alpha = aux_weight if min(mean_h, mean_w) < 25 else 0.0
+        alpha = aux_weight if min(mean_h, mean_w) < aux_size_threshold_px else 0.0
 
     main_loss = l["loss_giou"] + l["loss_ce"] + l["loss_bbox"]
     aux_loss = alpha * (l1["loss_giou"] + l1["loss_ce"] + l1["loss_bbox"])
@@ -127,7 +140,10 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
                 _, gt_box_canvas, _ = convert_gt_box_to_canvas(sample.frame_bgr, sample.gt_box, image_size)
                 target_boxes = build_targets(gt_box_canvas, image_size).to(device)
 
-                loss = compute_step_loss(criterion, out, target_boxes, args.aux_weight, image_size)
+                loss = compute_step_loss(
+                    criterion, out, target_boxes, args.aux_weight, image_size,
+                    aux_size_threshold_px=args.aux_size_threshold_px,
+                )
                 batch_losses.append(loss)
                 n_samples += 1
 
@@ -152,22 +168,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True)
     p.add_argument("--set", action="append", default=[])
     p.add_argument("--holdout-categories", nargs="+", default=list(DEFAULT_HOLDOUT_CATEGORIES))
-    p.add_argument("--epochs", type=int, default=15)
+    # Bumped from 15 -> 25 after the first finetune attempt: best val_loss
+    # was still improving as late as epoch 12/15 (early stopping never
+    # triggered, the run simply ran out of budgeted epochs), so the
+    # previous cap was likely leaving real improvement on the table.
+    p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--steps-per-epoch", type=int, default=400)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--max-grad-norm", type=float, default=0.1)
     p.add_argument("--aux-weight", type=float, default=0.3)
+    p.add_argument("--aux-size-threshold-px", type=float, default=25.0,
+                    help="Aux head loss only applies when mean GT box dim (on the 1024 canvas) is "
+                         "below this. train.py's original 25px default starves the aux head of any "
+                         "signal on most AERO EYES objects (typically 20-150px) -- try e.g. 100-150 "
+                         "if the aux head appears under-trained.")
     p.add_argument("--p-present", type=float, default=0.5)
     p.add_argument("--ref-downscale-lo", type=float, default=0.03)
     p.add_argument("--ref-downscale-hi", type=float, default=1.0)
+    p.add_argument("--lr-patience", type=int, default=3,
+                    help="Epochs with no val_loss improvement before ReduceLROnPlateau halves LR -- "
+                         "added after the first finetune attempt showed train+val loss oscillating "
+                         "together (both rising for 2+ epochs at a stretch) rather than converging "
+                         "smoothly, a classic too-high-LR-for-this-stage symptom.")
+    p.add_argument("--lr-decay-factor", type=float, default=0.5)
     p.add_argument("--base-checkpoint", default="./GECO2/CNTQG_multitrain_ca44.pth",
                     help="Base (pretrained-on-FSC147) checkpoint to finetune from. "
                          "Overrides stage123_geco2.weights_path from --config/--set.")
     p.add_argument("--out-checkpoint", default="./GECO2/CNTQG_aeroeyes_finetuned.pth",
                     help="Where to save the finetuned checkpoint. Never overwrites --base-checkpoint.")
-    p.add_argument("--early-stop-patience", type=int, default=5)
+    p.add_argument("--early-stop-patience", type=int, default=7)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dry-run", action="store_true",
                     help="Run a handful of steps only, assert finite loss, save nothing. "
@@ -232,6 +263,14 @@ def main():
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    # See --lr-patience help text: addresses the oscillating train+val loss
+    # observed in the first finetune attempt (both rising together for
+    # multiple epochs at a stretch, rather than converging), by halving LR
+    # once val_loss plateaus instead of holding a single flat LR for the
+    # whole run.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=args.lr_decay_factor, patience=args.lr_patience,
+    )
 
     image_size = float(cfg.stage123_geco2.image_size)
 
@@ -258,12 +297,18 @@ def main():
         val_loss, val_present, val_absent = run_epoch(
             model, val_loader, criterion, optimizer, args, image_size, device, train=False,
         )
+        lr_before = optimizer.param_groups[0]["lr"]
+        scheduler.step(val_loss)
+        lr_after = optimizer.param_groups[0]["lr"]
         log.info(
             "epoch %d/%d: train_loss=%.4f (present=%d absent=%d) val_loss=%.4f "
-            "(present=%d absent=%d) [%.1fs]",
+            "(present=%d absent=%d) lr=%.2e [%.1fs]",
             epoch + 1, args.epochs, train_loss, train_present, train_absent,
-            val_loss, val_present, val_absent, time.time() - t0,
+            val_loss, val_present, val_absent, lr_after, time.time() - t0,
         )
+        if lr_after < lr_before:
+            log.info("LR decayed: %.2e -> %.2e (val_loss plateaued for %d epochs)",
+                      lr_before, lr_after, args.lr_patience)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
