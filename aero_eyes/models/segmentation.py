@@ -18,9 +18,19 @@ class MobileSAMSegmenter:
 
     def __init__(self, weights_path: str | None = None, fallback_if_missing: str = "passthrough",
                  min_area_frac: float = 0.05, max_area_frac: float = 0.95,
-                 score_ratio_floor: float = 0.85, max_border_touch_frac: float = 0.02):
+                 score_ratio_floor: float = 0.85, max_border_touch_frac: float = 0.02,
+                 use_point_prompt: bool = True):
         self.weights_path = weights_path
         self.fallback_if_missing = fallback_if_missing
+        # Center-point prompt assumes the geometric center pixel is
+        # foreground -- breaks down for ring/donut-shaped objects (e.g. a
+        # life ring) whose center is a HOLLOW interior (background), which
+        # can bias SAM's mask proposals toward confused/leaky boundaries
+        # (confirmed empirically: life-ring reference photos showed both
+        # border-touching passthrough failures AND loose/over-inclusive
+        # masks on the candidate that WAS accepted). Set False to prompt
+        # with the box alone (no point) for object shapes like this.
+        self.use_point_prompt = use_point_prompt
         # Guardrail: a single center-point prompt sometimes locks onto a tiny
         # spurious region (a shadow, a logo) or ~the whole frame (no real
         # segmentation). Either extreme is worse than no masking at all, so
@@ -108,6 +118,22 @@ class MobileSAMSegmenter:
         return labels == label_at_point
 
     @staticmethod
+    def _isolate_largest_component(mask: np.ndarray) -> np.ndarray:
+        """Keep only the largest connected foreground component -- used
+        instead of _isolate_component_at_point when there is no reliable
+        known-foreground point to anchor on (use_point_prompt=False), e.g.
+        for ring/donut-shaped objects where the geometric center is the
+        hollow interior, not the object material."""
+        mask_u8 = mask.astype(np.uint8)
+        num_labels, labels = cv2.connectedComponents(mask_u8, connectivity=8)
+        if num_labels <= 2:
+            return mask
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        largest_label = int(np.argmax(counts))
+        return labels == largest_label
+
+    @staticmethod
     def _border_touch_frac(mask: np.ndarray) -> float:
         """Fraction of the image's outer-edge pixels (all 4 sides) that are
         foreground. Near 0 for a well-framed subject; large when the mask
@@ -155,11 +181,21 @@ class MobileSAMSegmenter:
             # The box anchors SAM to "segment the dominant thing filling
             # roughly this region", which is far more reliable for close-up
             # reference photos where the subject fills most of the frame.
-            cx, cy = w // 2, h // 2
-            point_coords = np.array([[cx, cy]])
-            point_labels = np.array([1])
+            #
+            # use_point_prompt=False drops the point prompt entirely (box
+            # only) -- the center-pixel assumption breaks down for
+            # ring/donut-shaped objects (e.g. a life ring) whose center is a
+            # HOLLOW interior, not object material; asserting "foreground
+            # here" at a background pixel can bias SAM's mask proposals
+            # toward confused/leaky boundaries (confirmed empirically: see
+            # SegmentationConfig.use_point_prompt).
             margin = 0.05
             box = np.array([w * margin, h * margin, w * (1 - margin), h * (1 - margin)])
+            if self.use_point_prompt:
+                cx, cy = w // 2, h // 2
+                point_coords, point_labels = np.array([[cx, cy]]), np.array([1])
+            else:
+                point_coords, point_labels = None, None
             masks, scores, _ = self._predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
@@ -177,8 +213,13 @@ class MobileSAMSegmenter:
             # a disconnected background chunk; a lower-scoring, smaller
             # candidate was the correct, tight one -- no score/area
             # threshold on the RAW masks can prefer the latter, only
-            # cleaning first can).
-            cleaned = [self._isolate_component_at_point(m, cx, cy) for m in masks]
+            # cleaning first can). Without a point prompt there is no
+            # "known-foreground pixel" to anchor the isolation on, so fall
+            # back to keeping each candidate's largest connected component.
+            if self.use_point_prompt:
+                cleaned = [self._isolate_component_at_point(m, cx, cy) for m in masks]
+            else:
+                cleaned = [self._isolate_largest_component(m) for m in masks]
 
             # multimask_output=True returns 3 candidates at different
             # granularities (roughly: whole object / a part / a sub-part).

@@ -203,6 +203,15 @@ stage123_geco2:
     # background plane commonly runs off-frame). Raise if legitimate subjects
     # in your reference photos are shot edge-to-edge with no margin.
     max_border_touch_frac: 0.02
+    # Center-point prompt (in addition to the box prompt) assumes the
+    # geometric center pixel is foreground -- breaks down for ring/donut-
+    # shaped objects (e.g. a life ring) whose center is a HOLLOW interior
+    # (background), which can bias SAM's mask proposals toward confused/
+    # leaky boundaries (confirmed empirically: life-ring reference photos
+    # showed both border-touching passthrough failures AND loose/over-
+    # inclusive masks on the candidate that WAS accepted). Set false to
+    # prompt with the box alone for object shapes like this.
+    use_point_prompt: true
     # What to do with the non-mask (background) region of a reference image:
     #   mean_fill (default) -- flat mean-color fill. Cheapest, but a large
     #     flat, textureless region is far outside what the backbone
@@ -250,6 +259,19 @@ stage123_geco2:
   # to image_size regardless of any uniform pre-shrink, so this only affects
   # blur/detail. Use scale_calibration below to fix apparent-size mismatch.
   ref_downscale_factor: 1.0   # e.g. 0.125 = resize down to 1/8 size
+  # Crop each ref image to its MobileSAM tight mask box (expanded by
+  # crop_context_margin) BEFORE resize_and_pad -- keeps 100% real pixels, no
+  # masking/fill (unlike background_mode above), just a tighter field of
+  # view than the whole reference photo. Since resize_and_pad always
+  # renormalizes the (now smaller) image's longer side back up to
+  # image_size, the object ends up occupying a LARGER fraction of the 1024
+  # canvas -- RoI-Align pools from more feature-map cells, higher-resolution
+  # appearance token. Unlike scale_calibration below, needs NO oracle
+  # knowledge of the deployment video's apparent object size -- purely a
+  # function of the reference photo's own object bounds. Requires
+  # segmentation.enabled.
+  crop_to_object: false
+  crop_context_margin: 0.5   # extra padding around the tight box, as a fraction of the box's own size
 
   # --------------------------------------------------------------------
   # Fixes the ground-to-aerial SIZE mismatch ref_downscale_factor cannot

@@ -82,6 +82,48 @@ def _mask_bbox(mask: np.ndarray) -> tuple[float, float, float, float] | None:
     return float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)
 
 
+def _crop_to_object(
+    img: np.ndarray, tight_box: tuple[float, float, float, float], context_margin: float
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Crop `img` to `tight_box` expanded by `context_margin` (a fraction of
+    the box's own width/height), clamped to image bounds. Keeps 100% real
+    pixels -- no masking/fill -- just a tighter field of view than the
+    whole reference photo.
+
+    Why this helps: GeCo2Detector._load_and_pad's resize_and_pad() always
+    renormalizes whichever image it's given so its longer side fits
+    stage123_geco2.image_size (1024). Feeding it the WHOLE reference photo
+    means the object occupies only whatever (small) fraction of the photo
+    it originally did, so it ends up occupying that same small fraction of
+    the 1024 canvas -- RoI-Align then pools the appearance token from very
+    few feature-map cells at each pyramid level, losing detail. Cropping to
+    just the object (plus context) BEFORE resize_and_pad means the object
+    occupies a much LARGER fraction of the (now smaller) cropped image, so
+    after renormalizing to 1024 it also occupies a larger fraction of the
+    canvas -- more feature-map cells, a higher-resolution token. Unlike
+    ScaleCalibrationConfig, this needs no oracle estimate of the deployment
+    video's apparent object size -- it's purely a function of the
+    reference photo's own (already-computed) object bounds.
+
+    Returns (cropped_img, box_in_cropped_image_coords). Falls back to
+    (img, tight_box) unchanged if the expanded crop region is degenerate
+    (shouldn't happen for a valid tight_box, but cheap to guard).
+    """
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = tight_box
+    mx, my = (x2 - x1) * context_margin, (y2 - y1) * context_margin
+    cx1 = max(0.0, x1 - mx)
+    cy1 = max(0.0, y1 - my)
+    cx2 = min(float(w), x2 + mx)
+    cy2 = min(float(h), y2 + my)
+    icx1, icy1, icx2, icy2 = int(round(cx1)), int(round(cy1)), int(round(cx2)), int(round(cy2))
+    if icx2 <= icx1 or icy2 <= icy1:
+        return img, tight_box
+    cropped = img[icy1:icy2, icx1:icx2]
+    box_in_crop = (x1 - icx1, y1 - icy1, x2 - icx1, y2 - icy1)
+    return cropped, box_in_crop
+
+
 def _apply_ref_downscale(img, downscale_factor: float):
     """Shrink a reference image to narrow the ground-to-aerial domain gap
     (close-up ref photos are otherwise much crisper/larger-looking than how
@@ -238,6 +280,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             max_area_frac=seg_cfg.max_area_frac,
             score_ratio_floor=seg_cfg.score_ratio_floor,
             max_border_touch_frac=seg_cfg.max_border_touch_frac,
+            use_point_prompt=seg_cfg.use_point_prompt,
         )
         masks = [segmenter.segment(img) for img in ref_imgs]
         # Tight box around the actual segmented object, on the ORIGINAL
@@ -295,13 +338,39 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                         for img, m in zip(ref_imgs, masks)]
             if cfg.runtime.save_visualizations:
                 vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+
+            if g.crop_to_object:
+                cropped_imgs, cropped_boxes = [], []
+                for img, b in zip(ref_imgs, raw_boxes):
+                    if b is None:
+                        cropped_imgs.append(img)
+                        cropped_boxes.append(None)
+                        continue
+                    cimg, cbox = _crop_to_object(img, b, g.crop_context_margin)
+                    cropped_imgs.append(cimg)
+                    cropped_boxes.append(cbox)
+                if cfg.runtime.save_visualizations:
+                    out_dir = work_dir / "viz" / "stage123_geco2" / "refs_cropped"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    for i, (c, box_c) in enumerate(zip(cropped_imgs, cropped_boxes)):
+                        cv2.imwrite(str(out_dir / f"ref_{i}_cropped.jpg"), c)
+                        if box_c is not None:
+                            annotated = c.copy()
+                            from aero_eyes.utils.viz import draw_box
+                            draw_box(annotated, Box(*box_c), "RoI-Align region", (0, 255, 0))
+                            cv2.imwrite(str(out_dir / f"ref_{i}_cropped_box.jpg"), annotated)
+                ref_imgs = cropped_imgs
+                raw_boxes = cropped_boxes
+
             # Scale into the coord system _apply_ref_downscale below produces
             # (uniform factor in both axes, matching that function). NOTE:
             # this only affects blur/detail -- it does NOT change the
             # object's final size on the model's canvas (resize_and_pad
             # re-normalizes the whole image's longer side regardless; see
             # ScaleCalibrationConfig docstring). Use scale_calibration above
-            # to fix apparent-size mismatch.
+            # to fix apparent-size mismatch. crop_to_object above (if
+            # enabled) is the mechanism that DOES change the object's final
+            # canvas size, without needing an oracle scale estimate.
             f = g.ref_downscale_factor
             ref_boxes = [
                 tuple(c * f for c in b) if b is not None else None
@@ -392,6 +461,7 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
                 weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
                 min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
                 score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
+                use_point_prompt=seg_cfg.use_point_prompt,
             )
             masks = [segmenter.segment(img) for img in ref_imgs]
         else:

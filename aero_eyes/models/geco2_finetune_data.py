@@ -20,6 +20,7 @@ from aero_eyes.models.segmentation import MobileSAMSegmenter
 from aero_eyes.stages.stage123_geco2 import (
     _apply_background,
     _apply_ref_downscale,
+    _crop_to_object,
     _load_ref_images,
     _locate_video,
     _mask_bbox,
@@ -212,6 +213,7 @@ class RefImageCache:
             max_area_frac=seg_cfg.max_area_frac,
             score_ratio_floor=seg_cfg.score_ratio_floor,
             max_border_touch_frac=seg_cfg.max_border_touch_frac,
+            use_point_prompt=seg_cfg.use_point_prompt,
         ) if seg_cfg.enabled else None
         self._cache: dict[str, tuple[list[np.ndarray], list[tuple | None]]] = {}
         for video_id in video_ids:
@@ -223,6 +225,23 @@ class RefImageCache:
                     _apply_background(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
                     for img, m in zip(ref_imgs, masks)
                 ]
+                if cfg.stage123_geco2.crop_to_object:
+                    # See aero_eyes/stages/stage123_geco2.py::_crop_to_object --
+                    # tighter field of view (real pixels, no masking) so the
+                    # object occupies more of the 1024 canvas after
+                    # resize_and_pad, without needing any oracle scale
+                    # estimate. Mirrors build_exemplar_prototype's identical
+                    # step so training and inference stay symmetric.
+                    cropped_imgs, cropped_boxes = [], []
+                    for img, b in zip(ref_imgs, boxes):
+                        if b is None:
+                            cropped_imgs.append(img)
+                            cropped_boxes.append(None)
+                            continue
+                        cimg, cbox = _crop_to_object(img, b, cfg.stage123_geco2.crop_context_margin)
+                        cropped_imgs.append(cimg)
+                        cropped_boxes.append(cbox)
+                    ref_imgs, boxes = cropped_imgs, cropped_boxes
             else:
                 boxes = [None] * len(ref_imgs)
             self._cache[video_id] = (ref_imgs, boxes)

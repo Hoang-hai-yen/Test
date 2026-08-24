@@ -76,6 +76,15 @@ class SegmentationConfig(BaseModel):
     # edges, so a correctly-segmented subject essentially never reaches the
     # real border; a background plane (ground, wall, sky) commonly does.
     max_border_touch_frac: float = 0.02
+    # Center-point prompt (in addition to the box prompt) assumes the
+    # geometric center pixel is foreground -- breaks down for ring/donut-
+    # shaped objects (e.g. a life ring) whose center is a HOLLOW interior
+    # (background), which can bias SAM's mask proposals toward confused/
+    # leaky boundaries (confirmed empirically: life-ring reference photos
+    # showed both border-touching passthrough failures AND loose/over-
+    # inclusive masks on the candidate that WAS accepted). Set false to
+    # prompt with the box alone for object shapes like this.
+    use_point_prompt: bool = True
     # What to do with the non-mask (background) region of a reference image:
     #   mean_fill -- flat mean-color fill (old/default behavior). Cheapest,
     #                but a large flat, textureless region is far outside what
@@ -510,6 +519,21 @@ class Stage123Geco2Config(BaseModel):
     # ScaleCalibrationConfig docstring) -- it only affects blur/detail level.
     # Use scale_calibration below to actually fix apparent-size mismatch.
     ref_downscale_factor: float = 1.0
+    # Crop each reference image to its MobileSAM tight mask box (expanded by
+    # crop_context_margin) BEFORE resize_and_pad -- keeps 100% real pixels,
+    # no masking/fill (unlike background_mode), just a tighter field of view
+    # than the whole reference photo. Since resize_and_pad always renormalizes
+    # the (now smaller) image's longer side back up to image_size, the object
+    # ends up occupying a LARGER fraction of the 1024 canvas than it would
+    # from the whole uncropped photo -- so RoI-Align pools from more
+    # feature-map cells at each pyramid level, giving a higher-resolution
+    # appearance token. Unlike scale_calibration below, this needs NO oracle
+    # knowledge of the deployment video's apparent object size -- it is
+    # purely a function of the reference photo's own (already-computed)
+    # object bounds. Requires segmentation.enabled (needs the tight mask
+    # box). See aero_eyes/stages/stage123_geco2.py::_crop_to_object.
+    crop_to_object: bool = False
+    crop_context_margin: float = 0.5
     scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
     domain_calibration: DomainCalibrationConfig = DomainCalibrationConfig()
     # Diagnostic/ablation toggle: box size feeds the exemplar prototype
