@@ -187,6 +187,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--p-present", type=float, default=0.5)
     p.add_argument("--ref-downscale-lo", type=float, default=0.03)
     p.add_argument("--ref-downscale-hi", type=float, default=1.0)
+    p.add_argument("--brightness-lo", type=float, default=0.0)
+    p.add_argument("--brightness-hi", type=float, default=0.0,
+                    help="Reference-image brightness jitter range (added to pixel values, uint8 "
+                         "scale) -- opt-in second domain-randomization axis alongside ref-downscale, "
+                         "for lighting differences between controlled ref photos and outdoor drone "
+                         "video. Default (0,0) is a no-op; try e.g. -30..30 to enable.")
+    p.add_argument("--contrast-lo", type=float, default=1.0)
+    p.add_argument("--contrast-hi", type=float, default=1.0,
+                    help="Reference-image contrast jitter range (multiplies pixel values). "
+                         "Default (1,1) is a no-op; try e.g. 0.7..1.3 to enable.")
     p.add_argument("--lr-patience", type=int, default=3,
                     help="Epochs with no val_loss improvement before ReduceLROnPlateau halves LR -- "
                          "added after the first finetune attempt showed train+val loss oscillating "
@@ -242,11 +252,15 @@ def main():
     train_ds = Geco2FinetuneDataset(
         cfg, train_ids, ref_cache, steps_per_epoch=steps_per_epoch,
         p_present=args.p_present, ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
+        brightness_range=(args.brightness_lo, args.brightness_hi),
+        contrast_range=(args.contrast_lo, args.contrast_hi),
         seed=args.seed,
     )
     val_ds = Geco2FinetuneDataset(
         cfg, val_ids, ref_cache, steps_per_epoch=max(1, steps_per_epoch // 4),
         p_present=args.p_present, ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
+        brightness_range=(args.brightness_lo, args.brightness_hi),
+        contrast_range=(args.contrast_lo, args.contrast_hi),
         seed=args.seed + 1,
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,

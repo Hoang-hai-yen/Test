@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -145,6 +146,41 @@ def sample_ref_downscale_factor(rng: np.random.Generator, lo: float = 0.03, hi: 
     if not (0.0 < lo <= hi):
         raise ValueError(f"require 0 < lo <= hi, got lo={lo} hi={hi}")
     return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+
+def sample_brightness_contrast(
+    rng: np.random.Generator,
+    brightness_range: tuple[float, float] = (0.0, 0.0),
+    contrast_range: tuple[float, float] = (1.0, 1.0),
+) -> tuple[float, float]:
+    """Sample a fresh (brightness_delta, contrast_factor) pair -- same
+    per-reference-image, per-step domain-randomization pattern as
+    sample_ref_downscale_factor, but for lighting instead of detail level.
+    Reference photos are typically taken in controlled/even lighting, while
+    the drone video sees natural outdoor light (shifting sun angle, shadows,
+    exposure) -- this is a second, independent axis of the same ground-to-
+    aerial domain gap ref_downscale_factor already addresses for detail.
+
+    Default range is a no-op ((0.0, 0.0), (1.0, 1.0)) -- this augmentation
+    is opt-in; pass a wider range explicitly to enable it. Uses linear
+    (not log) uniform sampling for both -- unlike detail level, there's no
+    reason to expect brightness/contrast shift to be better modeled on a
+    log scale.
+    """
+    brightness = float(rng.uniform(*brightness_range))
+    contrast = float(rng.uniform(*contrast_range))
+    return brightness, contrast
+
+
+def apply_brightness_contrast(img: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
+    """out = clip(img * contrast + brightness, 0, 255), matching OpenCV's
+    own standard brightness/contrast convention. No-op fast path when both
+    are neutral (the default), to avoid a redundant copy every step when
+    this augmentation isn't enabled.
+    """
+    if brightness == 0.0 and contrast == 1.0:
+        return img
+    return cv2.convertScaleAbs(img, alpha=contrast, beta=brightness)
 
 
 def convert_gt_box_to_canvas(
@@ -289,6 +325,8 @@ class Geco2FinetuneDataset(Dataset):
         steps_per_epoch: int,
         p_present: float = 0.5,
         ref_downscale_range: tuple[float, float] = (0.03, 1.0),
+        brightness_range: tuple[float, float] = (0.0, 0.0),
+        contrast_range: tuple[float, float] = (1.0, 1.0),
         seed: int | None = None,
     ):
         if not video_ids:
@@ -299,6 +337,10 @@ class Geco2FinetuneDataset(Dataset):
         self.steps_per_epoch = steps_per_epoch
         self.p_present = p_present
         self.ref_downscale_lo, self.ref_downscale_hi = ref_downscale_range
+        # Opt-in lighting augmentation -- default (0,0)/(1,1) is a no-op, see
+        # sample_brightness_contrast's docstring for the rationale.
+        self.brightness_range = brightness_range
+        self.contrast_range = contrast_range
         self.rng = np.random.default_rng(seed)
 
         self._gt: dict[str, dict[int, Box]] = {}
@@ -347,7 +389,16 @@ class Geco2FinetuneDataset(Dataset):
         ref_boxes: list[tuple[float, float, float, float] | None] = []
         for img, box in zip(native_imgs, native_boxes):
             factor = sample_ref_downscale_factor(self.rng, self.ref_downscale_lo, self.ref_downscale_hi)
-            ref_images.append(_apply_ref_downscale(img, factor))
+            downscaled = _apply_ref_downscale(img, factor)
+            # Brightness/contrast only changes pixel VALUES, never geometry --
+            # sampled independently per ref image, same as the downscale
+            # factor, but applied after it (order doesn't matter for a
+            # geometry-vs-pixel-value pair of ops, but keeps downscale's own
+            # blur computed from the ORIGINAL pixel values, not re-lit ones).
+            brightness, contrast = sample_brightness_contrast(
+                self.rng, self.brightness_range, self.contrast_range,
+            )
+            ref_images.append(apply_brightness_contrast(downscaled, brightness, contrast))
             ref_boxes.append(tuple(c * factor for c in box) if box is not None else None)
 
         video_path = self._video_paths[video_id]
