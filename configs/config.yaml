@@ -1,7 +1,7 @@
 # ============================================================================
 # AERO EYES — Few-Shot Spatio-Temporal Drone Object Localization
 # Master configuration. Every switch here is a real, documented option.
-# Override any field via CLI: --set stage2.proposal_model=fastsam_s
+# Override any field via CLI: --set proposal_model=fastsam_s
 # ============================================================================
 
 project:
@@ -12,25 +12,27 @@ project:
   use_cache: true
   seed: 42
 
-# ----------------------------------------------------------------------------
-# PIPELINE — which detector implementation runs Stage 1+2+3.
-# ----------------------------------------------------------------------------
 pipeline:
-  detector: legacy   # <<< "legacy" (Stage1/2/3 separate) | "geco2" (single merged Stage123)
-                     # Stage4/Stage5 run unchanged either way.
+  detector: merged
 
 # ----------------------------------------------------------------------------
-# DATA
+# DATA  —  CONFIRM THIS LAYOUT WITH THE USER BEFORE WRITING CODE.
+# These are PLACEHOLDER assumptions; the real schema must be verified.
 # ----------------------------------------------------------------------------
 data:
   # One sample = 3 reference images + 1 drone video (+ optional GT).
-  # Layout: data_root/<sample_id>/object_images/ (or refs/) + *.mp4
+  # Confirmed layout (aero-eyes-dataset / PublicTest / samples):
+  #   data_root/
+  #     <sample_id>/
+  #       object_images/   img_1.jpg img_2.jpg img_3.jpg
+  #       drone_video.mp4  (any *.mp4 name — video_glob matches by extension)
   data_root: ./data
   refs_subdir: object_images
   video_glob: "*.mp4"
   num_references: 3
 
-  # Ground-truth schema
+  # Ground-truth schema — confirmed by user.
+  # Single global annotations file at project root; filter by video_id.
   gt:
     global_file: "annotations (1).json"  # at project root, all videos
     box_format: xyxy          # confirmed: x1,y1,x2,y2 absolute pixels
@@ -39,7 +41,7 @@ data:
     absent_encoding: omit     # confirmed: missing frames = absent
     one_object_per_video: true
 
-  # Submission / output format
+  # Submission / output format — confirmed same schema as GT.
   submission:
     path_name: submission.json
     box_format: xyxy
@@ -52,6 +54,7 @@ data:
 # ----------------------------------------------------------------------------
 runtime:
   device: auto              # auto | cpu | cuda
+  # Jetson/TensorRT explicitly OUT OF SCOPE. CPU/GPU portable only.
   num_workers: 4
   batch_size: 16            # candidate-feature extraction batch
   log_level: INFO
@@ -63,76 +66,125 @@ runtime:
 stage1:
   segmentation:
     enabled: true
-    model: mobilesam         # mobilesam (background removal on refs)
+    model: mobilesam         # mobilesam  (background removal on refs)
     weights: null            # path to MobileSAM ckpt; null = auto-download
     fallback_if_missing: passthrough   # passthrough = skip masking, use full image
-    min_area_frac: 0.05      # reject a mask smaller than this fraction of frame
-    max_area_frac: 0.95      # reject a mask larger than this fraction of frame
-    score_ratio_floor: 0.85  # prefer largest among masks scoring within this ratio of best
-    max_border_touch_frac: 0.02 # reject mask touching image border > this fraction
-    background_mode: mean_fill  # mean_fill | keep_real | blur
-    blur_sigma: 25.0         # Gaussian sigma (px) used when background_mode == "blur"
-
   feature_extractor:
-    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble
-    dinov2_variant: vitb14   # vits14 (384-d) | vitb14 (768-d) | vitl14 (1024-d) | vitg14 (1536-d)
-    dinov3_variant: vitb16   # vits16 | vitb16 | vitl16 (gated on HF: facebook/dinov3-*)
+    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dinov2+clip concat)
+    dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
+                              # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
+    # dinov3_variant: used only when model=dinov3. Weights are GATED on
+    # HuggingFace (facebook/dinov3-*-pretrain-lvd1689m) -- request access on
+    # the model page with your HF account first, then set HF_TOKEN in the
+    # environment before running, or the download will 401/403.
+    dinov3_variant: vitb16   # vits16 (384-d) | vitb16 (768-d) | vitl16 (1024-d)
     clip_variant: vit-b/32   # vit-b/32 (512-d) | vit-l/14 (768-d)
-    siglip_variant: base     # base (768-d) | large (1024-d) | so400m (1152-d)
+    # siglip_variant: used only when model=siglip. Open access on HuggingFace,
+    # no token needed. Vision encoder only (no text tower loaded).
+    siglip_variant: base     # base (768-d) | large (1024-d) | so400m (1152-d, slow)
     weights: null            # null = load from torch.hub / hf
     image_size: 224
-
   prototype:
+    # How the 3 per-reference feature sets are fused.
     fusion: mean             # mean | max | concat_then_pca
     l2_normalize: true
     cache_name: prototype.npz
-
-  aerial_sim:
-    enabled: false
-    downscale_factor: 1.0    # e.g. 0.25 = shrink then re-upscale
-    blur_ksize: 0            # Gaussian blur kernel size (px), 0 = off
 
 # ----------------------------------------------------------------------------
 # STAGE 2 — Candidate generation (per keyframe)
 # ----------------------------------------------------------------------------
 stage2:
-  keyframe_interval: 8       # sample 1 keyframe every N frames
+  keyframe_interval: 8       # sample 1 keyframe every N frames (5–10 typical)
 
   sahi:
-    use_sahi: true           # SAHI ON/OFF switch
+    use_sahi: true           # <<< SAHI ON/OFF SWITCH
     tile: [640, 640]
-    overlap: 0.25
+    overlap: 0.25            # fraction
+    # If false: run the proposal model on the full (resized) frame instead.
 
-  proposal_model: yolov11n   # "yolov11n" | "fastsam_s" (YOLOv8 is NOT allowed)
+  proposal_model: yolov11n   # <<< "yolov11n"  |  "fastsam_s"  (pick exactly ONE)
+                             #     YOLOv8 is explicitly NOT allowed.
   yolov11n:
     weights: yolo11n.pt      # ultralytics auto-downloads if absent
     conf: 0.05               # low: class-agnostic recall over precision
     iou: 0.5
     max_det: 300
-    classes: null            # null = all classes
+    classes: null            # null = all classes (class-agnostic use)
   fastsam_s:
-    weights: FastSAM-s.pt
+    weights: FastSAM-s.pt    # ultralytics auto-downloads if absent
     conf: 0.2
     iou: 0.7
     imgsz: 640
 
   candidate:
-    min_box_area: 16.0       # discard sub-pixel noise (px^2)
+    min_box_area: 16         # discard sub-pixel noise (px^2)
     max_candidates_per_keyframe: 400
     feature_crop_pad: 0.10   # pad each candidate crop before DINOv2
+
+  # dense_scan: fallback candidate source, runs ALONGSIDE proposal_model
+  # (never replaces it -- proposal_model stays locked to yolov11n/fastsam_s).
+  # Diagnosed root cause this targets: YOLOv11n (COCO-pretrained,
+  # class-agnostic) essentially never proposes a box near a flat/small
+  # object (e.g. an ID card) from a top-down drone view (best-IoU ~0.01-0.03
+  # measured via scripts/check_stage2_recall.py) -- no amount of Stage3/4
+  # tuning can recover a candidate that was never generated. Only fires when
+  # proposal_model starves a keyframe, and only when
+  # stage1.feature_extractor.model == 'dinov2' (the only extractor with a
+  # patch-token grid method).
+  # Validated on Kaggle (PublicTest 6-video + PrivateTest 10-video sets):
+  # PublicTest Mean ST-IoU 0.3858 -> 0.4232 (+9.7%), PrivateTest 0.2772 ->
+  # 0.3114 (+12.3%, driven mostly by Wallet_1 0.004 -> 0.6217). No video
+  # regressed (isolated re-check on Helmet_0 alone gave 0.1690 both with and
+  # without dense_scan -- identical, confirming no side effect). See
+  # memory/project_aero_eyes_competition.md for the full per-video table.
+  dense_scan:
+    enabled: true
+    trigger_min_proposals: 3   # only scan if proposal_model found fewer than this
+    sim_threshold: 0.12        # low pre-filter bar; Stage3's own threshold does the real filtering
+    min_blob_patches: 2        # min connected 14px-patches to keep a blob as a candidate
+    max_dense_candidates_per_keyframe: 20
+    # FPN-style multi-scale fusion (coarse-scale patch grid upsampled +
+    # added into the finer grid, top-down, then re-normalized) instead of a
+    # single-resolution grid. Targets box PRECISION, not just recall: at a
+    # single resolution, connected-components can merge a real match with
+    # surrounding noise into an oversized blob -- root cause diagnosed when
+    # lowering sim_threshold to 0.05 made IDCard recall worse, not better.
+    # Opt-in (off by default) until validated on Kaggle -- roughly triples
+    # the DINOv2 forward-pass cost of every dense-scan trigger.
+    use_fpn_pyramid: false
 
 # ----------------------------------------------------------------------------
 # STAGE 3 — Cross-domain matching
 # ----------------------------------------------------------------------------
 stage3:
-  similarity: cosine         # cosine | l1 | l2
-  match_threshold: 0.55      # fallback cutoff when adaptive_threshold is false
+  similarity: cosine         # cosine | l1 | l2  (l1/l2 = negated distance, higher still = more similar)
+  match_threshold: 0.55      # calibratable; candidates below are dropped (used unless adaptive_threshold below)
   nms_iou: 0.5               # NMS across overlapping SAHI tiles
   topk_per_keyframe: 5       # keep at most K detections per keyframe
-  global_topk: null          # e.g. 30-100 to cap total surviving candidates across video
-  adaptive_threshold: true   # threshold = mean(sim) + z_score * std(sim), floored at min_floor
-  adaptive_z_score: 1.5      # swept via sweep_zscore_loocv.py (1.5 gives optimal generalization)
-  adaptive_min_floor: 0.05   # hard floor: never accept similarity below this
+  # global_topk: cap the number of surviving candidates across the WHOLE video
+  # (applied AFTER threshold filtering). null = no cap. Useful when the ground-
+  # to-aerial domain gap pushes the whole similarity distribution down and a
+  # fixed threshold alone lets too much noise through.
+  global_topk: null          # e.g. 30-100 when domain gap is large
+  # adaptive_threshold: instead of a fixed match_threshold, compute
+  # per-video threshold = mean(sim) + adaptive_z_score * std(sim), floored at
+  # adaptive_min_floor. Robust when the tiny top-down object's absolute
+  # similarity to the close-up reference is unpredictable video to video.
+  adaptive_threshold: true
+  # adaptive_z_score: higher = fewer false positives, lower = more recall.
+  # Re-swept via scripts/sweep_zscore_loocv.py on the real aero-eyes-dataset
+  # PublicTest 6-video set (baseline accuracy.mode, after fixing the stray
+  # %%writefile syntax bug in the stage modules): z=1.0->0.3744, 1.5->0.3933
+  # (best naive), 2.0->0.3480, 2.5->0.3109, 3.0->0.0983 (collapses -- 0
+  # detections on the hardest video). LOOCV honest estimate for z=1.5 (chosen
+  # for 5/6 videos without seeing the held-out one) = 0.3610, vs 0.3250 for
+  # the previous static match_threshold=0.55 -- so 1.5 is a real, non-overfit
+  # improvement, not just the best fit on this exact eval set. The earlier
+  # "2.0 is validated" note here was from a stale sweep and is superseded.
+  # Re-sweep if the domain gap, dataset, or upstream stage1/2/4/5 changes.
+  adaptive_z_score: 1.5
+  adaptive_min_floor: 0.05   # hard floor: never accept sim below this even if adaptive
+  # Optional auto-calibration of match_threshold on a labelled subset.
   calibrate:
     enabled: false
     target_metric: st_iou
@@ -140,62 +192,31 @@ stage3:
     steps: 8
 
 # ----------------------------------------------------------------------------
-# STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
-# Only used when pipeline.detector == "geco2". Produces detections.json for Stage 4/5.
-# ----------------------------------------------------------------------------
-stage123_geco2:
-  repo_path: ./GECO2
-  weights_path: ./GECO2/CNTQG_multitrain_ca44.pth
-  segmentation:
-    enabled: true
-    model: mobilesam
-    weights: null
-    fallback_if_missing: passthrough
-    min_area_frac: 0.05
-    max_area_frac: 0.95
-    score_ratio_floor: 0.85
-    max_border_touch_frac: 0.02
-    background_mode: mean_fill  # mean_fill | keep_real | blur
-    blur_sigma: 25.0
-  image_size: 1024
-  emb_dim: 256
-  kernel_dim: 3
-  reduction: 16
-  keyframe_interval: 8
-  score_threshold_ratio: 0.33 # relative threshold vs frame's max score
-  score_threshold_abs: 0.0   # absolute floor to detect target absence (calibrate via script)
-  nms_iou: 0.5
-  topk_per_keyframe: 5
-  prototype_cache_name: geco2_prototype.pt
-  ref_downscale_factor: 1.0
-
-  scale_calibration:
-    enabled: false
-    expected_object_px: null # [width, height] in raw video frame px (e.g. [22, 18])
-    context_margin: 0.5
-
-  domain_calibration:
-    enabled: false
-    num_sample_frames: 5     # frames sampled to estimate video domain
-    strength: 1.0            # 0 = off, 1 = fully align to video domain mean token
-
-# ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes
 # ----------------------------------------------------------------------------
 stage4:
-  tracker: builtin           # "builtin" | "litetrack" | "none"
+  tracker: builtin           # <<< "builtin" | "litetrack" | "none"
+                             #   builtin   = OpenCV CSRT/KCF (no extra weights)
+                             #   litetrack = LiteTrack-B4 ONNX (needs weights)
+                             #   none      = run detection on EVERY frame
   builtin:
-    algorithm: csrt          # csrt | kcf | mosse (auto-falls back to mil if missing)
+    algorithm: csrt          # csrt | kcf | mosse | mil
+                              # OpenCV >=5.0 removed csrt/kcf/mosse from the
+                              # Python API entirely -- if the installed OpenCV
+                              # doesn't have the requested algorithm,
+                              # aero_eyes.models.trackers auto-falls-back to
+                              # mil (logs a warning) instead of failing.
   litetrack:
-    onnx_path: null          # required if tracker=litetrack
+    onnx_path: null          # REQUIRED if tracker=litetrack; else fail clearly
     input_size: 256
-  tracker_conf_threshold: 0.40
-  max_track_age: 30
-  verify_interval: 5         # re-embed crop every N frames with DINOv2; 0 to disable
-  confirm_detections:
-    enabled: false           # require N consecutive agreeing detections before (re)init tracker
-    required_hits: 2
-    iou_threshold: 0.3
+  tracker_conf_threshold: 0.40   # τ: below this → re-detect immediately
+  max_track_age: 30          # frames a track survives without re-detection
+  # OpenCV trackers report a fixed placeholder confidence (see trackers.py),
+  # so tracker_conf_threshold alone rarely catches drift. Every N frames
+  # while tracking, re-embed the tracked crop with DINOv2 and compare
+  # against the prototype; below match_threshold -> forced re-detect.
+  # 0 disables this (old behaviour: trust the tracker until max_track_age).
+  verify_interval: 5
 
 # ----------------------------------------------------------------------------
 # STAGE 5 — Spatio-temporal output
@@ -205,11 +226,15 @@ stage5:
     enabled: true
     method: ema              # ema | none
     ema_alpha: 0.6
-  min_tube_length: 2         # discard tubes shorter than N frames
-  fill_short_gaps: 3         # linearly interpolate gaps <= N frames
+  min_tube_length: 2         # discard tubes shorter than this (frames)
+  fill_short_gaps: 3         # linearly interpolate gaps <= this many frames
 
 # ----------------------------------------------------------------------------
-# ACCURACY MODE — domain-gap mitigations.
+# ACCURACY MODE — progressively enables domain-gap mitigations.
+#   baseline       : single-scale, plain prototype
+#   cheap_boosters : multi-scale scan + tuned NMS/thresh + multi-ref averaging
+#   max_accuracy   : + synthetic viewpoint aug + CD-ViTO-style domain prompter
+# Individual sub-toggles let each technique be ablated independently.
 # ----------------------------------------------------------------------------
 accuracy:
   mode: baseline             # baseline | cheap_boosters | max_accuracy
@@ -218,17 +243,19 @@ accuracy:
     multi_scale_scan: true
     scales: [0.75, 1.0, 1.5]
     tuned_nms: true
-    multi_reference_embedding: true
+    multi_reference_embedding: true   # keep per-ref protos + ensemble match
 
   max_accuracy:
     synthetic_viewpoint_aug:
       enabled: true
       method: homography     # homography | perspective_warp
       num_synth_views: 6
-      pitch_range_deg: [40, 85]
+      pitch_range_deg: [40, 85]   # simulate top-down
       fold_into_prototype: true
     domain_prompter:
       enabled: true
+      # CD-ViTO-style: synthesize "imaginary domain" feature shifts and
+      # align candidate features toward the reference style.
       num_prompts: 4
       strength: 0.3
 
@@ -237,5 +264,7 @@ accuracy:
 # ----------------------------------------------------------------------------
 eval:
   metric: st_iou
+  # Per-frame IoU averaged over the TEMPORAL UNION of pred & GT tubes;
+  # frames present in only one tube contribute IoU = 0.
   spatial_iou_type: standard
   report_per_video: true
