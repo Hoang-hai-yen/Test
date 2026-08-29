@@ -560,7 +560,7 @@ def read_candidates_with_features(path: Path):
 # Entry point gộp
 # =====================================================================
 
-def run_stage_a(cfg, sample_id: str) -> tuple[Path, Path]:
+def run_stage12(cfg, sample_id: str) -> tuple[Path, Path]:
     """Stage A — Prepare. Chạy tuần tự: reference processing -> candidate
     generation. Trả về (prototype_path, candidates_path)."""
     proto_path = _run_reference_processing(cfg, sample_id)
@@ -577,7 +577,7 @@ def main():
     args = p.parse_args()
     from aero_eyes.config import load_config
     cfg = load_config(args.config, args.set)
-    run_stage_a(cfg, args.sample)
+    run_stage12(cfg, args.sample)
 
 
 if __name__ == "__main__":

@@ -543,7 +543,7 @@ def _run_tracking(cfg, sample_id: str) -> Path:
 # Entry point gộp
 # =====================================================================
 
-def run_stage_b(cfg, sample_id: str) -> Path:
+def run_stage34(cfg, sample_id: str) -> Path:
     """Stage B — Match & Track. Chạy tuần tự: matching -> tracking.
     Trả về đường dẫn tracks.json."""
     _run_matching(cfg, sample_id)
@@ -560,7 +560,7 @@ def main():
     args = p.parse_args()
     from aero_eyes.config import load_config
     cfg = load_config(args.config, args.set)
-    run_stage_b(cfg, args.sample)
+    run_stage34(cfg, args.sample)
 
 
 if __name__ == "__main__":
