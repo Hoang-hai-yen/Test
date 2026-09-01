@@ -363,11 +363,11 @@ def _run_candidate_generation(cfg, sample_id: str) -> Path:
 
     cand_cfg = cfg.stage2.candidate
     sahi_cfg = cfg.stage2.sahi
-    dscfg = cfg.stage2.dense_scan
+    dscfg = getattr(cfg.stage2, 'dense_scan', None)
 
     # ---- Optional dense-scan fallback candidate source ----
     dense_prototype = None
-    if dscfg.enabled:
+    if dscfg is not None and getattr(dscfg, 'enabled', False):
         if cfg.stage1.feature_extractor.model != "dinov2":
             log.warning(
                 "[StageA/cand] %s: stage2.dense_scan.enabled=true but "

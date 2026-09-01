@@ -128,6 +128,7 @@ class CandidateConfig(BaseModel):
 
 
 class Stage2Config(BaseModel):
+    model_config = {'extra': 'allow'}
     keyframe_interval: int = 8
     sahi: SAHIConfig = SAHIConfig()
     proposal_model: str = "yolov11n"
@@ -155,6 +156,7 @@ class CalibrateConfig(BaseModel):
 
 
 class Stage3Config(BaseModel):
+    model_config = {'extra': 'allow'}
     similarity: Literal["cosine", "l1", "l2"] = "cosine"
     match_threshold: float = 0.55
     nms_iou: float = 0.5
@@ -182,6 +184,7 @@ class DetectionConfirmationConfig(BaseModel):
 
 
 class Stage4Config(BaseModel):
+    model_config = {'extra': 'allow'}
     tracker: str = "builtin"
     builtin: BuiltinTrackerConfig = BuiltinTrackerConfig()
     litetrack: LiteTrackConfig = LiteTrackConfig()
@@ -250,7 +253,7 @@ class EvalConfig(BaseModel):
 
 
 class PipelineConfig(BaseModel):
-    detector: Literal["legacy", "geco2"] = "legacy"
+    detector: Literal['legacy', 'geco2', 'merged'] = 'legacy'
 
 
 class ScaleCalibrationConfig(BaseModel):

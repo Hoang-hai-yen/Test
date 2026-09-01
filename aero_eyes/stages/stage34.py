@@ -50,7 +50,7 @@ def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.nd
 
 def _run_matching(cfg, sample_id: str) -> Path:
     """(cũ: run_stage3) So khớp candidates với prototype -> detections.json."""
-    from stage_a_prepare import read_candidates_with_features
+    from aero_eyes.stages.stage12 import read_candidates_with_features
     from aero_eyes.utils.io import read_prototype, write_detections, write_prototype
 
     t0 = time.time()
