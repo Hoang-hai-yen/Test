@@ -282,7 +282,20 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             max_border_touch_frac=seg_cfg.max_border_touch_frac,
             use_point_prompt=seg_cfg.use_point_prompt,
         )
-        masks = [segmenter.segment(img) for img in ref_imgs]
+        masks = []
+        for img in ref_imgs:
+            mask = segmenter.segment(img)
+            if seg_cfg.center_crop_fallback:
+                mask_ratio = float(mask.sum()) / float(mask.size)
+                if mask_ratio < seg_cfg.min_valid_mask_ratio or mask_ratio > seg_cfg.max_valid_mask_ratio:
+                    from aero_eyes.utils.geometry import center_box_mask
+                    log.warning(
+                        "[Stage123-GeCo2] %s: MobileSAM mask area implausible (%.1f%% of frame), "
+                        "using center-crop fallback (ratio=%.2f) instead of passthrough.",
+                        sample_id, mask_ratio * 100.0, seg_cfg.center_fallback_ratio,
+                    )
+                    mask = center_box_mask(img.shape, seg_cfg.center_fallback_ratio)
+            masks.append(mask)
         # Tight box around the actual segmented object, on the ORIGINAL
         # (pre-downscale/pre-canvas) ref photo -- RoI-align-ing the whole
         # (masked) image instead pools in a lot of background + any
@@ -575,10 +588,39 @@ def apply_color_postfilter(
     return kept
 
 
+def _finalize_keyframe_detections(
+    frame_idx: int,
+    frame_bgr: np.ndarray,
+    boxes: list[Box],
+    color_sig,
+    cpf_cfg,
+    color_stats: list | None,
+    viz_dir: Path,
+    save_viz: bool,
+) -> list[Detection]:
+    """Color postfilter + Detection wrapping + viz save -- the per-keyframe
+    tail shared by both the default (per-frame-relative) and
+    global_adaptive_threshold detection paths in run_stage123_geco2, so the
+    two paths can't silently drift apart on this shared bookkeeping."""
+    from aero_eyes.utils import viz as vizmod
+
+    if color_sig is not None:
+        boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats)
+    result_dets = [
+        Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
+        for b in boxes
+    ]
+    if save_viz:
+        vizmod.save_stage3_detections(
+            frame_bgr, [d.box for d in result_dets], [d.similarity for d in result_dets],
+            frame_idx, viz_dir,
+        )
+    return result_dets
+
+
 def run_stage123_geco2(cfg, sample_id: str) -> Path:
     """Run the merged GeCo2 stage for one sample. Returns path to detections.json."""
     from aero_eyes.models.geco2_detector import GeCo2Detector
-    from aero_eyes.utils import viz as vizmod
     from aero_eyes.utils.io import write_detections
     from aero_eyes.utils.video import frame_iterator, keyframe_indices, video_info
 
@@ -612,29 +654,84 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
     kf_indices = set(keyframe_indices(total_frames, cfg.stage123_geco2.keyframe_interval))
     viz_dir = work_dir / "viz" / "stage123_geco2"
+    save_viz = cfg.runtime.save_visualizations
 
     color_stats: list[tuple[float, float, float]] | None = [] if color_sig is not None else None
 
+    gat_cfg = cfg.stage123_geco2.global_adaptive_threshold
     detections: dict[int, list[Detection]] = {}
-    for frame_idx, frame_bgr in frame_iterator(video_path):
-        if frame_idx not in kf_indices:
-            continue
+    effective_threshold: float | None = None
 
-        boxes = detector.detect_frame(frame_bgr, prototype)
-        if color_sig is not None:
-            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats)
-        result_dets = [
-            Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
-            for b in boxes
-        ]
-        detections[frame_idx] = result_dets
-        log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
+    if gat_cfg.enabled:
+        # ---- Pass 1: pool RAW (unfiltered) scores across every keyframe ----
+        # so Pass 2 can decide what counts as a real detection from the
+        # WHOLE video's score distribution instead of each frame's own max
+        # (which structurally always keeps >=1 box -- see
+        # GlobalAdaptiveThresholdConfig docstring). Raw tensors are moved to
+        # CPU and cached per frame so Pass 2 does not re-run the backbone.
+        per_frame_raw: dict[int, tuple] = {}
+        raw_score_chunks: list[np.ndarray] = []
+        for frame_idx, frame_bgr in frame_iterator(video_path):
+            if frame_idx not in kf_indices:
+                continue
+            pred_boxes, box_v, scale = detector.forward_scores(frame_bgr, prototype)
+            per_frame_raw[frame_idx] = (pred_boxes.cpu(), box_v.cpu(), scale)
+            if box_v.numel() > 0:
+                raw_score_chunks.append(box_v.cpu().numpy())
 
-        if cfg.runtime.save_visualizations:
-            vizmod.save_stage3_detections(
-                frame_bgr, [d.box for d in result_dets], [d.similarity for d in result_dets],
-                frame_idx, viz_dir,
+        if raw_score_chunks:
+            all_scores = np.concatenate(raw_score_chunks)
+            sim_mean = float(all_scores.mean())
+            sim_std = float(all_scores.std())
+            raw_threshold = sim_mean + gat_cfg.z_score * sim_std
+            effective_threshold = max(gat_cfg.abs_floor, raw_threshold)
+            sim_max = float(all_scores.max())
+            if effective_threshold > sim_max:
+                log.info(
+                    "[Stage123-GeCo2] %s: global adaptive threshold %.3f exceeds max score %.3f "
+                    "-- capping at max so the best candidate isn't dropped.",
+                    sample_id, effective_threshold, sim_max,
+                )
+                effective_threshold = sim_max
+            log.info(
+                "[Stage123-GeCo2] %s: global adaptive threshold = %.3f (mean=%.3f std=%.3f "
+                "z=%.2f, n=%d candidates over %d keyframes)",
+                sample_id, effective_threshold, sim_mean, sim_std, gat_cfg.z_score,
+                len(all_scores), len(per_frame_raw),
             )
+        else:
+            effective_threshold = gat_cfg.abs_floor
+            log.warning(
+                "[Stage123-GeCo2] %s: no raw candidates collected -- defaulting global "
+                "adaptive threshold to abs_floor=%.3f", sample_id, effective_threshold,
+            )
+
+        # ---- Pass 2: apply the global threshold, then per-frame NMS/top-K + ----
+        # color postfilter + viz, reusing each frame's cached raw tensors.
+        for frame_idx, frame_bgr in frame_iterator(video_path):
+            if frame_idx not in kf_indices:
+                continue
+            pred_boxes, box_v, scale = per_frame_raw[frame_idx]
+            boxes = detector.filter_boxes_by_threshold(
+                pred_boxes.to(detector.device), box_v.to(detector.device), scale,
+                frame_bgr, effective_threshold,
+            )
+            result_dets = _finalize_keyframe_detections(
+                frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
+            )
+            detections[frame_idx] = result_dets
+            log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
+    else:
+        # ---- Default: GeCo2's own per-frame-relative decision, unchanged. ----
+        for frame_idx, frame_bgr in frame_iterator(video_path):
+            if frame_idx not in kf_indices:
+                continue
+            boxes = detector.detect_frame(frame_bgr, prototype)
+            result_dets = _finalize_keyframe_detections(
+                frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
+            )
+            detections[frame_idx] = result_dets
+            log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
 
     if color_stats:
         arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim
@@ -650,10 +747,13 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
         )
 
-    # No single global threshold applies (GeCo2 thresholds relative to each
-    # frame's own max score) -- Stage 4's geco2-aware re-detect path reads
-    # stage123_geco2.score_threshold_ratio directly instead of this field.
-    write_detections(detections, det_path, threshold=None)
+    # No single global threshold applies when global_adaptive_threshold is
+    # disabled (GeCo2 thresholds relative to each frame's own max score) --
+    # Stage 4's geco2-aware re-detect path reads
+    # stage123_geco2.score_threshold_ratio directly instead of this field
+    # either way, so recording effective_threshold here is informational
+    # only (for inspecting detections.json), not consumed downstream.
+    write_detections(detections, det_path, threshold=effective_threshold)
 
     elapsed = time.time() - t0
     log.info("[Stage123-GeCo2] %s done in %.1fs -> %s (%d detection frames)",

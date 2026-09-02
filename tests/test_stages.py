@@ -349,6 +349,126 @@ def test_stage4_produces_tracks_with_none_tracker(cfg, synth_fixture):
     assert "frames" in data
 
 
+def test_track_still_matches():
+    """Unit test for stage4._track_still_matches -- the periodic
+    re-verification check driven by stage4.verify_interval. Covers both the
+    single-ref and multi-reference-embedding paths, and both the
+    match/no-match outcomes."""
+    from aero_eyes.stages.stage4 import _track_still_matches
+    from aero_eyes.types import Box
+
+    prototype = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    box = Box(0, 0, 10, 10)
+
+    class _Cfg:
+        class stage2:
+            class candidate:
+                feature_crop_pad = 0.1
+        class accuracy:
+            mode = "baseline"
+            class cheap_boosters:
+                multi_reference_embedding = False
+
+    # Crop feature identical to prototype -- similarity 1.0, above any
+    # reasonable threshold.
+    matching_extractor = MagicMock()
+    matching_extractor.extract_crops.return_value = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+    assert _track_still_matches(
+        np.zeros((20, 20, 3), dtype=np.uint8), box, matching_extractor,
+        prototype, [], _Cfg(), match_threshold=0.5,
+    ) is True
+
+    # Crop feature orthogonal to prototype -- similarity 0.0, below threshold.
+    drifted_extractor = MagicMock()
+    drifted_extractor.extract_crops.return_value = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
+    assert _track_still_matches(
+        np.zeros((20, 20, 3), dtype=np.uint8), box, drifted_extractor,
+        prototype, [], _Cfg(), match_threshold=0.5,
+    ) is False
+
+    # No crop extracted at all (e.g. degenerate box) -- treated as no match.
+    empty_extractor = MagicMock()
+    empty_extractor.extract_crops.return_value = np.zeros((0, 3), dtype=np.float32)
+    assert _track_still_matches(
+        np.zeros((20, 20, 3), dtype=np.uint8), box, empty_extractor,
+        prototype, [], _Cfg(), match_threshold=0.5,
+    ) is False
+
+    # Multi-reference-embedding path: average similarity across per-ref
+    # features, still compared against match_threshold.
+    class _MultiRefCfg(_Cfg):
+        class accuracy:
+            mode = "cheap_boosters"
+            class cheap_boosters:
+                multi_reference_embedding = True
+
+    per_ref = [np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])]  # mean sim = 0.5
+    multi_extractor = MagicMock()
+    multi_extractor.extract_crops.return_value = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+    assert _track_still_matches(
+        np.zeros((20, 20, 3), dtype=np.uint8), box, multi_extractor,
+        prototype, per_ref, _MultiRefCfg(), match_threshold=0.4,
+    ) is True
+    assert _track_still_matches(
+        np.zeros((20, 20, 3), dtype=np.uint8), box, multi_extractor,
+        prototype, per_ref, _MultiRefCfg(), match_threshold=0.6,
+    ) is False
+
+
+def test_stage4_verify_interval_forces_redetect_on_drift(cfg, synth_fixture):
+    """With stage4.verify_interval enabled and a tracker that always reports
+    success (fixed placeholder confidence, like BuiltinTracker), a track
+    whose re-embedded crop no longer matches the prototype must trigger the
+    same re-detect path as a low-confidence/aged-out track -- Stage 4 must
+    not just trust the tracker's own "success" forever. Uses a fake tracker
+    (not real CSRT) and a mocked _track_still_matches so the test is
+    deterministic and independent of actual tracking/embedding numerics."""
+    from aero_eyes.types import Box
+
+    cfg.stage4.tracker = "builtin"
+    cfg.stage4.verify_interval = 1  # re-check every tracked frame
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+    mock_prop = _mock_proposals()
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop):
+        from aero_eyes.stages.stage2 import run_stage2
+        run_stage2(cfg, FIXTURE_ID)
+
+    from aero_eyes.stages.stage3 import run_stage3
+    run_stage3(cfg, FIXTURE_ID)
+
+    # Fake tracker: always "succeeds" with a fixed placeholder confidence
+    # (mirrors BuiltinTracker.update's real behavior) but never actually
+    # moves the box -- the exact silent-drift shape verify_interval exists
+    # to catch instead of trusting forever.
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (Box(0, 0, 10, 10), 0.9)
+
+    with patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop), \
+         patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
+         patch("aero_eyes.stages.stage4._track_still_matches", return_value=False) as mock_verify:
+        from aero_eyes.stages.stage4 import run_stage4
+        tracks_path = run_stage4(cfg, FIXTURE_ID)
+
+    assert mock_verify.called, "verify_interval=1 should have triggered periodic re-verification"
+    assert tracks_path.exists(), f"tracks.json not found at {tracks_path}"
+    with open(tracks_path) as f:
+        data = json.load(f)
+    assert "frames" in data
+
+
 def test_stage4_litetrack_missing_path_raises(cfg):
     """Stage 4 with litetrack + no onnx_path raises a clear error."""
     from pydantic import ValidationError

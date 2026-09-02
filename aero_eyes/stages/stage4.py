@@ -4,6 +4,10 @@ Flow:  detections.json + video
        -> initialize tracker at each keyframe detection
        -> propagate boxes on intermediate frames
        -> if conf < tau: trigger re-detection
+       -> every verify_interval frames (opt-in): re-embed the tracked crop
+          and cross-check it against the prototype, forcing a re-detect if
+          it no longer matches -- catches silent drift builtin trackers'
+          placeholder confidence can't (see _track_still_matches)
        -> tracks.json
 
 Tracker options: builtin | litetrack | none
@@ -132,6 +136,31 @@ def run_stage4(cfg, sample_id: str) -> Path:
             proto_path = work_dir / cfg.stage1.prototype.cache_name
             if proto_path.exists():
                 prototype, _, per_ref_features = read_prototype(proto_path)
+    elif s4.verify_interval > 0:
+        # An active tracker (builtin/litetrack) doesn't need extractor/
+        # prototype for tracking itself, but verify_interval's periodic
+        # re-check (_track_still_matches below) does -- load them here, from
+        # prototype.npz (the DINOv2 embedding space), whenever it exists.
+        # Always exists for the legacy pipeline; for pipeline.detector=geco2
+        # it only exists when stage123_geco2.cosine_rescore.enabled built
+        # one (via stage1.run_stage1) -- otherwise there is no DINOv2
+        # embedding space to re-verify against, and this degrades to a
+        # no-op (logged once) rather than erroring.
+        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.utils.io import read_prototype
+
+        proto_path = work_dir / cfg.stage1.prototype.cache_name
+        if proto_path.exists():
+            extractor = build_feature_extractor(cfg)
+            prototype, _, per_ref_features = read_prototype(proto_path)
+        else:
+            log.warning(
+                "[Stage4] %s: stage4.verify_interval=%d but no prototype.npz found at %s -- "
+                "periodic re-verification unavailable this run (needs a DINOv2 embedding "
+                "space; plain pipeline.detector=geco2 without "
+                "stage123_geco2.cosine_rescore.enabled doesn't build one).",
+                sample_id, s4.verify_interval, proto_path,
+            )
 
     # ---- Video writer for visualizations ----
     writer = None
@@ -150,6 +179,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
     tracks: dict[int, Box | None] = {}
     tracker_active = False
     track_age = 0
+    frames_since_verify = 0
     confirm_cfg = s4.confirm_detections
     confirmer = (
         _DetectionConfirmer(confirm_cfg.required_hits, confirm_cfg.iou_threshold)
@@ -191,6 +221,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             tracker.init(frame_bgr, confirmed)
                             tracker_active = True
                             track_age = 0
+                            frames_since_verify = 0
                             box_out = confirmed
                             source = "detect"
                         else:
@@ -202,13 +233,42 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 elif tracker_active:
                     box, conf = tracker.update(frame_bgr)
                     track_age += 1
-                    if (conf >= s4.tracker_conf_threshold
-                            and track_age <= s4.max_track_age
-                            and box is not None):
+                    frames_since_verify += 1
+                    track_ok = (conf >= s4.tracker_conf_threshold
+                                and track_age <= s4.max_track_age
+                                and box is not None)
+
+                    # OpenCV's own tracker confidence is a near-constant
+                    # placeholder (BuiltinTracker.update always returns 0.9
+                    # on success -- OpenCV exposes no real confidence), so it
+                    # cannot by itself tell a drifted lock from a correct
+                    # one. Every verify_interval frames, cross-check the
+                    # tracked crop against the DINOv2 prototype (the same
+                    # embedding/threshold used to decide the original match)
+                    # so a silently-drifted track gets caught within a few
+                    # frames instead of persisting for the full
+                    # max_track_age. 0 (default) = never runs, i.e. exactly
+                    # the original conf/age-only logic.
+                    if (track_ok and box is not None and s4.verify_interval > 0
+                            and extractor is not None and prototype is not None
+                            and frames_since_verify >= s4.verify_interval):
+                        frames_since_verify = 0
+                        if not _track_still_matches(
+                            frame_bgr, box, extractor, prototype,
+                            per_ref_features, cfg, match_threshold,
+                        ):
+                            log.debug(
+                                "[Stage4] frame %d: track failed re-verification "
+                                "(likely drifted) -- forcing re-detect", frame_idx,
+                            )
+                            track_ok = False
+
+                    if track_ok:
                         box_out = box
                         source = "track"
                     else:
-                        # Confidence too low or track too old — try re-detect
+                        # Confidence too low, track too old, or failed
+                        # re-verification — try re-detect
                         tracker_active = False
                         if use_geco2:
                             if geco2_detector is None:
@@ -217,12 +277,19 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 frame_bgr, geco2_detector, geco2_prototype, geco2_color_sig, cfg.stage123_geco2.color_postfilter,
                             )
                         else:
+                            # Lazy-init for re-detect fallback -- guarded
+                            # independently (not both under one "proposal_model
+                            # is None" check) since verify_interval above may
+                            # have already built extractor/prototype for its
+                            # own periodic re-check, in which case only
+                            # proposal_model (never needed by verify_interval)
+                            # remains to be built here.
                             if proposal_model is None:
-                                # Lazy-init for re-detect fallback
-                                from aero_eyes.models.features import build_feature_extractor
                                 from aero_eyes.models.proposals import build_proposal_model
-                                from aero_eyes.utils.io import read_prototype
                                 proposal_model = build_proposal_model(cfg)
+                            if extractor is None:
+                                from aero_eyes.models.features import build_feature_extractor
+                                from aero_eyes.utils.io import read_prototype
                                 extractor = build_feature_extractor(cfg)
                                 proto_path = work_dir / cfg.stage1.prototype.cache_name
                                 if proto_path.exists():
@@ -245,6 +312,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             tracker.init(frame_bgr, box_out)
                             tracker_active = True
                             track_age = 0
+                            frames_since_verify = 0
 
             tracks[frame_idx] = box_out
 
@@ -265,6 +333,43 @@ def run_stage4(cfg, sample_id: str) -> Path:
     log.info("[Stage4] %s done in %.1fs -> %s (%d/%d frames with box)",
              sample_id, elapsed, tracks_path, present, total_frames)
     return tracks_path
+
+
+def _track_still_matches(
+    frame_bgr,
+    box: Box,
+    extractor,
+    prototype,
+    per_ref_features: list,
+    cfg,
+    match_threshold: float,
+) -> bool:
+    """Re-embed the crop the tracker is CURRENTLY reporting and check it
+    still resembles the target, using the same DINOv2 embedding space and
+    threshold Stage 3 used to decide the original match -- the real
+    correctness check BuiltinTracker's own fixed placeholder confidence
+    (see aero_eyes/models/trackers.py) cannot provide. Used by
+    stage4.verify_interval's periodic re-check.
+    """
+    feats = extractor.extract_crops(
+        frame_bgr, [box],
+        pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+        batch_size=1,
+    )
+    if feats.shape[0] == 0:
+        return False
+
+    use_multi_ref = (
+        cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+        and cfg.accuracy.cheap_boosters.multi_reference_embedding
+        and len(per_ref_features) > 0
+    )
+    if use_multi_ref:
+        sim = float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
+    else:
+        sim = float(feats[0] @ prototype)
+
+    return sim >= match_threshold
 
 
 def _load_geco2(cfg, sample_id: str, work_dir: Path):

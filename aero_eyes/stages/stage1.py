@@ -1,9 +1,10 @@
 """Stage 1 — Reference processing (offline, runs once per target).
 
 Flow:  3 reference images
-       -> MobileSAM foreground mask
-       -> DINOv2 ViT-B/14 patch features
-       -> fuse across views -> multi-view prototype
+       -> MobileSAM foreground mask (center-crop fallback if implausible,
+          opt-in via stage1.segmentation.center_crop_fallback)
+       -> multi-scale pyramid (1.0x/0.75x/0.5x) -> DINOv2 ViT-B/14 features
+       -> mask-area-weighted fusion across views -> multi-view prototype
        -> write prototype.npz
 
 Writes: <work_dir>/<sample_id>/prototype.npz
@@ -88,6 +89,16 @@ def run_stage1(cfg, sample_id: str) -> Path:
     for img in ref_imgs:
         if segmenter is not None:
             mask = segmenter.segment(img)
+            if seg_cfg.center_crop_fallback:
+                mask_ratio = float(mask.sum()) / float(mask.size)
+                if mask_ratio < seg_cfg.min_valid_mask_ratio or mask_ratio > seg_cfg.max_valid_mask_ratio:
+                    from aero_eyes.utils.geometry import center_box_mask
+                    log.warning(
+                        "[Stage1] %s: MobileSAM mask area implausible (%.1f%% of frame), "
+                        "using center-crop fallback (ratio=%.2f) instead of passthrough.",
+                        sample_id, mask_ratio * 100.0, seg_cfg.center_fallback_ratio,
+                    )
+                    mask = center_box_mask(img.shape, seg_cfg.center_fallback_ratio)
         else:
             mask = np.ones(img.shape[:2], dtype=bool)
         masks.append(mask)
@@ -119,7 +130,20 @@ def run_stage1(cfg, sample_id: str) -> Path:
 
     images_per_ref: list[list[np.ndarray]] = []
     for i, (masked, mask) in enumerate(zip(masked_imgs, masks)):
-        imgs_this_ref = [masked]
+        # Multi-scale pyramid: extract features at 1.0x/0.75x/0.5x of the
+        # masked reference image, then average over them (below) along with
+        # any synthetic views -- makes the fused per-ref feature more robust
+        # to how large the object appears (drone altitude/zoom varies the
+        # query video's apparent object scale in a way a single fixed-scale
+        # reference photo can't hedge against on its own).
+        imgs_this_ref = []
+        for scale in (1.0, 0.75, 0.5):
+            if scale == 1.0:
+                imgs_this_ref.append(masked)
+            else:
+                h, w = masked.shape[:2]
+                scaled = cv2.resize(masked, (max(1, int(w * scale)), max(1, int(h * scale))))
+                imgs_this_ref.append(scaled)
         # Synthetic viewpoint augmentation
         acc = cfg.accuracy
         if acc.mode == "max_accuracy" and acc.max_accuracy.synthetic_viewpoint_aug.enabled:
@@ -147,7 +171,16 @@ def run_stage1(cfg, sample_id: str) -> Path:
     # ---- 5. Fuse prototype ----
     fusion = cfg.stage1.prototype.fusion
     if fusion == "mean":
-        prototype = per_ref_array.mean(axis=0)
+        # Weight each ref's contribution by its own mask's foreground area
+        # ratio instead of a plain unweighted mean -- a ref whose segmenter
+        # mask covers more of the frame is (empirically) a more confident/
+        # reliable segmentation, less likely to have background bleeding
+        # into what was measured as "the object", so it should count for
+        # more when fusing the 3 refs into one prototype.
+        weights = np.array([m.sum() / m.size + 1e-4 for m in masks])
+        weights = weights / weights.sum()
+        log.info("[Stage1] %s: mask-area-weighted fusion, weights=%s", sample_id, weights)
+        prototype = np.average(per_ref_array, axis=0, weights=weights)
     elif fusion == "max":
         prototype = per_ref_array.max(axis=0)
     elif fusion == "concat_then_pca":

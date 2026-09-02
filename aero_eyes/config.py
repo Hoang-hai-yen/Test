@@ -101,6 +101,21 @@ class SegmentationConfig(BaseModel):
     #                matches.
     background_mode: Literal["mean_fill", "keep_real", "blur"] = "mean_fill"
     blur_sigma: float = 25.0  # Gaussian sigma (px) used when background_mode == "blur"
+    # When the segmenter's own mask area ratio (mask pixels / total pixels)
+    # falls outside [min_valid_mask_ratio, max_valid_mask_ratio], replace it
+    # with a safe rectangular center-crop mask (center_fallback_ratio of the
+    # frame -- see aero_eyes.utils.geometry.center_box_mask) instead of
+    # passing the implausible mask straight through. An almost-empty mask is
+    # likely pure segmentation noise; an almost-full mask is effectively a
+    # whole-image passthrough that lets background bleed straight into the
+    # exemplar/prototype and corrupts matching downstream. Reference photos
+    # are always close-up shots with the target centered, so a center-crop
+    # is a reasonable stand-in for "the object" in either failure case.
+    # Off by default -- does not change existing runs unless opted in.
+    center_crop_fallback: bool = False
+    min_valid_mask_ratio: float = 0.03
+    max_valid_mask_ratio: float = 0.92
+    center_fallback_ratio: float = 0.75
 
 
 class FeatureExtractorConfig(BaseModel):
@@ -273,6 +288,31 @@ class Stage4Config(BaseModel):
     tracker_conf_threshold: float = 0.40
     max_track_age: int = 30
     confirm_detections: DetectionConfirmationConfig = DetectionConfirmationConfig()
+    # Every verify_interval frames of ACTIVE tracking (builtin/litetrack,
+    # not tracker=none), re-embed the currently-tracked crop with DINOv2 and
+    # cross-check it against the prototype -- the real correctness check
+    # BuiltinTracker's own confidence cannot provide (it returns a fixed
+    # 0.9 placeholder on any OpenCV-reported success; see trackers.py). If
+    # the re-embedded crop no longer matches, forces the same re-detect path
+    # used when confidence/age fail, even though OpenCV still reports
+    # tracking as nominally successful -- catches silent drift instead of
+    # letting it persist for the full max_track_age.
+    #
+    # Independent of confirm_detections above -- that guards against
+    # trusting a single SPURIOUS detection before a track ever starts;
+    # this guards against a track that started fine but DRIFTED after the
+    # fact. Both can be enabled together.
+    #
+    # Needs a DINOv2 prototype.npz to re-embed against: always available on
+    # the legacy pipeline; on pipeline.detector=geco2 only when
+    # stage123_geco2.cosine_rescore.enabled built one (see stage1.run_stage1)
+    # -- otherwise this silently has no effect (logged once) rather than
+    # erroring, since plain GeCo2 has no DINOv2 embedding space to check
+    # against.
+    #
+    # 0 (default) = disabled -- reproduces the exact original tracking
+    # logic (confidence/age only), unchanged.
+    verify_interval: int = 0
 
     @field_validator("tracker")
     @classmethod
@@ -561,6 +601,38 @@ class Geco2CosineRescoreConfig(BaseModel):
     candidate_topk_per_keyframe: int = 15
 
 
+class GlobalAdaptiveThresholdConfig(BaseModel):
+    """Optional alternative to GeCo2's default per-frame-relative decision
+    (score_threshold_ratio/score_threshold_abs above): a keyframe with no
+    real target still has a "best" box by construction (score is thresholded
+    RELATIVE to that frame's own max), so per-frame-relative thresholding
+    structurally always keeps something on every frame -- across a whole
+    video that means stray boxes on every frame that has no real target.
+
+    Instead: Pass 1 pools RAW (unfiltered) per-location scores across EVERY
+    keyframe in the whole video first; Pass 2 computes ONE global threshold
+    = max(abs_floor, mean + z_score*std) over that pooled distribution
+    (capped at the video's own observed max so the statistical estimate
+    never rejects the single best real score), then applies it to every
+    keyframe -- same style of fix as stage3.adaptive_threshold, applied to
+    GeCo2's own score instead of DINOv2 cosine similarity.
+
+    Costs a second pass over the video's keyframes, but reuses each frame's
+    already-computed raw backbone output from Pass 1 (see
+    GeCo2Detector.forward_scores/filter_boxes_by_threshold) -- does NOT
+    double the number of GeCo2 backbone forward passes.
+
+    Disabled by default -- score_threshold_ratio/score_threshold_abs decide
+    detections.json exactly as before this option existed. Only applies to
+    run_stage123_geco2 (the default geco2 path); has no effect when
+    stage123_geco2.cosine_rescore.enabled (that path's own Stage 3 cosine
+    matching decides the final threshold instead).
+    """
+    enabled: bool = False
+    z_score: float = 1.0
+    abs_floor: float = 0.15
+
+
 class Stage123Geco2Config(BaseModel):
     """Only used when pipeline.detector == 'geco2'. Requires the vendored
     GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
@@ -639,6 +711,7 @@ class Stage123Geco2Config(BaseModel):
     use_shape_token: bool = True
     color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
     cosine_rescore: Geco2CosineRescoreConfig = Geco2CosineRescoreConfig()
+    global_adaptive_threshold: GlobalAdaptiveThresholdConfig = GlobalAdaptiveThresholdConfig()
 
     @model_validator(mode="after")
     def check_scale_calibration(self) -> "Stage123Geco2Config":

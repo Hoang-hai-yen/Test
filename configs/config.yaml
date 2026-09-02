@@ -239,6 +239,20 @@ stage123_geco2:
     #     color/texture statistics, discards fine background detail.
     background_mode: keep_real
     blur_sigma: 25.0   # used when background_mode: blur
+    # When the segmenter's own mask area ratio falls outside
+    # [min_valid_mask_ratio, max_valid_mask_ratio], replace it with a safe
+    # rectangular center-crop mask (center_fallback_ratio of the frame)
+    # instead of passing the implausible mask straight through -- an
+    # almost-empty mask is likely pure noise; an almost-full mask is
+    # effectively a whole-image passthrough that lets background bleed
+    # straight into the exemplar and corrupts matching downstream.
+    # Reference photos are always close-up shots with the target centered,
+    # so a center-crop is a reasonable stand-in for "the object" either way.
+    # Off by default -- does not change existing runs unless opted in.
+    center_crop_fallback: false
+    min_valid_mask_ratio: 0.03
+    max_valid_mask_ratio: 0.92
+    center_fallback_ratio: 0.75
   image_size: 1024
   emb_dim: 256
   kernel_dim: 3
@@ -263,6 +277,26 @@ stage123_geco2:
   nms_iou: 0.5
   topk_per_keyframe: 5
   prototype_cache_name: geco2_prototype.pt   # cached exemplar tokens (torch, not prototype.npz)
+
+  # --------------------------------------------------------------------
+  # Optional alternative to score_threshold_ratio/score_threshold_abs above:
+  # a keyframe with no real target still has a "best" box by construction
+  # (per-frame-relative thresholding), so across a whole video that means
+  # stray boxes on every empty frame. Instead: pool raw scores across EVERY
+  # keyframe in the whole video first, then compute ONE global threshold =
+  # max(abs_floor, mean + z_score*std) over that pooled distribution
+  # (capped at the video's own observed max) -- same style of fix as
+  # stage3.adaptive_threshold, applied to GeCo2's own score. Costs a second
+  # pass over the video's keyframes, but reuses each frame's already-
+  # computed raw backbone output, so it does NOT double GeCo2 forward
+  # passes. Disabled by default. Only applies when
+  # stage123_geco2.cosine_rescore.enabled is false (that path's own Stage 3
+  # cosine matching decides the final threshold instead).
+  # --------------------------------------------------------------------
+  global_adaptive_threshold:
+    enabled: false
+    z_score: 1.0
+    abs_floor: 0.15
 
   # --------------------------------------------------------------------
   # Optional extra matching pass inserted between GeCo2 detection and
@@ -499,6 +533,23 @@ stage4:
     enabled: false
     required_hits: 2
     iou_threshold: 0.3
+
+  # Every verify_interval frames of ACTIVE tracking (builtin/litetrack, not
+  # tracker=none), re-embed the currently-tracked crop with DINOv2 and
+  # cross-check it against the prototype -- the real correctness check
+  # BuiltinTracker's own confidence cannot provide (it returns a fixed 0.9
+  # placeholder on any OpenCV-reported success). If the re-embedded crop no
+  # longer matches, forces a re-detect even though OpenCV still reports
+  # tracking as nominally successful -- catches silent drift instead of
+  # letting it persist for the full max_track_age.
+  # Independent of confirm_detections above -- that guards against a single
+  # SPURIOUS detection before a track ever starts; this guards against a
+  # track that started fine but DRIFTED after the fact. Both can be on.
+  # Needs prototype.npz (DINOv2): always present on the legacy pipeline; on
+  # pipeline.detector=geco2 only when stage123_geco2.cosine_rescore.enabled
+  # built one -- otherwise this silently has no effect (logged once).
+  # 0 (default) = disabled, reproduces the original tracking logic exactly.
+  verify_interval: 0
 
 # ----------------------------------------------------------------------------
 # STAGE 5 — Spatio-temporal output

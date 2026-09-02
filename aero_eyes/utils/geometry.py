@@ -242,3 +242,25 @@ def generate_synth_views(img_bgr, mask, method: str, num_views: int,
             warped = warped * warped_mask[:, :, None]
         views.append(warped)
     return views
+
+
+# ---------------------------------------------------------------------------
+# Segmentation mask fallback
+# ---------------------------------------------------------------------------
+
+def center_box_mask(shape: tuple, ratio: float):
+    """A rectangular mask covering the center `ratio` fraction of an image's
+    height/width -- a safe fallback when a segmenter's own mask is
+    implausible (too small = likely noise, too large = likely background
+    bleed/near-passthrough). Reference photos (object_images) are always
+    close-up shots of the target centered in frame, so this is a reasonable
+    stand-in for "the object", far better than passing the implausible mask
+    (or a full-frame passthrough) straight into a prototype/exemplar build.
+    """
+    import numpy as np
+    h, w = shape[:2]
+    mh, mw = int(round(h * ratio)), int(round(w * ratio))
+    y0, x0 = max(0, (h - mh) // 2), max(0, (w - mw) // 2)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[y0:y0 + mh, x0:x0 + mw] = True
+    return mask

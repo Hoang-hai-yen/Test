@@ -295,32 +295,42 @@ class GeCo2Detector:
         return box_v.cpu().numpy()
 
     @torch.no_grad()
-    def detect_frame(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> list[Box]:
-        """Run the query-image half of CNT.forward on one frame, cross-attend
-        with the precomputed exemplar tokens, threshold + NMS, and return
-        boxes in absolute pixel coords of `frame_bgr`.
+    def forward_scores(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]):
+        """Public wrapper around _forward_scores: the RAW, unfiltered dense
+        predictions for one frame -- (pred_boxes [N,4] normalized xyxy in
+        padded canvas, box_v [N] raw score, scale). Unlike detect_frame(),
+        applies no threshold/NMS/top-K at all.
 
-        score_threshold_ratio alone is RELATIVE to this frame's own max
-        score, so on its own it always returns at least one box whenever
-        box_v.max() > 0 -- it cannot express "target absent this frame".
-        score_threshold_abs adds an ABSOLUTE floor on that per-frame max: if
-        the frame's best score doesn't even clear this, the whole frame is
-        treated as empty (returns []) regardless of the relative ratio.
-        Calibrate it with scripts/check_geco2_score_separation.py on your
-        own present/absent-labeled frames -- default 0.0 keeps the old
-        always-detects-something behavior.
+        Used by stage123_geco2.py's stage123_geco2.global_adaptive_threshold
+        path to pool raw scores across every keyframe in a video BEFORE
+        deciding what counts as a real detection (see
+        filter_boxes_by_threshold below for the second half) -- the same
+        two-pass shape as stage3.py's own adaptive_threshold, applied to
+        GeCo2's score instead of DINOv2 cosine similarity.
+        """
+        return self._forward_scores(frame_bgr, prototype)
+
+    def filter_boxes_by_threshold(
+        self,
+        pred_boxes: torch.Tensor,
+        box_v: torch.Tensor,
+        scale: float,
+        frame_bgr: np.ndarray,
+        threshold: float,
+    ) -> list[Box]:
+        """Threshold (by an EXPLICIT absolute score value, not a per-frame
+        ratio) + NMS + top-K + coordinate conversion -- the second half of
+        detect_frame(), factored out so it can also be driven by a threshold
+        computed externally (e.g. stage123_geco2.py's global adaptive
+        threshold, pooled across a whole video) instead of only
+        detect_frame()'s own per-frame-relative one.
         """
         from torchvision.ops import nms as torch_nms
 
-        pred_boxes, box_v, scale = self._forward_scores(frame_bgr, prototype)
         if pred_boxes.numel() == 0:
             return []
 
-        max_score = box_v.max()
-        if max_score < self.score_threshold_abs:
-            return []
-
-        keep_mask = box_v > (max_score * self.score_threshold_ratio)
+        keep_mask = box_v > threshold
         if not bool(keep_mask.any()):
             return []
         cand_boxes = torch.clamp(pred_boxes[keep_mask], 0, 1)
@@ -346,6 +356,35 @@ class GeCo2Detector:
             if box.area() > 0:
                 results.append(box)
         return results
+
+    @torch.no_grad()
+    def detect_frame(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> list[Box]:
+        """Run the query-image half of CNT.forward on one frame, cross-attend
+        with the precomputed exemplar tokens, threshold + NMS, and return
+        boxes in absolute pixel coords of `frame_bgr`.
+
+        score_threshold_ratio alone is RELATIVE to this frame's own max
+        score, so on its own it always returns at least one box whenever
+        box_v.max() > 0 -- it cannot express "target absent this frame".
+        score_threshold_abs adds an ABSOLUTE floor on that per-frame max: if
+        the frame's best score doesn't even clear this, the whole frame is
+        treated as empty (returns []) regardless of the relative ratio.
+        Calibrate it with scripts/check_geco2_score_separation.py on your
+        own present/absent-labeled frames -- default 0.0 keeps the old
+        always-detects-something behavior. See
+        stage123_geco2.global_adaptive_threshold for a whole-video
+        alternative to this per-frame-relative decision.
+        """
+        pred_boxes, box_v, scale = self._forward_scores(frame_bgr, prototype)
+        if pred_boxes.numel() == 0:
+            return []
+
+        max_score = box_v.max()
+        if max_score < self.score_threshold_abs:
+            return []
+
+        threshold = max_score * self.score_threshold_ratio
+        return self.filter_boxes_by_threshold(pred_boxes, box_v, scale, frame_bgr, threshold)
 
     # ------------------------------------------------------------------
     # Domain calibration (stage123_geco2.domain_calibration) -- shifts
