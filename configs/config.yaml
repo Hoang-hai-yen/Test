@@ -324,13 +324,25 @@ stage123_geco2:
   # --------------------------------------------------------------------
   scale_calibration:
     enabled: false
-    # Expected apparent size [width, height] in pixels of the object AS IT
-    # APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- estimate
+    # Expected apparent size(s) [width, height] in pixels of the object AS
+    # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- estimate
     # from flight altitude/GSD, or eyeball it on a sample frame. Required
     # when enabled: true -- do NOT guess a value blind, a wrong estimate
     # actively hurts (recreates the same kind of scale mismatch this exists
     # to remove, just in a different direction).
-    expected_object_px: null   # e.g. [22, 18]
+    # Accepts a single [w, h] pair (shorthand for one scale, e.g. [22, 18])
+    # OR a list of pairs to hedge across several plausible apparent sizes,
+    # e.g. [[18, 15], [26, 22], [34, 29]] -- see multi_scale_mode below for
+    # how more than one scale is actually used.
+    expected_object_px: null
+    # "first" (default): only expected_object_px[0] is used -- one
+    #   calibrated canvas per reference image, unchanged from before this
+    #   option existed.
+    # "all": one calibrated canvas per (reference image, scale) pair, each
+    #   fed into GeCo2 as its own exemplar entry -- own appearance token
+    #   AND (when use_shape_token: true) own shape token per scale. Costs
+    #   num_refs*num_scales backbone passes instead of num_refs.
+    multi_scale_mode: first   # "first" | "all"
     # Extra padding kept around the tight mask box, as a fraction of the
     # object's own size, before that (object+margin) footprint is
     # calibrated to expected_object_px -- gives the model a bit of

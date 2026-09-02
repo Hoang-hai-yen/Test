@@ -291,34 +291,57 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
         raw_boxes = [_mask_bbox(m) for m in masks]
 
         if sc_cfg.enabled:
-            # scale_calibration: build a canvas per ref image where the
-            # object occupies the same canvas-relative size it's expected
-            # to occupy in the query video frame -- see
+            # scale_calibration: build a canvas per (ref image, scale) pair
+            # where the object occupies the same canvas-relative size it's
+            # expected to occupy in the query video frame -- see
             # _build_scale_calibrated_canvas for why ref_downscale_factor
-            # alone cannot do this.
+            # alone cannot do this. multi_scale_mode=="first" (default) only
+            # uses expected_object_px[0], reproducing the original
+            # one-canvas-per-ref behavior exactly; "all" builds one canvas
+            # per scale for EVERY ref image and feeds all of them into
+            # encode_exemplars as independent exemplar entries (each with
+            # its own appearance token AND, when use_shape_token, its own
+            # shape token derived from that scale's own box size) -- see
+            # ScaleCalibrationConfig.multi_scale_mode docstring.
             video_path = _locate_video(cfg, sample_id)
             info = video_info(video_path)
             video_longer_dim = max(info["width"], info["height"])
-            canvases, canvas_boxes = [], []
-            for img, m, b in zip(ref_imgs, masks, raw_boxes):
+            scales = (
+                sc_cfg.expected_object_px if sc_cfg.multi_scale_mode == "all"
+                else sc_cfg.expected_object_px[:1]
+            )
+            num_orig_refs = len(ref_imgs)
+            canvases, canvas_boxes, canvas_labels = [], [], []
+            for ref_idx, (img, m, b) in enumerate(zip(ref_imgs, masks, raw_boxes)):
                 if b is None:
                     # Empty mask (fallback/edge case) -- nothing to
-                    # calibrate against; fall back to whole-image exemplar.
+                    # calibrate against; fall back to whole-image exemplar
+                    # (once, regardless of how many scales were requested).
                     canvases.append(img)
                     canvas_boxes.append(None)
+                    canvas_labels.append(f"ref_{ref_idx}")
                     continue
-                canvas, box_c = _build_scale_calibrated_canvas(
-                    img, m, b, tuple(sc_cfg.expected_object_px), video_longer_dim,
-                    sc_cfg.context_margin, seg_cfg.background_mode, seg_cfg.blur_sigma,
-                    canvas_px=g.image_size,
+                for scale_idx, expected_px in enumerate(scales):
+                    canvas, box_c = _build_scale_calibrated_canvas(
+                        img, m, b, tuple(expected_px), video_longer_dim,
+                        sc_cfg.context_margin, seg_cfg.background_mode, seg_cfg.blur_sigma,
+                        canvas_px=g.image_size,
+                    )
+                    canvases.append(canvas)
+                    canvas_boxes.append(box_c)
+                    label = f"ref_{ref_idx}" if len(scales) == 1 else f"ref_{ref_idx}_scale_{scale_idx}"
+                    canvas_labels.append(label)
+            if len(scales) > 1:
+                log.info(
+                    "[Stage123-GeCo2] %s: scale_calibration multi_scale_mode=all -- "
+                    "%d ref image(s) x %d scale(s) = %d exemplar entries",
+                    sample_id, num_orig_refs, len(scales), len(canvases),
                 )
-                canvases.append(canvas)
-                canvas_boxes.append(box_c)
             if cfg.runtime.save_visualizations:
                 out_dir = work_dir / "viz" / "stage123_geco2" / "refs_scale_calibrated"
                 out_dir.mkdir(parents=True, exist_ok=True)
-                for i, (c, box_c) in enumerate(zip(canvases, canvas_boxes)):
-                    cv2.imwrite(str(out_dir / f"ref_{i}_calibrated.jpg"), c)
+                for label, c, box_c in zip(canvas_labels, canvases, canvas_boxes):
+                    cv2.imwrite(str(out_dir / f"{label}_calibrated.jpg"), c)
                     # ALSO save a copy with the actual RoI-Align pooling box
                     # drawn on top -- background_mode=keep_real (or a huge
                     # conceptual crop region relative to the reference photo)
@@ -330,7 +353,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                         annotated = c.copy()
                         from aero_eyes.utils.viz import draw_box
                         draw_box(annotated, Box(*box_c), "RoI-Align region", (0, 255, 0))
-                        cv2.imwrite(str(out_dir / f"ref_{i}_calibrated_box.jpg"), annotated)
+                        cv2.imwrite(str(out_dir / f"{label}_calibrated_box.jpg"), annotated)
             ref_imgs = canvases
             ref_boxes = canvas_boxes
         else:

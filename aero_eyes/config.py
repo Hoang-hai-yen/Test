@@ -358,24 +358,66 @@ class ScaleCalibrationConfig(BaseModel):
     frame after ITS OWN resize_and_pad.
     """
     enabled: bool = False
-    # Expected apparent size [width, height] in pixels of the object AS IT
-    # APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- e.g.
+    # Expected apparent size(s) [width, height] in pixels of the object AS
+    # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- e.g.
     # estimated from flight altitude/GSD, or eyeballed on a sample frame.
     # Required when enabled=true; there is no safe default (a wrong value
     # actively hurts -- it recreates the same kind of scale mismatch this
     # feature exists to remove, just in a different direction).
-    expected_object_px: Optional[list[float]] = None
+    #
+    # Accepts EITHER a single [w, h] pair (shorthand, normalized to [[w, h]]
+    # below -- exactly the original single-scale behavior) OR a list of
+    # [w, h] pairs, e.g. [[18, 15], [26, 22], [34, 29]], to hedge against
+    # uncertainty in the true apparent scale (altitude/zoom varies shot to
+    # shot, or the estimate is a rough eyeball guess). See multi_scale_mode
+    # below for how more than one scale is actually consumed.
+    expected_object_px: Optional[list[list[float]]] = None
+    # "first" (default): only expected_object_px[0] is used -- exactly the
+    #   original single-canvas-per-reference-image behavior, unaffected by
+    #   any extra scales listed.
+    # "all": build ONE calibrated canvas PER (reference image, scale) pair
+    #   and feed every one of them into GeCo2Detector.encode_exemplars as
+    #   its own exemplar entry -- each contributes its own appearance token
+    #   (RoI-Align pooled from that canvas) and, when use_shape_token=true,
+    #   its own shape token (that scale's own calibrated box (w,h) -- shape
+    #   tokens naturally come out different per scale with no extra code,
+    #   since shape_or_objectness is computed from each canvas's own box).
+    #   Total exemplar count becomes num_refs * num_scales; all of them are
+    #   concatenated into the same K/V sequence cross-attention already
+    #   treats as a flat set, so nothing downstream (calibrate_prototype,
+    #   Stage 4 re-detect, etc.) needs to change. Costs num_refs*num_scales
+    #   backbone forward passes instead of num_refs.
+    multi_scale_mode: Literal["first", "all"] = "first"
     # Extra padding kept around the tight mask box, as a fraction of the
     # object's own size, before that (object+margin) footprint is calibrated
     # to match expected_object_px -- gives the model a bit of surrounding
     # context instead of the object filling the canvas edge-to-edge.
     context_margin: float = 0.5
 
+    @field_validator("expected_object_px", mode="before")
+    @classmethod
+    def _normalize_expected_object_px(cls, v: Any) -> Any:
+        """Accept a flat [w, h] pair (the original single-scale shape) as
+        shorthand for [[w, h]] -- keeps existing configs setting
+        expected_object_px: [22, 18] working unchanged."""
+        if (
+            v is not None
+            and len(v) == 2
+            and all(isinstance(x, (int, float)) for x in v)
+        ):
+            return [v]
+        return v
+
     @field_validator("expected_object_px")
     @classmethod
-    def check_expected_object_px(cls, v: Optional[list[float]]) -> Optional[list[float]]:
-        if v is not None and len(v) != 2:
-            raise ValueError("scale_calibration.expected_object_px must be [width, height]")
+    def check_expected_object_px(cls, v: Optional[list[list[float]]]) -> Optional[list[list[float]]]:
+        if v is None:
+            return v
+        if len(v) == 0:
+            raise ValueError("scale_calibration.expected_object_px must have at least one [width, height] entry")
+        for entry in v:
+            if len(entry) != 2:
+                raise ValueError("scale_calibration.expected_object_px entries must each be [width, height]")
         return v
 
 
