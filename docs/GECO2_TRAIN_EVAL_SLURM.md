@@ -203,49 +203,55 @@ chỉ ghi đè khi có cải thiện.
 
 ---
 
-## 6-7. Inference + Evaluate AP/AP50 (`GECO2/eval.sh`)
+## 6. Sinh dự đoán để evaluate (`inference.py`)
 
-Sau khi `train.py` chạy xong (có checkpoint), 2 bước còn lại cũng cần chạy trên node có GPU
-(`inference.py` dùng `torch.cuda.set_device(0)`) nên đóng gói chung thành 1 file SLURM riêng:
-[GECO2/eval.sh](../GECO2/eval.sh). File này chạy tuần tự trong **cùng 1 job, cùng thư mục
-làm việc**:
-
-1. **`inference.py`** — nạp checkpoint từ `<model_path>/<model_name>.pth`
-   ([GECO2/inference.py:34](../GECO2/inference.py#L34)), chạy qua cả 2 split `val`/`test`,
-   in ra **MAE/RMSE đếm số lượng**, và ghi 2 file **`geco2_val.json`** /
-   **`geco2_test.json`** (dự đoán dạng COCO) vào thư mục làm việc hiện tại
-   ([GECO2/inference.py:189-190](../GECO2/inference.py#L189-L190)).
-2. **`eval_bboxes.py`** — đọc lại 2 file JSON trên theo đường dẫn tương đối
-   ([GECO2/eval_bboxes.py:527,543](../GECO2/eval_bboxes.py#L527)), tính AP/AP50/AP75/APs/APm/APl
-   qua Detectron2 (chỉ `--data_path` thực sự được dùng trong script — các flag khác chỉ cần
-   có mặt vì nó dùng chung `utils.arg_parser.get_argparser()` với `train.py`; flag
-   `--input_folder` trong docstring nội bộ file là hàm `get_args_parser` cục bộ không được
-   gọi tới, bỏ qua).
-
-**Trước khi submit**, sửa trong `GECO2/eval.sh` (đánh dấu để sửa, tương tự `train.sh`):
-- `#SBATCH --partition`, `--gres=gpu:1`, `--time` cho khớp cluster của bạn (mặc định chỉ xin
-  **1 GPU** — cả 2 script đều single-GPU, không cần multi-node/DDP như training).
-- `module load ...` / `source activate ...` cho khớp tên env đã tạo ở bước 2.
-- `MODEL_NAME`, `MODEL_PATH`, `DATA_PATH` ở đầu file — phải **khớp chính xác** với giá trị
-  đã dùng khi `sbatch train.sh` (đặc biệt `MODEL_PATH`/`MODEL_NAME`, để nạp đúng checkpoint
-  vừa train).
-
-Submit **sau khi** job training đã hoàn tất và checkpoint đã tồn tại:
+Sau khi `train.py` chạy xong (hoặc bất cứ lúc nào có checkpoint muốn đánh giá), chạy trên 1
+node/job có GPU (không cần multi-GPU, `inference.py` chỉ dùng 1 GPU đơn — `torch.cuda.set_device(0)`):
 
 ```bash
-cd GECO2
-mkdir -p results   # nếu chưa tạo từ bước train
-sbatch eval.sh
-squeue -u $USER
-tail -f results/GECO2_eval_<jobid>.txt
+python inference.py \
+    --model_name GECO2_FSCD \
+    --model_path /path/to/your/checkpoint/dir \
+    --data_path /path/to/your/fsc147 \
+    --backbone resnet50 --reduction 16 --image_size 1024 \
+    --emb_dim 256 --num_heads 8 --kernel_dim 1 --num_objects 3 \
+    --batch_size 1 --num_workers 8
 ```
 
-Output: MAE/RMSE (từ `inference.py`) + bảng AP/AP50 (từ `eval_bboxes.py`) cho cả `val` và
-`test`, in trong log job; chi tiết từng ảnh lưu vào `each_img_infor<split>.pkl` trong
-`GECO2/` (thư mục làm việc khi submit).
+`--model_name`/`--model_path` phải khớp checkpoint đã lưu ở bước train (nạp từ
+`<model_path>/<model_name>.pth`, xem [GECO2/inference.py:34](../GECO2/inference.py#L34)).
 
-> Script visualize (`vis_res/`) mặc định **tắt** trong `eval_bboxes.py` (`visualize_res=False`)
-> — sửa thành `True` trong file nếu muốn xem ảnh có box vẽ đè lên để debug trực quan.
+Script sẽ:
+- Chạy qua cả 2 split `val` và `test`, in ra **MAE/RMSE đếm số lượng** cho từng split.
+- Ghi 2 file **`geco2_val.json`** và **`geco2_test.json`** (dự đoán dạng COCO) vào **thư mục
+  làm việc hiện tại** ([GECO2/inference.py:189-190](../GECO2/inference.py#L189-L190)) — chạy
+  lệnh này từ đúng thư mục bạn muốn 2 file này xuất hiện (thường là `GECO2/`).
+
+---
+
+## 7. Evaluate AP/AP50 (`eval_bboxes.py`, cần Detectron2)
+
+Chạy **cùng thư mục làm việc** đã sinh ra `geco2_val.json`/`geco2_test.json` ở bước 6 (script
+đọc 2 file này theo đường dẫn tương đối, xem
+[GECO2/eval_bboxes.py:527,543](../GECO2/eval_bboxes.py#L527)):
+
+```bash
+python eval_bboxes.py \
+    --model_name GECO2_FSCD \
+    --model_path /path/to/your/checkpoint/dir \
+    --data_path /path/to/your/fsc147
+```
+
+(Chỉ `--data_path` thực sự được dùng bên trong script — các flag khác chỉ cần có mặt vì
+`eval_bboxes.py` dùng chung `utils.arg_parser.get_argparser()` với `train.py`/`inference.py`,
+không dùng riêng flag `--input_folder` như docstring nội bộ của file gợi ý — đó là hàm
+`get_args_parser` cục bộ không được gọi tới, có thể bỏ qua.)
+
+Output: MAE/RMSE/NAE/SRE + bảng AP/AP50/AP75/APs/APm/APl cho cả `val` và `test`, in ra
+console, đồng thời lưu chi tiết từng ảnh vào `each_img_infor<split>.pkl` trong thư mục hiện tại.
+
+> Script visualize (`vis_res/`) mặc định **tắt** trong `main` (`visualize_res=False`) — bật
+> lên nếu muốn xem ảnh có box vẽ đè lên nếu cần debug trực quan.
 
 ---
 
@@ -264,10 +270,14 @@ mkdir -p results /path/to/checkpoint/dir
 sbatch train.sh
 squeue -u $USER
 
-# 5. Sửa MODEL_NAME/MODEL_PATH/DATA_PATH + #SBATCH trong eval.sh (khớp bước 4),
-#    rồi submit SAU KHI train.sh đã có checkpoint xong
-sbatch eval.sh   # chạy inference.py -> eval_bboxes.py tuần tự, in MAE/RMSE + AP/AP50
-squeue -u $USER
+# 5. Inference (sinh geco2_val.json / geco2_test.json)
+python inference.py --model_name GECO2_FSCD --model_path /path/to/checkpoint/dir \
+    --data_path /path/to/fsc147 --backbone resnet50 --reduction 16 --image_size 1024 \
+    --emb_dim 256 --num_heads 8 --kernel_dim 1 --num_objects 3 --batch_size 1 --num_workers 8
+
+# 6. Evaluate AP/AP50
+python eval_bboxes.py --model_name GECO2_FSCD --model_path /path/to/checkpoint/dir \
+    --data_path /path/to/fsc147
 ```
 
 ## Vấn đề thường gặp

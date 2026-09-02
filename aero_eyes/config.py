@@ -192,6 +192,26 @@ class CalibrateConfig(BaseModel):
     steps: int = 8
 
 
+class DynamicPrototypeConfig(BaseModel):
+    """Optional 2-pass matching: after the initial similarity pass, pick the
+    candidates scoring above an ADAPTIVE (percentile-based) threshold of
+    THIS sample's own score distribution -- not a fixed cutoff, since a
+    fixed one only fires for "easy" targets whose scores are already high
+    (a "hard" target's scores may never clear a fixed bar, so the mechanism
+    never activates for it) -- and blend their mean feature into the
+    prototype, then re-score. Repeated for `rounds` passes so the prototype
+    drifts toward this specific video's own appearance of the target.
+    Disabled by default: plain single-pass cosine matching against the
+    Stage 1 prototype, unchanged from before this option existed.
+    """
+    enabled: bool = False
+    rounds: int = 2
+    alpha: float = 0.3  # blend weight of the new high-confidence mean feature into the prototype
+    high_conf_percentile: float = 90.0  # percentile of THIS sample's score distribution
+    high_conf_abs_floor: float = 0.15   # absolute floor, so a low-scoring sample doesn't update from noise
+    min_support: int = 2  # minimum high-confidence candidates required to update; else stop early
+
+
 class Stage3Config(BaseModel):
     similarity: Literal["cosine", "l1", "l2"] = "cosine"
     match_threshold: float = 0.55
@@ -208,6 +228,7 @@ class Stage3Config(BaseModel):
     adaptive_z_score: float = 2.0   # higher = fewer FP, lower = more recall (see configs/config.yaml for the sweep)
     adaptive_min_floor: float = 0.05  # hard floor: never accept sim below this
     calibrate: CalibrateConfig = CalibrateConfig()
+    dynamic_prototype: DynamicPrototypeConfig = DynamicPrototypeConfig()
 
 
 class BuiltinTrackerConfig(BaseModel):
@@ -472,6 +493,32 @@ class ColorPostfilterConfig(BaseModel):
     value_full_confidence: float = 160.0
 
 
+class Geco2CosineRescoreConfig(BaseModel):
+    """Optional extra matching pass inserted between GeCo2 detection and
+    Stage 4 tracking: instead of GeCo2's own score alone deciding
+    detections.json (score_threshold_ratio/score_threshold_abs/nms_iou/
+    topk_per_keyframe above), GeCo2 first produces a WIDER per-keyframe
+    candidate set (this config's own looser threshold/topk below), each
+    candidate crop is embedded with a separate DINOv2 prototype (built the
+    same way legacy stage1.py does, from the same 3 reference images), and
+    aero_eyes.stages.stage3.run_stage3's cosine matching (optionally with
+    stage3.dynamic_prototype) does the final threshold/NMS/top-K filtering
+    that writes detections.json. GeCo2's cross-attention score and DINOv2's
+    cosine similarity are independent signals from different backbones, so
+    this is a genuine second opinion rather than re-deriving what GeCo2
+    already scored.
+
+    Disabled by default: run_stage123_geco2 alone decides detections.json
+    exactly as before this option existed (original behavior, unchanged).
+    """
+    enabled: bool = False
+    # Looser than stage123_geco2.score_threshold_ratio/topk_per_keyframe --
+    # this stage only needs to not throw away the true positive; Stage 3's
+    # cosine matching (+ dynamic_prototype, if enabled) does the real cut.
+    candidate_score_threshold_ratio: float = 0.15
+    candidate_topk_per_keyframe: int = 15
+
+
 class Stage123Geco2Config(BaseModel):
     """Only used when pipeline.detector == 'geco2'. Requires the vendored
     GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
@@ -549,6 +596,7 @@ class Stage123Geco2Config(BaseModel):
     #   use_shape_token=false, scale_calibration=true  -- path (2) fixed, path (1) removed
     use_shape_token: bool = True
     color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
+    cosine_rescore: Geco2CosineRescoreConfig = Geco2CosineRescoreConfig()
 
     @model_validator(mode="after")
     def check_scale_calibration(self) -> "Stage123Geco2Config":

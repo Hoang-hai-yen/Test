@@ -26,7 +26,13 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
 
     Stage list depends on cfg.pipeline.detector:
       "legacy" -> Stage1, Stage2, Stage3, Stage4, Stage5 (5 artifacts)
-      "geco2"  -> merged Stage1+2+3 (stage123_geco2.py), Stage4, Stage5
+      "geco2"  -> merged Stage1+2+3 (stage123_geco2.py), Stage4, Stage5,
+                  UNLESS stage123_geco2.cosine_rescore.enabled, in which case
+                  GeCo2 only generates candidates (run_stage12_geco2_candidates),
+                  and Stage3's DINOv2 cosine matching + Stage4's tracking run
+                  as one merged step (stage34.run_stage34) so a --from-stage
+                  resume can never run tracking against a stale/missing
+                  detections.json -- see Geco2CosineRescoreConfig in config.py.
     Stage numbers in --from-stage always refer to the ORIGINAL 1-5 scheme
     (e.g. --from-stage 4 resumes at tracking either way) so switching
     detector doesn't change what a given --from-stage value means.
@@ -55,7 +61,20 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
         if not sample_ids:
             raise ValueError(f"No sample directories found under {data_root}")
 
-    if cfg.pipeline.detector == "geco2":
+    if cfg.pipeline.detector == "geco2" and cfg.stage123_geco2.cosine_rescore.enabled:
+        from aero_eyes.stages.stage34 import run_stage34
+        from aero_eyes.stages.stage123_geco2 import run_stage12_geco2_candidates
+        # stage_num=1 covers GeCo2 candidate generation (replaces legacy
+        # Stage1+2); stage_num=4 is the merged Stage3+4 (cosine matching then
+        # tracking) -- tagged 4, not 3, so --from-stage 4 ("resume at
+        # tracking") still runs it, which also guarantees matching has run
+        # (or is cache-hit) before tracking, closing the gap a bare
+        # --from-stage 4 would otherwise leave if matching and tracking were
+        # separate stage_fns entries.
+        stage_fns: list[tuple[int, object]] = [
+            (1, run_stage12_geco2_candidates), (4, run_stage34), (5, run_stage5),
+        ]
+    elif cfg.pipeline.detector == "geco2":
         from aero_eyes.stages.stage123_geco2 import run_stage123_geco2
         # stage_num=1 covers what legacy Stage1-3 do combined.
         stage_fns: list[tuple[int, object]] = [(1, run_stage123_geco2), (4, run_stage4), (5, run_stage5)]

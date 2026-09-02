@@ -159,6 +159,22 @@ stage3:
     target_metric: st_iou
     search_range: [0.40, 0.75]
     steps: 8
+  # Optional 2-pass matching: after the initial similarity pass, pick
+  # candidates scoring above an ADAPTIVE (percentile-of-THIS-sample)
+  # threshold instead of a fixed cutoff -- a fixed cutoff only ever fires
+  # for "easy" targets whose scores are already high; a "hard" target's
+  # scores may never clear it, so the mechanism silently never activates.
+  # Blends those high-confidence candidates' mean feature into the
+  # prototype and re-scores, repeated for `rounds` passes so the prototype
+  # drifts toward this specific video's own appearance of the target.
+  # Disabled by default -- leaves single-pass matching above unchanged.
+  dynamic_prototype:
+    enabled: false
+    rounds: 2
+    alpha: 0.3                    # blend weight of the new high-confidence mean feature into the prototype
+    high_conf_percentile: 90.0    # percentile of THIS sample's own score distribution
+    high_conf_abs_floor: 0.15     # absolute floor, so a low-scoring sample doesn't update from noise
+    min_support: 2                # minimum high-confidence candidates required to update; else stop early
 
 # ----------------------------------------------------------------------------
 # STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
@@ -247,6 +263,30 @@ stage123_geco2:
   nms_iou: 0.5
   topk_per_keyframe: 5
   prototype_cache_name: geco2_prototype.pt   # cached exemplar tokens (torch, not prototype.npz)
+
+  # --------------------------------------------------------------------
+  # Optional extra matching pass inserted between GeCo2 detection and
+  # Stage 4 tracking. When enabled, GeCo2 no longer decides detections.json
+  # alone: it first produces a WIDER per-keyframe candidate set (using
+  # candidate_score_threshold_ratio/candidate_topk_per_keyframe below
+  # instead of score_threshold_ratio/topk_per_keyframe above), each
+  # candidate crop is embedded with a SEPARATE DINOv2 prototype (built the
+  # same way stage1 above does, from the same 3 reference images -- an
+  # independent signal from a different backbone than GeCo2's own Hiera),
+  # and stage3's cosine matching (+ stage3.dynamic_prototype, if enabled)
+  # does the actual threshold/NMS/top-K filtering that writes
+  # detections.json. Stage 3 and Stage 4 then run as one merged step
+  # (aero_eyes/stages/stage34.py) so a --from-stage resume can never run
+  # tracking against a stale/missing detections.json.
+  # Disabled by default -- GeCo2 alone decides detections.json, unchanged.
+  # --------------------------------------------------------------------
+  cosine_rescore:
+    enabled: false
+    # Looser than score_threshold_ratio/topk_per_keyframe above -- this
+    # stage only needs to not throw away the true positive; stage3's
+    # cosine matching does the real cut.
+    candidate_score_threshold_ratio: 0.15
+    candidate_topk_per_keyframe: 15
   # Shrink each ref image before encoding as an exemplar, to narrow the
   # ground-to-aerial domain gap (close-up ref photos are otherwise much
   # crisper/larger-looking than the object as it actually appears in the

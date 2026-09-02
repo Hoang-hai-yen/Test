@@ -638,6 +638,110 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     return det_path
 
 
+def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
+    """Stage 1+2 replacement (cosine_rescore variant) — GeCo2 exemplar
+    detection as a CANDIDATE generator instead of the final word.
+
+    Used instead of run_stage123_geco2 when
+    stage123_geco2.cosine_rescore.enabled=true. Differs from
+    run_stage123_geco2 in exactly one way: GeCo2's own
+    score_threshold_ratio/topk_per_keyframe are replaced with the looser
+    cosine_rescore.candidate_* values (so real detections aren't filtered
+    out before Stage 3 gets to see them), each surviving candidate crop is
+    embedded with a SEPARATE DINOv2 prototype (built via stage1.run_stage1
+    from the same reference images -- an independent signal from a
+    different backbone than GeCo2's own Hiera), and the result is written
+    to candidates.json (+ .feats.npz) in the same schema Stage 2 writes,
+    instead of straight to detections.json. aero_eyes.stages.stage3.run_stage3
+    then does the actual threshold/NMS/top-K filtering that produces
+    detections.json for Stage 4/5.
+
+    Reads:  cfg.data reference images + video
+    Writes: <work_dir>/<sample_id>/geco2_prototype.pt (cached GeCo2 exemplar tokens)
+            <work_dir>/<sample_id>/prototype.npz (cached DINOv2 prototype, via run_stage1)
+            <work_dir>/<sample_id>/candidates.json (+ .feats.npz)
+    """
+    from aero_eyes.models.features import build_feature_extractor
+    from aero_eyes.models.geco2_detector import GeCo2Detector
+    from aero_eyes.stages.stage1 import run_stage1
+    from aero_eyes.stages.stage2 import _write_candidates_with_features
+    from aero_eyes.utils.video import frame_iterator, keyframe_indices, video_info
+
+    t0 = time.time()
+    work_dir = Path(cfg.project.work_dir) / sample_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    cand_path = work_dir / "candidates.json"
+    if cfg.project.use_cache and cand_path.exists():
+        log.info("[Stage12-GeCo2] %s: using cached candidates at %s", sample_id, cand_path)
+        return cand_path
+
+    # DINOv2 prototype for Stage 3's cosine matching -- independent of (and
+    # cached separately from) GeCo2's own exemplar tokens below.
+    run_stage1(cfg, sample_id)
+
+    detector = GeCo2Detector(cfg)
+    prototype = build_exemplar_prototype(cfg, sample_id, detector, work_dir)
+
+    # Loosen GeCo2's own cut so real detections survive through to Stage 3's
+    # cosine matching -- see Geco2CosineRescoreConfig docstring.
+    cr = cfg.stage123_geco2.cosine_rescore
+    detector.score_threshold_ratio = cr.candidate_score_threshold_ratio
+    detector.topk_per_keyframe = cr.candidate_topk_per_keyframe
+
+    cpf_cfg = cfg.stage123_geco2.color_postfilter
+    color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
+
+    extractor = build_feature_extractor(cfg)
+
+    data_root = Path(cfg.data.data_root)
+    video_dir = data_root / sample_id
+    video_files = list(video_dir.glob(cfg.data.video_glob))
+    if not video_files:
+        raise FileNotFoundError(
+            f"No video matching '{cfg.data.video_glob}' found in {video_dir}."
+        )
+    video_path = video_files[0]
+    info = video_info(video_path)
+    total_frames = info["total_frames"]
+    log.info("[Stage12-GeCo2] %s: video=%s (%d frames)", sample_id, video_path.name, total_frames)
+
+    kf_indices = set(keyframe_indices(total_frames, cfg.stage123_geco2.keyframe_interval))
+
+    candidates: dict[int, list[Detection]] = {}
+    for frame_idx, frame_bgr in frame_iterator(video_path):
+        if frame_idx not in kf_indices:
+            continue
+
+        boxes = detector.detect_frame(frame_bgr, prototype)
+        if color_sig is not None:
+            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
+
+        if boxes:
+            feats = extractor.extract_crops(
+                frame_bgr, boxes,
+                pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+                batch_size=cfg.runtime.batch_size,
+            )
+        else:
+            feats = np.zeros((0, extractor._feature_dim()), dtype=np.float32)
+
+        frame_dets: list[Detection] = []
+        for i, box in enumerate(boxes):
+            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="candidate")
+            d._feature = feats[i]  # type: ignore[attr-defined]
+            frame_dets.append(d)
+        candidates[frame_idx] = frame_dets
+        log.debug("[Stage12-GeCo2] frame %d: %d candidates", frame_idx, len(frame_dets))
+
+    _write_candidates_with_features(candidates, cand_path)
+
+    elapsed = time.time() - t0
+    log.info("[Stage12-GeCo2] %s done in %.1fs -> %s (%d keyframes)",
+              sample_id, elapsed, cand_path, len(candidates))
+    return cand_path
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description="Stage 1+2+3 — GeCo2 exemplar detector")

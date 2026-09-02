@@ -125,6 +125,44 @@ def run_stage3(cfg, sample_id: str) -> Path:
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
 
+    # ---- Dynamic prototype update (stage3.dynamic_prototype, opt-in) ----
+    # A fixed high-confidence cutoff only ever fires for "easy" targets whose
+    # scores are already high; a "hard" target's scores may never clear a
+    # fixed bar, so the mechanism silently never activates for it. Using a
+    # percentile of THIS sample's own score distribution instead (with an
+    # absolute floor so a uniformly-low-scoring sample doesn't update from
+    # pure noise) makes it fire consistently, then blends the resulting
+    # high-confidence candidates' mean feature into the prototype and
+    # re-scores -- repeated for `rounds` passes so the prototype drifts
+    # toward this specific video's own appearance of the target. Disabled by
+    # default: leaves the single-pass score computed above untouched.
+    dp = s3.dynamic_prototype
+    if dp.enabled:
+        for round_idx in range(dp.rounds):
+            adaptive_high_thresh = max(dp.high_conf_abs_floor, float(np.percentile(all_sims, dp.high_conf_percentile)))
+            high_conf_mask = all_sims >= adaptive_high_thresh
+            if int(high_conf_mask.sum()) < dp.min_support:
+                break
+
+            dynamic_feat = all_feats[high_conf_mask].mean(axis=0)
+            dynamic_feat = dynamic_feat / (np.linalg.norm(dynamic_feat) + 1e-8)
+
+            log.info(
+                "[Stage3] %s: dynamic prototype update round %d/%d -- adaptive threshold=%.3f "
+                "(percentile=%.0f), %d candidates, alpha=%.2f",
+                sample_id, round_idx + 1, dp.rounds, adaptive_high_thresh,
+                dp.high_conf_percentile, int(high_conf_mask.sum()), dp.alpha,
+            )
+
+            if use_multi_ref:
+                per_ref_features.append(dynamic_feat)
+                sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
+                all_sims = np.mean(sims_per_ref, axis=0)
+            else:
+                prototype = (1 - dp.alpha) * prototype + dp.alpha * dynamic_feat
+                prototype = prototype / (np.linalg.norm(prototype) + 1e-8)
+                all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
+
     # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;
     # already shown to hurt results (see docs/COLAB_KAGGLE_GUIDE.md), kept
     # off by default and not extended to l1/l2.

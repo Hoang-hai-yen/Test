@@ -278,6 +278,42 @@ def test_stage3_produces_detections(cfg, synth_fixture):
     assert "frames" in data
 
 
+def test_stage3_dynamic_prototype_produces_detections(cfg, synth_fixture):
+    """Stage 3 with stage3.dynamic_prototype.enabled=True still runs to
+    completion and writes valid detections.json -- covers the 2-pass
+    percentile-threshold matching path (see DynamicPrototypeConfig), which
+    is silent (identical output) when disabled but exercises new candidate
+    re-scoring / prototype-blend code when on."""
+    cfg.stage3.dynamic_prototype.enabled = True
+    cfg.stage3.dynamic_prototype.min_support = 1  # small synthetic candidate set
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+    mock_prop = _mock_proposals()
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop):
+        from aero_eyes.stages.stage2 import run_stage2
+        run_stage2(cfg, FIXTURE_ID)
+
+    from aero_eyes.stages.stage3 import run_stage3
+    det_path = run_stage3(cfg, FIXTURE_ID)
+
+    assert det_path.exists(), f"detections.json not found at {det_path}"
+    with open(det_path) as f:
+        data = json.load(f)
+    assert "schema_version" in data
+    assert "frames" in data
+
+
 def test_stage4_produces_tracks_with_none_tracker(cfg, synth_fixture):
     """Stage 4 with tracker=none writes tracks.json."""
     feat_dim = 384
