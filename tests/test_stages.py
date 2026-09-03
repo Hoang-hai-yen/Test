@@ -229,6 +229,36 @@ def test_stage1_produces_prototype(cfg, synth_fixture):
     assert meta["sample_id"] == FIXTURE_ID
 
 
+def test_stage1_domain_calibration_produces_prototype(cfg, synth_fixture):
+    """Stage 1 with stage1.domain_calibration.enabled=True still runs to
+    completion and writes a valid, L2-normalized prototype.npz -- covers
+    the video-frame-sampling + blend path (see DinoDomainCalibrationConfig),
+    which is silent (identical output) when disabled but exercises new
+    video-reading / feature-averaging code when on."""
+    cfg.stage1.domain_calibration.enabled = True
+    cfg.stage1.domain_calibration.num_sample_frames = 3
+    cfg.stage1.domain_calibration.strength = 0.3
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+
+        from aero_eyes.stages.stage1 import run_stage1
+        proto_path = run_stage1(cfg, FIXTURE_ID)
+
+    assert proto_path.exists(), f"prototype.npz not found at {proto_path}"
+    from aero_eyes.utils.io import read_prototype
+    prototype, meta, per_ref = read_prototype(proto_path)
+    assert prototype.ndim == 1
+    assert prototype.shape[0] == feat_dim
+    assert abs(np.linalg.norm(prototype) - 1.0) < 1e-5  # still L2-normalized after the blend
+
+
 def test_stage2_produces_candidates(cfg, synth_fixture):
     """Stage 2 writes candidates.json with expected structure."""
     mock_extractor = _mock_dinov2()
@@ -312,6 +342,31 @@ def test_stage3_dynamic_prototype_produces_detections(cfg, synth_fixture):
         data = json.load(f)
     assert "schema_version" in data
     assert "frames" in data
+
+
+def test_pool_sims():
+    """accuracy.cheap_boosters.multi_ref_pooling: 'mean' averages per-ref
+    scores (diluted by a weak ref), 'max' keeps the single best-matching
+    ref's score instead."""
+    from aero_eyes.stages.stage3 import _pool_sims
+
+    # 2 candidates x 3 refs: candidate 0 matches ref 0 well but refs 1/2
+    # poorly; candidate 1 matches all three refs moderately.
+    sims_per_ref = [
+        np.array([0.9, 0.5]),
+        np.array([0.1, 0.4]),
+        np.array([0.1, 0.6]),
+    ]
+
+    mean_pooled = _pool_sims(sims_per_ref, "mean")
+    assert np.allclose(mean_pooled, [(0.9 + 0.1 + 0.1) / 3, (0.5 + 0.4 + 0.6) / 3])
+
+    max_pooled = _pool_sims(sims_per_ref, "max")
+    assert np.allclose(max_pooled, [0.9, 0.6])
+
+    # Unknown/unset pooling falls back to mean (matches the config default).
+    default_pooled = _pool_sims(sims_per_ref, "anything-else")
+    assert np.allclose(default_pooled, mean_pooled)
 
 
 def test_stage4_produces_tracks_with_none_tracker(cfg, synth_fixture):

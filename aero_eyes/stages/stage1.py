@@ -204,6 +204,50 @@ def run_stage1(cfg, sample_id: str) -> Path:
             if n > 0:
                 per_ref_features[i] = per_ref_features[i] / n
 
+    # ---- 5b. Domain calibration (opt-in) ----
+    # Shifts prototype (and each per-ref vector) toward the mean DINOv2
+    # embedding of a few RAW frames sampled from the query video -- an
+    # estimate of this video's own general scene/lighting domain, distinct
+    # from stage3.dynamic_prototype (which shifts toward matched CANDIDATE
+    # CROPS instead of whole frames) -- see DinoDomainCalibrationConfig.
+    dc_cfg = cfg.stage1.domain_calibration
+    if dc_cfg.enabled:
+        from aero_eyes.utils.video import read_frame, video_info
+
+        video_dir = data_root / sample_id
+        video_files = list(video_dir.glob(cfg.data.video_glob))
+        if not video_files:
+            raise FileNotFoundError(
+                f"No video matching '{cfg.data.video_glob}' found in {video_dir} "
+                "(needed for stage1.domain_calibration)."
+            )
+        video_path = video_files[0]
+        info = video_info(video_path)
+        total_frames = info["total_frames"]
+        n = max(1, min(dc_cfg.num_sample_frames, total_frames))
+        sample_idxs = sorted(set(np.linspace(0, max(total_frames - 1, 0), num=n).astype(int).tolist()))
+        sample_frames = [read_frame(video_path, i) for i in sample_idxs]
+
+        frame_feats = extractor.extract(sample_frames, batch_size=cfg.runtime.batch_size)
+        video_domain_mean = frame_feats.mean(axis=0)
+        vnorm = np.linalg.norm(video_domain_mean)
+        if vnorm > 0:
+            video_domain_mean = video_domain_mean / vnorm
+
+        prototype = (1 - dc_cfg.strength) * prototype + dc_cfg.strength * video_domain_mean
+        norm = np.linalg.norm(prototype)
+        if norm > 0:
+            prototype = prototype / norm
+        for i in range(len(per_ref_features)):
+            shifted = (1 - dc_cfg.strength) * per_ref_features[i] + dc_cfg.strength * video_domain_mean
+            n = np.linalg.norm(shifted)
+            per_ref_features[i] = shifted / n if n > 0 else shifted
+
+        log.info(
+            "[Stage1] %s: domain-calibrated prototype using %d sampled video frames (strength=%.2f)",
+            sample_id, len(sample_frames), dc_cfg.strength,
+        )
+
     # ---- 6. Write prototype ----
     meta = {
         "sample_id": sample_id,

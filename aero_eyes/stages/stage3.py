@@ -46,6 +46,23 @@ def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.nd
     raise ValueError(f"Unknown stage3.similarity metric '{metric}'. Must be 'cosine', 'l1', or 'l2'.")
 
 
+def _pool_sims(sims_per_ref: list, pooling: str) -> np.ndarray:
+    """Combine per-reference-image similarity arrays into one, per
+    accuracy.cheap_boosters.multi_ref_pooling:
+      mean -- average across refs (original behavior). A candidate that
+        matches one ref very well but the other two poorly (e.g. the object
+        was photographed from 3 different angles and this candidate's own
+        viewing angle only resembles one of them) has that good score
+        diluted by the two weak ones.
+      max -- the single best-matching ref's score per candidate, so a
+        genuinely good match from one well-aligned reference view isn't
+        dragged down by refs shot from a different angle/lighting.
+    """
+    if pooling == "max":
+        return np.max(sims_per_ref, axis=0)
+    return np.mean(sims_per_ref, axis=0)
+
+
 def run_stage3(cfg, sample_id: str) -> Path:
     """Run Stage 3 for the given sample. Returns path to detections.json."""
     from aero_eyes.stages.stage2 import read_candidates_with_features
@@ -92,6 +109,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
         and cfg.accuracy.cheap_boosters.multi_reference_embedding
         and len(per_ref_features) > 0
     )
+    multi_ref_pooling = cfg.accuracy.cheap_boosters.multi_ref_pooling
 
     # ---- Match: global top-K or per-keyframe threshold ----
     detections: dict[int, list[Detection]] = {}
@@ -121,7 +139,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # regardless of metric -- see _score_against_ref).
     if use_multi_ref:
         sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-        all_sims = np.mean(sims_per_ref, axis=0)
+        all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
 
@@ -157,7 +175,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
             if use_multi_ref:
                 per_ref_features.append(dynamic_feat)
                 sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-                all_sims = np.mean(sims_per_ref, axis=0)
+                all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
             else:
                 prototype = (1 - dp.alpha) * prototype + dp.alpha * dynamic_feat
                 prototype = prototype / (np.linalg.norm(prototype) + 1e-8)

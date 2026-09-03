@@ -146,11 +146,40 @@ class AerialSimConfig(BaseModel):
     blur_ksize: int = 0  # Gaussian blur kernel size in px, 0 = off (simulate motion/optical blur)
 
 
+class DinoDomainCalibrationConfig(BaseModel):
+    """DINOv2 analog of stage123_geco2.domain_calibration: shifts the fused
+    `prototype` (and each per-ref vector, when multi_reference_embedding is
+    active) toward the mean DINOv2 embedding of several RAW frames sampled
+    from the query video -- an estimate of this video's own general scene/
+    lighting domain (color temperature, exposure, compression, motion blur),
+    independent of where the target object actually is in those frames.
+
+    Different from -- and complementary to -- stage3.dynamic_prototype:
+    that mechanism shifts the prototype toward high-confidence CANDIDATE
+    CROPS (object-focused, but only available/reliable once matching has
+    already found some plausible hits). This one shifts toward whole video
+    frames (background-heavy, but available immediately, before any
+    matching happens, and captures broad scene-level lighting/exposure
+    differences a handful of object crops might not fully represent). Can
+    be used together with dynamic_prototype or on its own.
+
+    Disabled by default -- prototype.npz is built exactly as before this
+    option existed unless explicitly turned on.
+    """
+    enabled: bool = False
+    num_sample_frames: int = 5
+    # 0 = no change, 1 = appearance fully replaced by the video's own mean
+    # embedding (almost certainly too aggressive -- the object's own
+    # identity would be washed out by generic background/scene content).
+    strength: float = 0.3
+
+
 class Stage1Config(BaseModel):
     segmentation: SegmentationConfig = SegmentationConfig()
     feature_extractor: FeatureExtractorConfig = FeatureExtractorConfig()
     prototype: PrototypeConfig = PrototypeConfig()
     aerial_sim: AerialSimConfig = AerialSimConfig()
+    domain_calibration: DinoDomainCalibrationConfig = DinoDomainCalibrationConfig()
 
 
 class SAHIConfig(BaseModel):
@@ -354,6 +383,18 @@ class CheapBoostersConfig(BaseModel):
     scales: list[float] = [0.75, 1.0, 1.5]
     tuned_nms: bool = True
     multi_reference_embedding: bool = True
+    # How per-reference-image similarity scores are pooled into one score,
+    # when multi_reference_embedding is active (see stage3.py's use_multi_ref).
+    #   mean (default, unchanged from before this option existed) -- a
+    #     candidate that matches ONE ref very well but the other two poorly
+    #     (e.g. the object was photographed from 3 different angles, and
+    #     this candidate's viewing angle only resembles 1 of them) gets its
+    #     good score DILUTED by the two weak ones.
+    #   max -- take the single best-matching ref's score per candidate
+    #     instead of averaging all of them. Keeps a genuinely good match
+    #     from a single well-aligned reference view from being dragged down
+    #     by refs shot from a different angle/lighting than this candidate.
+    multi_ref_pooling: Literal["mean", "max"] = "mean"
 
 
 class MaxAccuracyConfig(BaseModel):

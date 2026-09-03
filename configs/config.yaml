@@ -96,6 +96,28 @@ stage1:
     fusion: mean             # mean | max | concat_then_pca
     l2_normalize: true
     cache_name: prototype.npz
+  # Degrade reference images (shrink-then-upscale + optional blur) to look
+  # more like a distant aerial capture before feature extraction -- shrinks
+  # the domain gap between crisp close-up references and the drone's
+  # actual view of the object. Both no-ops at their default values.
+  aerial_sim:
+    enabled: false
+    downscale_factor: 1.0   # e.g. 0.5 = shrink to half then upscale back
+    blur_ksize: 0            # Gaussian blur kernel size in px, 0 = off
+  # DINOv2 analog of stage123_geco2.domain_calibration: shifts the fused
+  # prototype (and each per-ref vector, when multi_reference_embedding is
+  # active) toward the mean DINOv2 embedding of a few RAW frames sampled
+  # from the query video -- an estimate of this video's own general scene/
+  # lighting domain (color temperature, exposure, compression, motion
+  # blur), independent of where the target object is in those frames.
+  # Different from -- and can be combined with -- stage3.dynamic_prototype,
+  # which shifts toward matched CANDIDATE CROPS (object-focused, but only
+  # available once matching has already found plausible hits) instead of
+  # whole frames (background-heavy, but available immediately).
+  domain_calibration:
+    enabled: false
+    num_sample_frames: 5
+    strength: 0.3   # 0 = no change, 1 = fully replaced by the video's own mean embedding
 
 # ----------------------------------------------------------------------------
 # STAGE 2 — Candidate generation (per keyframe)
@@ -596,6 +618,14 @@ accuracy:
     scales: [0.75, 1.0, 1.5]
     tuned_nms: true
     multi_reference_embedding: true   # keep per-ref protos + ensemble match
+    # How per-ref similarity scores get pooled into one, when
+    # multi_reference_embedding is active. "mean" (default) averages across
+    # all 3 refs -- a candidate matching only ONE ref well (e.g. object shot
+    # from 3 different angles, candidate's own angle resembles just one of
+    # them) gets that good score diluted by the other two weak ones. "max"
+    # takes the single best-matching ref's score instead, so a genuinely
+    # good match isn't dragged down by refs shot from a different angle.
+    multi_ref_pooling: mean   # "mean" | "max"
 
   max_accuracy:
     synthetic_viewpoint_aug:
