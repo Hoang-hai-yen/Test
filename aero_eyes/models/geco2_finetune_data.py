@@ -19,13 +19,11 @@ from torch.utils.data import Dataset
 
 from aero_eyes.models.segmentation import MobileSAMSegmenter
 from aero_eyes.stages.stage123_geco2 import (
-    _apply_background,
     _apply_ref_downscale,
-    _crop_to_object,
     _load_ref_images,
     _locate_video,
-    _mask_bbox,
 )
+from aero_eyes.utils.geometry import apply_background_mode, crop_to_object, mask_bbox
 from aero_eyes.types import Box
 from aero_eyes.utils.io import load_gt
 from aero_eyes.utils.video import read_frame, video_info
@@ -229,9 +227,9 @@ def convert_gt_box_to_canvas(
 class RefImageCache:
     """Precomputes, ONCE per video_id (not per training step): the 3
     native-resolution reference BGR images + their MobileSAM tight-box, via
-    aero_eyes.models.segmentation.MobileSAMSegmenter + stage123_geco2's
-    _mask_bbox/_apply_background (reused unmodified). Only ~14*3=42
-    MobileSAM calls total for the whole training run.
+    aero_eyes.models.segmentation.MobileSAMSegmenter + aero_eyes.utils.
+    geometry's mask_bbox/apply_background_mode (reused unmodified). Only
+    ~14*3=42 MobileSAM calls total for the whole training run.
 
     Per-step augmentation (domain randomization) reads from this cache and
     does cheap array ops only -- see docs/GECO2_FINETUNE_PLAN.md point 4.
@@ -256,13 +254,13 @@ class RefImageCache:
             ref_imgs = _load_ref_images(cfg, video_id)
             if seg_cfg.enabled:
                 masks = [segmenter.segment(img) for img in ref_imgs]
-                boxes = [_mask_bbox(m) for m in masks]
+                boxes = [mask_bbox(m) for m in masks]
                 ref_imgs = [
-                    _apply_background(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
+                    apply_background_mode(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
                     for img, m in zip(ref_imgs, masks)
                 ]
                 if cfg.stage123_geco2.crop_to_object:
-                    # See aero_eyes/stages/stage123_geco2.py::_crop_to_object --
+                    # See aero_eyes/utils/geometry.py::crop_to_object --
                     # tighter field of view (real pixels, no masking) so the
                     # object occupies more of the 1024 canvas after
                     # resize_and_pad, without needing any oracle scale
@@ -274,7 +272,7 @@ class RefImageCache:
                             cropped_imgs.append(img)
                             cropped_boxes.append(None)
                             continue
-                        cimg, cbox = _crop_to_object(img, b, cfg.stage123_geco2.crop_context_margin)
+                        cimg, cbox = crop_to_object(img, b, cfg.stage123_geco2.crop_context_margin)
                         cropped_imgs.append(cimg)
                         cropped_boxes.append(cbox)
                     ref_imgs, boxes = cropped_imgs, cropped_boxes

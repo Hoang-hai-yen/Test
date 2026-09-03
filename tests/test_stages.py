@@ -259,6 +259,42 @@ def test_stage1_domain_calibration_produces_prototype(cfg, synth_fixture):
     assert abs(np.linalg.norm(prototype) - 1.0) < 1e-5  # still L2-normalized after the blend
 
 
+def test_stage1_crop_to_object_produces_prototype(cfg, synth_fixture):
+    """Stage 1 with stage1.crop_to_object.enabled=True still runs to
+    completion, and (critically) keeps the cropped mask pixel-aligned with
+    the cropped image when synthetic_viewpoint_aug is ALSO on -- a mask/
+    image size mismatch there would crash generate_synth_views."""
+    cfg.stage1.crop_to_object = True
+    cfg.stage1.crop_context_margin = 0.5
+    cfg.accuracy.mode = "max_accuracy"
+    cfg.accuracy.max_accuracy.synthetic_viewpoint_aug.enabled = True
+    cfg.accuracy.max_accuracy.synthetic_viewpoint_aug.num_synth_views = 2
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+
+    # A partial (not full-frame) mask so crop_to_object actually shrinks
+    # the image, instead of cropping-to-the-whole-thing being a no-op.
+    partial_mask = np.zeros((224, 224), dtype=bool)
+    partial_mask[80:150, 60:140] = True
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = partial_mask
+        mock_seg_cls.return_value = mock_seg
+
+        from aero_eyes.stages.stage1 import run_stage1
+        proto_path = run_stage1(cfg, FIXTURE_ID)
+
+    assert proto_path.exists(), f"prototype.npz not found at {proto_path}"
+    from aero_eyes.utils.io import read_prototype
+    prototype, meta, per_ref = read_prototype(proto_path)
+    assert prototype.ndim == 1
+    assert prototype.shape[0] == feat_dim
+    assert abs(np.linalg.norm(prototype) - 1.0) < 1e-5
+
+
 def test_stage2_produces_candidates(cfg, synth_fixture):
     """Stage 2 writes candidates.json with expected structure."""
     mock_extractor = _mock_dinov2()

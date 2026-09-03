@@ -28,100 +28,9 @@ import cv2
 import numpy as np
 
 from aero_eyes.types import Box, Detection
+from aero_eyes.utils.geometry import apply_background_mode, crop_to_object, mask_bbox
 
 log = logging.getLogger(__name__)
-
-
-def _apply_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Fill everything outside `mask` with the image's own mean color
-    (same approach as stage1.py) -- a solid-black background would be
-    out-of-distribution for the backbone; the mean color is a milder,
-    less distracting stand-in. This is background_mode == "mean_fill".
-    """
-    masked = img.copy()
-    bg_color = img.reshape(-1, 3).mean(axis=0)
-    masked[~mask] = bg_color
-    return masked
-
-
-def _apply_background(img: np.ndarray, mask: np.ndarray, mode: str, blur_sigma: float) -> np.ndarray:
-    """Replace (or keep) the non-mask region of `img` per
-    stage123_geco2.segmentation.background_mode:
-
-      mean_fill -- flat mean-color fill (_apply_mask above, old default).
-                   Cheapest, but a large flat, textureless region is far
-                   outside what the backbone (pretrained on natural photos)
-                   ever saw -- can push the exemplar token into an
-                   unnatural part of feature space.
-      keep_real -- leave the reference photo's real background untouched.
-                   The tight mask bbox still controls WHERE RoI-Align
-                   pools from, so background pixels never enter the token
-                   directly -- but the backbone's self-attention still
-                   sees a natural image overall (its own real photo
-                   context), not a synthetic flat region.
-      blur      -- strong Gaussian blur of the real background: keeps
-                   natural color/texture statistics but discards fine
-                   detail that could otherwise cause spurious background
-                   matches.
-    """
-    if mode == "keep_real":
-        return img
-    if mode == "blur":
-        blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=blur_sigma)
-        out = img.copy()
-        out[~mask] = blurred[~mask]
-        return out
-    return _apply_mask(img, mask)
-
-
-def _mask_bbox(mask: np.ndarray) -> tuple[float, float, float, float] | None:
-    """Tight bbox around the True region of `mask`. None if mask is empty."""
-    ys, xs = np.where(mask)
-    if len(xs) == 0:
-        return None
-    return float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)
-
-
-def _crop_to_object(
-    img: np.ndarray, tight_box: tuple[float, float, float, float], context_margin: float
-) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """Crop `img` to `tight_box` expanded by `context_margin` (a fraction of
-    the box's own width/height), clamped to image bounds. Keeps 100% real
-    pixels -- no masking/fill -- just a tighter field of view than the
-    whole reference photo.
-
-    Why this helps: GeCo2Detector._load_and_pad's resize_and_pad() always
-    renormalizes whichever image it's given so its longer side fits
-    stage123_geco2.image_size (1024). Feeding it the WHOLE reference photo
-    means the object occupies only whatever (small) fraction of the photo
-    it originally did, so it ends up occupying that same small fraction of
-    the 1024 canvas -- RoI-Align then pools the appearance token from very
-    few feature-map cells at each pyramid level, losing detail. Cropping to
-    just the object (plus context) BEFORE resize_and_pad means the object
-    occupies a much LARGER fraction of the (now smaller) cropped image, so
-    after renormalizing to 1024 it also occupies a larger fraction of the
-    canvas -- more feature-map cells, a higher-resolution token. Unlike
-    ScaleCalibrationConfig, this needs no oracle estimate of the deployment
-    video's apparent object size -- it's purely a function of the
-    reference photo's own (already-computed) object bounds.
-
-    Returns (cropped_img, box_in_cropped_image_coords). Falls back to
-    (img, tight_box) unchanged if the expanded crop region is degenerate
-    (shouldn't happen for a valid tight_box, but cheap to guard).
-    """
-    h, w = img.shape[:2]
-    x1, y1, x2, y2 = tight_box
-    mx, my = (x2 - x1) * context_margin, (y2 - y1) * context_margin
-    cx1 = max(0.0, x1 - mx)
-    cy1 = max(0.0, y1 - my)
-    cx2 = min(float(w), x2 + mx)
-    cy2 = min(float(h), y2 + my)
-    icx1, icy1, icx2, icy2 = int(round(cx1)), int(round(cy1)), int(round(cx2)), int(round(cy2))
-    if icx2 <= icx1 or icy2 <= icy1:
-        return img, tight_box
-    cropped = img[icy1:icy2, icx1:icx2]
-    box_in_crop = (x1 - icx1, y1 - icy1, x2 - icx1, y2 - icy1)
-    return cropped, box_in_crop
 
 
 def _apply_ref_downscale(img, downscale_factor: float):
@@ -196,7 +105,7 @@ def _build_scale_calibrated_canvas(
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     src_x1, src_y1 = cx - ideal_native_size / 2.0, cy - ideal_native_size / 2.0
 
-    processed = _apply_background(img, mask, background_mode, blur_sigma)
+    processed = apply_background_mode(img, mask, background_mode, blur_sigma)
     bg_color = img.reshape(-1, 3).mean(axis=0)
     affine = np.array([
         [resize_ratio, 0.0, -src_x1 * resize_ratio],
@@ -301,7 +210,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
         # (masked) image instead pools in a lot of background + any
         # resize_and_pad zero-padding, diluting the exemplar token
         # (empirically confirmed to matter).
-        raw_boxes = [_mask_bbox(m) for m in masks]
+        raw_boxes = [mask_bbox(m) for m in masks]
 
         if sc_cfg.enabled:
             # scale_calibration: build a canvas per (ref image, scale) pair
@@ -370,7 +279,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             ref_imgs = canvases
             ref_boxes = canvas_boxes
         else:
-            ref_imgs = [_apply_background(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
+            ref_imgs = [apply_background_mode(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
                         for img, m in zip(ref_imgs, masks)]
             if cfg.runtime.save_visualizations:
                 vizmod.save_stage1_refs(ref_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
@@ -382,7 +291,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                         cropped_imgs.append(img)
                         cropped_boxes.append(None)
                         continue
-                    cimg, cbox = _crop_to_object(img, b, g.crop_context_margin)
+                    cimg, cbox = crop_to_object(img, b, g.crop_context_margin)
                     cropped_imgs.append(cimg)
                     cropped_boxes.append(cbox)
                 if cfg.runtime.save_visualizations:

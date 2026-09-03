@@ -46,7 +46,7 @@ def run_stage1(cfg, sample_id: str) -> Path:
     from aero_eyes.config import load_config
     from aero_eyes.models.features import build_feature_extractor
     from aero_eyes.models.segmentation import MobileSAMSegmenter
-    from aero_eyes.utils.geometry import generate_synth_views
+    from aero_eyes.utils.geometry import apply_background_mode, crop_to_object, generate_synth_views, mask_bbox
     from aero_eyes.utils.io import write_prototype
     from aero_eyes.utils import viz as vizmod
 
@@ -102,19 +102,56 @@ def run_stage1(cfg, sample_id: str) -> Path:
         else:
             mask = np.ones(img.shape[:2], dtype=bool)
         masks.append(mask)
-        masked = img.copy()
-        # Fill background with the image's own mean color rather than pure
-        # black: a large solid-black region is out-of-distribution for
-        # ImageNet-pretrained backbones (DINOv2/CLIP/SigLIP) and can distort
-        # the embedding more than the background clutter it was meant to
-        # remove.
-        bg_color = img.reshape(-1, 3).mean(axis=0)
-        masked[~mask] = bg_color
+        # background_mode: mean_fill (flat mean-color fill, old hardcoded
+        # default) | keep_real (leave the photo's real background
+        # untouched) | blur (Gaussian-blur it). See
+        # aero_eyes/utils/geometry.py::apply_background_mode.
+        masked = apply_background_mode(img, mask, seg_cfg.background_mode, seg_cfg.blur_sigma)
         masked_imgs.append(masked)
 
     if cfg.runtime.save_visualizations:
         viz_dir = work_dir / "viz" / "stage1"
         vizmod.save_stage1_refs(ref_imgs, masks, viz_dir)
+
+    # ---- 2a. Crop to object (opt-in) ----
+    # Whole-photo resize to feature_extractor.image_size (224 by default)
+    # means the object occupies only whatever fraction of the photo it
+    # originally did -- less detail/resolution for the object than if it
+    # filled more of the canvas. Cropping tight to the MobileSAM mask's
+    # bbox (+ crop_context_margin) BEFORE that resize makes the object
+    # occupy a larger fraction of the (now smaller) cropped image, so it
+    # also occupies a larger fraction after resizing. Mirrors
+    # stage123_geco2.crop_to_object -- see
+    # aero_eyes/utils/geometry.py::crop_to_object for the full rationale.
+    # synth_masks tracks whichever mask is pixel-aligned with masked_imgs --
+    # stays == masks (the ORIGINAL, uncropped masks) unless cropping below
+    # actually runs. Kept separate from `masks` itself because the mask-
+    # area-weighted fusion further down (step 5) should still reflect each
+    # ref's ORIGINAL segmentation confidence/framing, not the post-crop
+    # ratio (which would trend toward a similar value for every ref
+    # regardless of how tightly the photo was originally framed, once
+    # cropped to roughly the same box+margin proportions).
+    synth_masks = masks
+    if seg_cfg.enabled and cfg.stage1.crop_to_object:
+        cropped_imgs = []
+        cropped_masks = []
+        for masked, mask in zip(masked_imgs, masks):
+            tight_box = mask_bbox(mask)
+            if tight_box is None:
+                cropped_imgs.append(masked)
+                cropped_masks.append(mask)
+                continue
+            cimg, _ = crop_to_object(masked, tight_box, cfg.stage1.crop_context_margin)
+            cmask, _ = crop_to_object(mask, tight_box, cfg.stage1.crop_context_margin)
+            cropped_imgs.append(cimg)
+            cropped_masks.append(cmask)
+        masked_imgs = cropped_imgs
+        synth_masks = cropped_masks
+        if cfg.runtime.save_visualizations:
+            out_dir = work_dir / "viz" / "stage1" / "refs_cropped"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for i, c in enumerate(masked_imgs):
+                cv2.imwrite(str(out_dir / f"ref_{i}_cropped.jpg"), c)
 
     # ---- 2b. Aerial-view simulation (shrink/blur to match drone domain) ----
     sim_cfg = cfg.stage1.aerial_sim
@@ -129,7 +166,7 @@ def run_stage1(cfg, sample_id: str) -> Path:
     extractor = build_feature_extractor(cfg)
 
     images_per_ref: list[list[np.ndarray]] = []
-    for i, (masked, mask) in enumerate(zip(masked_imgs, masks)):
+    for i, (masked, mask) in enumerate(zip(masked_imgs, synth_masks)):
         # Multi-scale pyramid: extract features at 1.0x/0.75x/0.5x of the
         # masked reference image, then average over them (below) along with
         # any synthetic views -- makes the fused per-ref feature more robust

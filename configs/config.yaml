@@ -76,6 +76,19 @@ stage1:
     model: mobilesam         # mobilesam  (background removal on refs)
     weights: null            # path to MobileSAM ckpt; null = auto-download
     fallback_if_missing: passthrough   # passthrough = skip masking, use full image
+    # What to do with the non-mask (background) region of a reference image:
+    #   mean_fill (default) -- flat mean-color fill.
+    #   keep_real -- leave the reference photo's real background untouched.
+    #   blur -- strong Gaussian blur of the real background.
+    background_mode: mean_fill   # mean_fill | keep_real | blur
+    blur_sigma: 25.0             # used when background_mode: blur
+  # Crop each reference image to its MobileSAM tight mask box (expanded by
+  # crop_context_margin) BEFORE resizing to feature_extractor.image_size --
+  # keeps 100% real pixels, just a tighter field of view than the whole
+  # photo, so the object occupies a larger fraction of the final canvas.
+  # Requires segmentation.enabled. Off by default.
+  crop_to_object: false
+  crop_context_margin: 0.5
   feature_extractor:
     model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dinov2+clip concat)
     dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)

@@ -180,6 +180,19 @@ class Stage1Config(BaseModel):
     prototype: PrototypeConfig = PrototypeConfig()
     aerial_sim: AerialSimConfig = AerialSimConfig()
     domain_calibration: DinoDomainCalibrationConfig = DinoDomainCalibrationConfig()
+    # Crop each reference image to its MobileSAM tight mask box (expanded by
+    # crop_context_margin) BEFORE resizing to feature_extractor.image_size
+    # -- keeps 100% real pixels, no masking/fill, just a tighter field of
+    # view than the whole reference photo. Since the resize always
+    # renormalizes the (now smaller) image's longer side back up to
+    # image_size, the object ends up occupying a LARGER fraction of the
+    # final canvas than it would from the whole uncropped photo. Mirrors
+    # stage123_geco2.crop_to_object -- see
+    # aero_eyes/utils/geometry.py::crop_to_object. Requires
+    # segmentation.enabled (needs the tight mask box). Off by default --
+    # does not change existing runs unless opted in.
+    crop_to_object: bool = False
+    crop_context_margin: float = 0.5
 
 
 class SAHIConfig(BaseModel):
@@ -762,7 +775,7 @@ class Stage123Geco2Config(BaseModel):
     # knowledge of the deployment video's apparent object size -- it is
     # purely a function of the reference photo's own (already-computed)
     # object bounds. Requires segmentation.enabled (needs the tight mask
-    # box). See aero_eyes/stages/stage123_geco2.py::_crop_to_object.
+    # box). See aero_eyes/utils/geometry.py::crop_to_object.
     crop_to_object: bool = False
     crop_context_margin: float = 0.5
     scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
