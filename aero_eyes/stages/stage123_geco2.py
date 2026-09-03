@@ -567,12 +567,17 @@ def apply_color_postfilter(
     run_stage123_geco2's end-of-run summary log.
     """
     from aero_eyes.utils.color import compute_hs_histogram, compute_value_histogram, histogram_similarity
-    from aero_eyes.utils.geometry import crop_with_pad
+    from aero_eyes.utils.geometry import crop_with_pad, inset_box
 
     conf = color_sig.confidence
     kept: list[Box] = []
     for box in boxes:
-        crop = crop_with_pad(frame_bgr, box, pad_ratio=0.0)
+        # Sample color from an INSET box (see ColorPostfilterConfig.
+        # candidate_inset_ratio) -- the box KEPT below is still the
+        # original, unshrunk one; the inset only narrows what pixels the
+        # color histogram is measured from.
+        color_box = inset_box(box, cpf_cfg.candidate_inset_ratio)
+        crop = crop_with_pad(frame_bgr, color_box, pad_ratio=0.0)
         hs_hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins)
         v_hist = compute_value_histogram(crop, None, cpf_cfg.value_bins)
         sim_hs = max(histogram_similarity(hs_hist, r, cpf_cfg.metric) for r in color_sig.hs_hists)

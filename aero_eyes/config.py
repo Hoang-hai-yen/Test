@@ -561,7 +561,21 @@ class ColorPostfilterConfig(BaseModel):
     # saturation_full_confidence, confidence=1 (full effect); linearly
     # interpolated in between. mean saturation = 0-255, averaged over the
     # masked object pixels across all 3 ref photos.
-    min_ref_saturation: float = 40.0
+    #
+    # 65.0 (not the naive-looking 40.0): saturation=(max-min)/max is a
+    # RATIO, so for genuinely dark/near-black pixels small absolute sensor
+    # noise gets amplified into a spuriously HIGH saturation reading -- an
+    # actual black reference object in this codebase's own test data
+    # measured mean_saturation=60.1, which sat ABOVE a 40.0 floor and so
+    # still leaked ~22% confidence onto Hue+Saturation (a channel this
+    # class's own docstring calls unreliable for dark objects) instead of
+    # relying on Value as intended. 65.0 sits just above that observed
+    # noise floor so a genuinely-black reference reliably lands at
+    # confidence=0 (Value only); re-check the real mean_saturation logged
+    # by build_color_signature for YOUR reference object if black/white
+    # discrimination still looks off, and raise further if it's still
+    # landing above this floor.
+    min_ref_saturation: float = 65.0
     saturation_full_confidence: float = 130.0
     # Same ramp, triggered by mean HSV value/brightness -- catches
     # near-BLACK objects. Needed because saturation=(max-min)/max is a
@@ -573,6 +587,21 @@ class ColorPostfilterConfig(BaseModel):
     # the MINIMUM of the saturation ramp and this value ramp.
     min_ref_value: float = 50.0
     value_full_confidence: float = 160.0
+    # Shrink each CANDIDATE box inward by this fraction of its own
+    # width/height (on each side) before sampling its color histogram --
+    # e.g. 0.15 keeps only the middle 70%x70% of the box. A rectangular
+    # detector box's edges/corners commonly include background the
+    # (usually non-rectangular) real object doesn't cover; unlike the
+    # reference photos (masked by MobileSAM to pure object pixels, see
+    # build_color_signature), a video candidate box has no per-candidate
+    # segmentation to strip that background out, so its color histogram
+    # gets diluted by whatever's at the edges. This hurts achromatic
+    # (black/white) discrimination specifically MORE than chromatic colors:
+    # background rarely shares a colorful object's distinct HUE, but
+    # commonly sits at a MID brightness that pulls both a black and a white
+    # candidate's Value histogram toward each other. 0.0 = no-op (samples
+    # the whole box, original behavior).
+    candidate_inset_ratio: float = 0.15
 
 
 class Geco2CosineRescoreConfig(BaseModel):

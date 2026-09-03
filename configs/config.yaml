@@ -489,7 +489,15 @@ stage123_geco2:
     # saturation_full_confidence, confidence=1 (100% Hue+Saturation);
     # linearly interpolated in between. mean saturation = 0-255, over the
     # masked object pixels, averaged across all 3 ref photos.
-    min_ref_saturation: 40.0
+    # 65.0 (not the naive-looking 40.0): a real black reference object in
+    # this codebase's own test data measured mean_saturation=60.1 (S is a
+    # ratio, so sensor noise on dark pixels inflates it) -- with a 40.0
+    # floor that still leaked ~22% confidence onto Hue+Saturation (unreliable
+    # for dark objects) instead of relying on Value as intended. 65.0 sits
+    # just above that observed noise floor. Check the mean_saturation
+    # build_color_signature logs for YOUR reference object and raise
+    # further if black/white discrimination still looks off.
+    min_ref_saturation: 65.0
     saturation_full_confidence: 130.0
     # Same ramp, triggered by mean HSV value/brightness. Needed because
     # saturation=(max-min)/max is a RATIO: for dark pixels, small absolute
@@ -501,6 +509,17 @@ stage123_geco2:
     # saturation ramp and this value ramp.
     min_ref_value: 50.0
     value_full_confidence: 160.0
+    # Shrink each CANDIDATE box inward by this fraction of its own
+    # width/height (each side) before sampling its color histogram -- e.g.
+    # 0.15 keeps only the middle 70%x70% of the box. Unlike the reference
+    # photos (masked by MobileSAM to pure object pixels), a video candidate
+    # box has no per-candidate segmentation, so its rectangular edges/
+    # corners commonly include background that dilutes the color
+    # histogram -- hurts black/white discrimination specifically more than
+    # colorful objects (background rarely shares a distinct HUE, but
+    # commonly sits at a MID brightness that pulls both a black and a white
+    # candidate's Value histogram toward each other). 0.0 = no-op.
+    candidate_inset_ratio: 0.15
 
 # ----------------------------------------------------------------------------
 # STAGE 4 — Tracking between keyframes

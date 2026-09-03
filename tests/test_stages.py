@@ -559,3 +559,26 @@ def test_geometry_iou():
     assert 0 in keep
     assert 2 in keep
     assert 1 not in keep
+
+
+def test_inset_box():
+    """inset_box shrinks toward the box's own center; degenerates safely."""
+    from aero_eyes.types import Box
+    from aero_eyes.utils.geometry import inset_box
+
+    box = Box(0, 0, 100, 40, score=0.5)
+
+    # 0.0 = no-op, returns an equal (possibly same) box.
+    same = inset_box(box, 0.0)
+    assert (same.x1, same.y1, same.x2, same.y2) == (0, 0, 100, 40)
+
+    # 0.15 shrinks 15% of width/height off EACH side, keeps score.
+    shrunk = inset_box(box, 0.15)
+    assert shrunk.x1 == 15.0 and shrunk.x2 == 85.0
+    assert shrunk.y1 == 6.0 and shrunk.y2 == 34.0
+    assert shrunk.score == 0.5
+
+    # A ratio large enough to collapse/invert the box falls back to the
+    # original box unchanged, rather than returning a degenerate rect.
+    degenerate = inset_box(box, 0.6)
+    assert (degenerate.x1, degenerate.y1, degenerate.x2, degenerate.y2) == (0, 0, 100, 40)

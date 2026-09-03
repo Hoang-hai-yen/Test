@@ -178,6 +178,28 @@ def crop_with_pad(img_bgr, box: Box, pad_ratio: float = 0.1):
     return crop
 
 
+def inset_box(box: Box, ratio: float) -> Box:
+    """Shrink `box` inward by `ratio` of its own width/height on EACH side
+    (0.15 = 15% off each edge, i.e. the box keeps its middle 70% x 70%).
+    A rectangular detector box's edges/corners commonly include background
+    the (usually non-rectangular) real object doesn't actually cover --
+    sampling color/appearance from the full box dilutes the measurement
+    with that background. Insetting first removes exactly the pixels most
+    likely to be background, without needing a real per-candidate
+    segmentation mask. 0.0 (or a ratio that would collapse/invert the box)
+    = no-op, returns `box` unchanged.
+    """
+    if ratio <= 0.0:
+        return box
+    w = box.x2 - box.x1
+    h = box.y2 - box.y1
+    dx, dy = w * ratio, h * ratio
+    x1, y1, x2, y2 = box.x1 + dx, box.y1 + dy, box.x2 - dx, box.y2 - dy
+    if x2 <= x1 or y2 <= y1:
+        return box
+    return Box(x1, y1, x2, y2, score=box.score)
+
+
 # ---------------------------------------------------------------------------
 # Synthetic viewpoint augmentation
 # ---------------------------------------------------------------------------
