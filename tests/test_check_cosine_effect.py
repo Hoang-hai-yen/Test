@@ -82,6 +82,41 @@ def test_unsampled_gt_frames_reported_separately():
     assert r["unsampled_gt_frames"] == 2
 
 
+def test_processed_frames_catches_missing_keys_as_fn():
+    """Regression test for a real survivorship-bias bug: detections.json
+    only writes a key for a frame when >=1 candidate SURVIVED the
+    threshold, so a frame Stage 3 rejected everything on is silently
+    ABSENT from the dict (not present as an empty list). Without an
+    explicit processed_frames set, that frame would be invisible to
+    compute_prf1 and get folded into unsampled_gt_frames instead of FN --
+    inflating recall/precision by only ever evaluating "surviving" frames.
+    """
+    box = Box(0, 0, 10, 10)
+    # candidates.json (before): every attempted keyframe has an entry,
+    # even a bad/empty one.
+    candidates = {0: [_det(box)], 1: [], 2: [_det(box)]}
+    # detections.json (after): frame 1 (cosine rejected everything) and
+    # frame 2 (cosine also rejected it) are MISSING entirely -- only frame
+    # 0 survived. This mirrors write_detections only writing keys present
+    # in frame_groups (built from candidates that passed threshold).
+    detections = {0: [_det(box)]}
+    gt = {0: box, 1: box, 2: box}  # object present on all 3 frames
+
+    # BUG (what happens without processed_frames): frame 1 and 2 are
+    # invisible -- only frame 0 gets evaluated -> looks like perfect R=1.0.
+    buggy = compute_prf1(detections, gt, iou_threshold=0.5)
+    assert buggy["tp"] == 1 and buggy["fn"] == 0
+    assert buggy["recall"] == 1.0  # falsely perfect
+
+    # FIX: pass candidates.json's key set as processed_frames -- frames 1
+    # and 2 are now correctly counted as FN (0 detections on a GT-present
+    # frame that WAS attempted), not silently skipped.
+    fixed = compute_prf1(detections, gt, iou_threshold=0.5, processed_frames=set(candidates.keys()))
+    assert fixed["tp"] == 1 and fixed["fn"] == 2
+    assert abs(fixed["recall"] - 1.0 / 3.0) < 1e-9
+    assert fixed["unsampled_gt_frames"] == 0  # all 3 GT frames were in processed_frames
+
+
 def test_iou_threshold_is_configurable():
     """A partial-overlap candidate passes at a loose threshold but fails
     at a strict one -- exactly what --iou-threshold controls."""

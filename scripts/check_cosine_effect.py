@@ -7,8 +7,18 @@ Works on candidates.json from EITHER pipeline (legacy Stage 2, or GeCo2's
 run_stage12_geco2_candidates when stage123_geco2.cosine_rescore.enabled) --
 both write the same schema.
 
-Per-frame confusion matrix, over frames actually PROCESSED (present as a key
-in the file being evaluated -- i.e. sampled as a keyframe and given a chance):
+Per-frame confusion matrix, over frames actually PROCESSED -- i.e. sampled
+as a keyframe and given a chance, from candidates.json's OWN key set (every
+keyframe GeCo2/Stage 2 sampled gets an entry there, even an empty one).
+detections.json's key set is NOT used for this by itself: Stage 3 only
+writes a key for a frame when >=1 candidate SURVIVED the similarity
+threshold, so a keyframe where every candidate was rejected is silently
+ABSENT from the dict (not present as an empty list) -- naively treating
+"absent from detections.json" as "never processed" would silently exclude
+every rejected-everything frame from FN, producing survivorship-biased
+Precision/Recall that only reflects frames where cosine happened to keep
+something. Both BEFORE and AFTER are evaluated against the SAME frame set
+(candidates.json's) so the comparison is apples-to-apples.
   GT present + best candidate IoU >= threshold        -> TP
   GT present + best candidate IoU <  threshold
                (including 0 candidates on that frame) -> FN
@@ -45,13 +55,25 @@ def compute_prf1(
     dets_by_frame: dict[int, list[Detection]],
     gt: dict[int, Box],
     iou_threshold: float,
+    processed_frames: set[int] | None = None,
 ) -> dict:
     """Per-frame confusion matrix + Precision/Recall/F1 for one
     frame_idx -> [Detection] mapping against one frame_idx -> Box ground
-    truth. See module docstring for exact TP/FN/FP/TN semantics."""
+    truth. See module docstring for exact TP/FN/FP/TN semantics.
+
+    processed_frames: the full set of frame indices actually attempted.
+    Defaults to dets_by_frame.keys() if not given -- but pass this
+    EXPLICITLY (e.g. candidates.json's key set) when evaluating
+    detections.json, whose own keys under-represent what was attempted
+    (see module docstring) -- a frame in processed_frames but absent from
+    dets_by_frame is treated as 0 detections on that frame, not skipped.
+    """
+    if processed_frames is None:
+        processed_frames = set(dets_by_frame.keys())
+
     tp = fn = fp = tn = 0
-    for fi, dets in dets_by_frame.items():
-        boxes = [d.box for d in dets]
+    for fi in processed_frames:
+        boxes = [d.box for d in dets_by_frame.get(fi, [])]
         has_detection = len(boxes) > 0
         if fi in gt:
             best_iou = max((box_iou(gt[fi], b) for b in boxes), default=0.0)
@@ -108,17 +130,31 @@ def check_sample(cfg, sample_id: str, iou_threshold: float) -> None:
 
     print(f"\n=== {sample_id} (IoU threshold={iou_threshold}) ===")
 
+    candidates = None
+    processed_frames = None
     if not cand_path.exists():
         print(f"  BEFORE cosine (candidates.json): not found at {cand_path} -- "
               "run Stage 2 (legacy) or the GeCo2 candidate stage first.")
     else:
-        r = compute_prf1(read_candidates(cand_path), gt, iou_threshold)
+        candidates = read_candidates(cand_path)
+        processed_frames = set(candidates.keys())
+        r = compute_prf1(candidates, gt, iou_threshold, processed_frames=processed_frames)
         _print_result("BEFORE cosine (candidates.json)", r)
 
     if not det_path.exists():
         print(f"  AFTER  cosine (detections.json): not found at {det_path} -- run Stage 3 first.")
     else:
-        r = compute_prf1(read_detections(det_path), gt, iou_threshold)
+        detections = read_detections(det_path)
+        if processed_frames is None:
+            # candidates.json wasn't available to establish the true
+            # attempted-frame set -- fall back to detections.json's own
+            # keys, but this UNDERCOUNTS: any keyframe where cosine
+            # rejected every candidate is silently absent here (see module
+            # docstring), so those misses won't be counted as FN.
+            print("    warning: candidates.json unavailable -- FN count below may be "
+                  "undercounted (frames cosine rejected everything on are invisible "
+                  "without candidates.json's key set).")
+        r = compute_prf1(detections, gt, iou_threshold, processed_frames=processed_frames)
         _print_result("AFTER  cosine (detections.json)", r)
 
 
