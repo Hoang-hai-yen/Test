@@ -288,7 +288,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             from aero_eyes.utils.box_refine import refine_box
                             box = refine_box(
                                 br_cfg.method, frame_bgr, box, br_cfg.context_margin,
-                                segmenter=box_refine_segmenter,
+                                segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
                             )
                             tracker.init(frame_bgr, box)
 

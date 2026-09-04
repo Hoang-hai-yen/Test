@@ -129,3 +129,57 @@ def test_refine_box_unknown_method_raises():
     box = Box(35, 35, 85, 85)
     with pytest.raises(ValueError, match="Unknown box_refine.method"):
         refine_box("nearest-neighbor", frame, box, context_margin=0.2)
+
+
+def test_refine_box_min_iou_gate_rejects_wildly_different_region():
+    """Regression test for a real failure mode: on a real run, SAM latched
+    onto an entirely different region than the original box, TANKING
+    ST-IoU instead of improving it. min_iou_with_original must reject a
+    "refined" box that barely overlaps the original and fall back to it."""
+    frame = _synthetic_frame()
+    original = Box(35, 35, 85, 85, score=0.6)
+
+    class _WildSegmenter:
+        """Always returns a mask far away from the original box -- e.g. a
+        confuser or background clutter elsewhere in the padded crop."""
+        def segment_box(self, frame_bgr, box, context_margin):
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[0:5, 0:5] = True  # tiny region nowhere near the original box
+            return mask, (0, 0)
+
+    # No gate (0.0, default in refine_box's own signature) -- accepts the
+    # wild region verbatim.
+    ungated = refine_box("sam", frame, original, context_margin=0.2, segmenter=_WildSegmenter())
+    assert (ungated.x1, ungated.y1, ungated.x2, ungated.y2) == (0.0, 0.0, 5.0, 5.0)
+
+    # With the gate on (matches BoxRefineConfig's own default of 0.3) --
+    # the wild region's IoU with `original` is 0.0, well below 0.3, so the
+    # original box must be returned unchanged instead.
+    gated = refine_box(
+        "sam", frame, original, context_margin=0.2,
+        segmenter=_WildSegmenter(), min_iou_with_original=0.3,
+    )
+    assert gated is original
+
+
+def test_refine_box_min_iou_gate_accepts_a_genuine_tightening():
+    """The gate must NOT reject a legitimate refinement that stays well
+    within/near the original box -- only wildly different regions."""
+    frame = _synthetic_frame()
+    original = Box(20, 20, 100, 100, score=0.6)
+
+    class _TighteningSegmenter:
+        def segment_box(self, frame_bgr, box, context_margin):
+            # Mask covers (40,40)-(80,80) within a crop offset at (0, 0) --
+            # a real tightening toward the frame's own true square, IoU
+            # with `original` is (40*40)/(80*80) = 0.25... let's make it
+            # comfortably overlapping instead so this exercises "accepted".
+            mask = np.zeros((120, 120), dtype=bool)
+            mask[25:95, 25:95] = True
+            return mask, (0, 0)
+
+    refined = refine_box(
+        "sam", frame, original, context_margin=0.2,
+        segmenter=_TighteningSegmenter(), min_iou_with_original=0.3,
+    )
+    assert (refined.x1, refined.y1, refined.x2, refined.y2) == (25.0, 25.0, 95.0, 95.0)

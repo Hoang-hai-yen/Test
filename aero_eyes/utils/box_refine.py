@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 
 from aero_eyes.types import Box
-from aero_eyes.utils.geometry import mask_bbox
+from aero_eyes.utils.geometry import box_iou, mask_bbox
 
 log = logging.getLogger(__name__)
 
@@ -102,12 +102,36 @@ def refine_box_with_grabcut(frame_bgr, box: Box, context_margin: float = 0.2) ->
     return Box(x1 + cx1, y1 + cy1, x2 + cx1, y2 + cy1, score=box.score)
 
 
-def refine_box(method: str, frame_bgr, box: Box, context_margin: float, segmenter=None) -> Box:
+def refine_box(
+    method: str, frame_bgr, box: Box, context_margin: float,
+    segmenter=None, min_iou_with_original: float = 0.0,
+) -> Box:
     """Dispatch to refine_box_with_sam ('sam') or refine_box_with_grabcut
-    ('grabcut') per box_refine.method. `segmenter` is required (and used)
-    only for 'sam' -- ignored otherwise."""
+    ('grabcut') per box_refine.method, then a safety gate: if the refined
+    box's IoU with the ORIGINAL `box` falls below min_iou_with_original,
+    discard it and return `box` unchanged instead.
+
+    Why this gate exists (confirmed in practice, not just theoretical): on
+    small/low-res candidate boxes, the segmenter can latch onto a sub-part,
+    a nearby confuser, or background clutter within the padded crop
+    instead of the intended object -- silently replacing a decent box with
+    a much worse one. Comparing against the box's OWN prior state (not
+    ground truth, which isn't available at inference time) is the only
+    self-consistency check available, but it directly catches "refined
+    into a totally different region", which is the dominant failure mode
+    observed. 0.0 (default) = no gate, accept whatever the segmenter
+    returns.
+
+    `segmenter` is required (and used) only for 'sam' -- ignored otherwise.
+    """
     if method == "sam":
-        return refine_box_with_sam(segmenter, frame_bgr, box, context_margin)
-    if method == "grabcut":
-        return refine_box_with_grabcut(frame_bgr, box, context_margin)
-    raise ValueError(f"Unknown box_refine.method '{method}'. Must be 'sam' or 'grabcut'.")
+        refined = refine_box_with_sam(segmenter, frame_bgr, box, context_margin)
+    elif method == "grabcut":
+        refined = refine_box_with_grabcut(frame_bgr, box, context_margin)
+    else:
+        raise ValueError(f"Unknown box_refine.method '{method}'. Must be 'sam' or 'grabcut'.")
+
+    if min_iou_with_original > 0.0 and refined is not box:
+        if box_iou(refined, box) < min_iou_with_original:
+            return box
+    return refined

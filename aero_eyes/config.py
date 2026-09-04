@@ -854,6 +854,17 @@ class BoxRefineConfig(BaseModel):
     context_margin: float = 0.2
     apply_in_stage3: bool = True
     apply_in_stage4: bool = False
+    # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box
+    # falls below this -- guards against the segmenter latching onto a
+    # sub-part, a nearby confuser, or background clutter within the padded
+    # crop instead of the intended object (confirmed to happen in
+    # practice: on small/low-res candidate boxes -- as small as ~20x10px,
+    # see ColorPostfilterConfig's docstring for the same small-crop issue
+    # elsewhere -- SAM sometimes segments an entirely different region,
+    # silently replacing a decent box with a much worse one and TANKING
+    # ST-IoU rather than improving it). 0.0 = no sanity check (accept
+    # whatever the segmenter returns, even a wildly different region).
+    min_iou_with_original: float = 0.3
 
 
 # ---------------------------------------------------------------------------

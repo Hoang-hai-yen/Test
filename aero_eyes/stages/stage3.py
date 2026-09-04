@@ -327,7 +327,10 @@ def run_stage3(cfg, sample_id: str) -> Path:
             result_dets = [
                 Detection(
                     frame_idx=d.frame_idx,
-                    box=refine_box(br_cfg.method, frame_bgr, d.box, br_cfg.context_margin, segmenter=box_refine_segmenter),
+                    box=refine_box(
+                        br_cfg.method, frame_bgr, d.box, br_cfg.context_margin,
+                        segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
+                    ),
                     similarity=d.similarity, source=d.source,
                 )
                 for d in result_dets

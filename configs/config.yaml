@@ -629,6 +629,12 @@ box_refine:
   method: sam                # "sam" (MobileSAM, higher quality, extra fwd pass)
                               # | "grabcut" (no model, cheaper, lower quality)
   context_margin: 0.2        # padding kept around the box when cropping to segment
+  # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box falls
+  # below this -- guards against the segmenter latching onto a sub-part,
+  # a nearby confuser, or background clutter within the padded crop
+  # instead of the intended object (confirmed in practice on small/low-res
+  # candidate boxes). 0.0 = no sanity check.
+  min_iou_with_original: 0.3
   # Refine the FINAL box Stage 3's cosine matching picked, once per
   # keyframe -- cheap (bounded by keyframe count x topk_per_keyframe).
   apply_in_stage3: true
