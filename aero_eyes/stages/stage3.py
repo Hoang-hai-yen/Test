@@ -63,6 +63,77 @@ def _pool_sims(sims_per_ref: list, pooling: str) -> np.ndarray:
     return np.mean(sims_per_ref, axis=0)
 
 
+def run_dynamic_prototype_rounds(
+    sample_id: str,
+    all_feats: np.ndarray,
+    all_sims: np.ndarray,
+    prototype: np.ndarray,
+    per_ref_features: list,
+    use_multi_ref: bool,
+    multi_ref_pooling: str,
+    similarity_metric: str,
+    dp,
+    on_round=None,
+) -> tuple[np.ndarray, np.ndarray, list]:
+    """stage3.dynamic_prototype's iterative refinement loop (opt-in, no-op
+    when dp.enabled is False): a fixed high-confidence cutoff only ever
+    fires for "easy" targets whose scores are already high; a "hard"
+    target's scores may never clear a fixed bar, so the mechanism silently
+    never activates for it. Using a percentile of THIS sample's own score
+    distribution instead (with an absolute floor so a uniformly-low-scoring
+    sample doesn't update from pure noise) makes it fire consistently, then
+    blends the resulting high-confidence candidates' mean feature into the
+    prototype and re-scores -- repeated for `dp.rounds` passes so the
+    prototype drifts toward this specific video's own appearance of the
+    target.
+
+    Factored out of run_stage3 so a diagnostic script (see
+    scripts/check_dynamic_prototype_purity.py) can replay the exact same
+    selection logic against candidates.json + ground truth WITHOUT
+    duplicating it -- self-training loops like this can drift toward a
+    confuser if a round's "high-confidence" picks are actually wrong, and
+    that diagnostic checks the picks' GT IoU per round to catch it.
+
+    on_round: optional callback(round_idx, high_conf_mask, threshold),
+    invoked once per round that actually ran (rounds skipped by the
+    min_support early-break are NOT reported) -- called BEFORE that
+    round's prototype update, i.e. high_conf_mask indexes all_feats at the
+    state used to SELECT that round's candidates. Return value ignored.
+    """
+    if not dp.enabled:
+        return prototype, all_sims, per_ref_features
+
+    for round_idx in range(dp.rounds):
+        adaptive_high_thresh = max(dp.high_conf_abs_floor, float(np.percentile(all_sims, dp.high_conf_percentile)))
+        high_conf_mask = all_sims >= adaptive_high_thresh
+        if int(high_conf_mask.sum()) < dp.min_support:
+            break
+
+        dynamic_feat = all_feats[high_conf_mask].mean(axis=0)
+        dynamic_feat = dynamic_feat / (np.linalg.norm(dynamic_feat) + 1e-8)
+
+        log.info(
+            "[Stage3] %s: dynamic prototype update round %d/%d -- adaptive threshold=%.3f "
+            "(percentile=%.0f), %d candidates, alpha=%.2f",
+            sample_id, round_idx + 1, dp.rounds, adaptive_high_thresh,
+            dp.high_conf_percentile, int(high_conf_mask.sum()), dp.alpha,
+        )
+
+        if on_round is not None:
+            on_round(round_idx, high_conf_mask, adaptive_high_thresh)
+
+        if use_multi_ref:
+            per_ref_features.append(dynamic_feat)
+            sims_per_ref = [_score_against_ref(all_feats, ref_feat, similarity_metric) for ref_feat in per_ref_features]
+            all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
+        else:
+            prototype = (1 - dp.alpha) * prototype + dp.alpha * dynamic_feat
+            prototype = prototype / (np.linalg.norm(prototype) + 1e-8)
+            all_sims = _score_against_ref(all_feats, prototype, similarity_metric)
+
+    return prototype, all_sims, per_ref_features
+
+
 def run_stage3(cfg, sample_id: str) -> Path:
     """Run Stage 3 for the given sample. Returns path to detections.json."""
     from aero_eyes.stages.stage2 import read_candidates_with_features
@@ -144,42 +215,10 @@ def run_stage3(cfg, sample_id: str) -> Path:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
 
     # ---- Dynamic prototype update (stage3.dynamic_prototype, opt-in) ----
-    # A fixed high-confidence cutoff only ever fires for "easy" targets whose
-    # scores are already high; a "hard" target's scores may never clear a
-    # fixed bar, so the mechanism silently never activates for it. Using a
-    # percentile of THIS sample's own score distribution instead (with an
-    # absolute floor so a uniformly-low-scoring sample doesn't update from
-    # pure noise) makes it fire consistently, then blends the resulting
-    # high-confidence candidates' mean feature into the prototype and
-    # re-scores -- repeated for `rounds` passes so the prototype drifts
-    # toward this specific video's own appearance of the target. Disabled by
-    # default: leaves the single-pass score computed above untouched.
-    dp = s3.dynamic_prototype
-    if dp.enabled:
-        for round_idx in range(dp.rounds):
-            adaptive_high_thresh = max(dp.high_conf_abs_floor, float(np.percentile(all_sims, dp.high_conf_percentile)))
-            high_conf_mask = all_sims >= adaptive_high_thresh
-            if int(high_conf_mask.sum()) < dp.min_support:
-                break
-
-            dynamic_feat = all_feats[high_conf_mask].mean(axis=0)
-            dynamic_feat = dynamic_feat / (np.linalg.norm(dynamic_feat) + 1e-8)
-
-            log.info(
-                "[Stage3] %s: dynamic prototype update round %d/%d -- adaptive threshold=%.3f "
-                "(percentile=%.0f), %d candidates, alpha=%.2f",
-                sample_id, round_idx + 1, dp.rounds, adaptive_high_thresh,
-                dp.high_conf_percentile, int(high_conf_mask.sum()), dp.alpha,
-            )
-
-            if use_multi_ref:
-                per_ref_features.append(dynamic_feat)
-                sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-                all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
-            else:
-                prototype = (1 - dp.alpha) * prototype + dp.alpha * dynamic_feat
-                prototype = prototype / (np.linalg.norm(prototype) + 1e-8)
-                all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
+    prototype, all_sims, per_ref_features = run_dynamic_prototype_rounds(
+        sample_id, all_feats, all_sims, prototype, per_ref_features,
+        use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
+    )
 
     # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;
     # already shown to hurt results (see docs/COLAB_KAGGLE_GUIDE.md), kept
