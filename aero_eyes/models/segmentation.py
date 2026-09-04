@@ -10,6 +10,8 @@ import logging
 import cv2
 import numpy as np
 
+from aero_eyes.types import Box
+
 log = logging.getLogger(__name__)
 
 
@@ -157,6 +159,86 @@ class MobileSAMSegmenter:
             urllib.request.urlretrieve(url, ckpt)
         except Exception as e:
             log.warning("MobileSAM download failed: %s", e)
+
+    def segment_box(
+        self, image_bgr: np.ndarray, box: Box, context_margin: float = 0.2,
+    ) -> tuple[np.ndarray | None, tuple[int, int] | None]:
+        """Refine an approximate `box` (from a detector or tracker) to a
+        tight mask, via SAM prompted with the box itself -- used to sharpen
+        imprecise detection/tracking boxes (see aero_eyes.utils.box_refine),
+        NOT for whole-photo reference segmentation (see segment() above,
+        which assumes a close-up centered subject and uses a different set
+        of heuristics tuned for that).
+
+        Unlike segment(), this crops a small PADDED region around `box`
+        first -- SAM's own image encoder then only runs on that small crop,
+        not the full video frame, so refining many boxes stays cheap. The
+        box is already a real (if imprecise) localization, so it's used
+        directly as the prompt -- no oracle guess needed, and no point
+        prompt (a box alone is a reliable enough anchor here, and avoids
+        the same center-pixel pitfall documented in __init__ for
+        ring/donut-shaped objects).
+
+        Returns (mask, crop_offset) where mask is HxW bool over the
+        CROPPED region and crop_offset=(x1,y1) locates that crop within
+        image_bgr -- or (None, None) if unavailable, inference fails, or
+        no plausible mask is found (caller should fall back to the
+        original box unchanged).
+        """
+        if not self._available:
+            return None, None
+
+        h, w = image_bgr.shape[:2]
+        bw, bh = box.x2 - box.x1, box.y2 - box.y1
+        if bw <= 0 or bh <= 0:
+            return None, None
+        mx, my = bw * context_margin, bh * context_margin
+        cx1 = max(0, int(box.x1 - mx))
+        cy1 = max(0, int(box.y1 - my))
+        cx2 = min(w, int(box.x2 + mx))
+        cy2 = min(h, int(box.y2 + my))
+        if cx2 <= cx1 or cy2 <= cy1:
+            return None, None
+        crop = image_bgr[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return None, None
+
+        try:
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            self._predictor.set_image(crop_rgb)
+
+            box_local = np.array([
+                box.x1 - cx1, box.y1 - cy1, box.x2 - cx1, box.y2 - cy1,
+            ])
+            masks, scores, _ = self._predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box_local,
+                multimask_output=True,
+            )
+            # No known-foreground point to anchor on (box-only prompt) --
+            # keep each candidate's largest connected component, same as
+            # segment()'s use_point_prompt=False path.
+            cleaned = [self._isolate_largest_component(m) for m in masks]
+            areas = [float(m.mean()) for m in cleaned]
+            border_touch = [self._border_touch_frac(m) for m in cleaned]
+            plausible = [
+                i for i in range(len(cleaned))
+                if self.min_area_frac <= areas[i] <= self.max_area_frac
+                and border_touch[i] <= self.max_border_touch_frac
+            ]
+            if not plausible:
+                return None, None
+            # Trust SAM's own predicted-IoU score here (unlike segment()'s
+            # "prefer largest among confident"): the box prompt already
+            # pins down roughly where and how big the object is, so there's
+            # far less risk of a high-scoring candidate being a bloated
+            # background-leaked blob than in the whole-photo case.
+            best_idx = max(plausible, key=lambda i: scores[i])
+            return cleaned[best_idx], (cx1, cy1)
+        except Exception as e:
+            log.warning("MobileSAM box-refine inference failed (%s).", e)
+            return None, None
 
     def segment(self, image_bgr: np.ndarray) -> np.ndarray:
         """Return a binary mask (HxW bool) for the primary foreground object.

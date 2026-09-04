@@ -151,6 +151,12 @@ def run_stage3(cfg, sample_id: str) -> Path:
         log.info("[Stage3] %s: using cached detections at %s", sample_id, det_path)
         return det_path
 
+    br_cfg = cfg.box_refine
+    box_refine_segmenter = None
+    if br_cfg.enabled and br_cfg.apply_in_stage3 and br_cfg.method == "sam":
+        from aero_eyes.models.segmentation import MobileSAMSegmenter
+        box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+
     # ---- Load prototype ----
     proto_path = work_dir / cfg.stage1.prototype.cache_name
     if not proto_path.exists():
@@ -307,18 +313,34 @@ def run_stage3(cfg, sample_id: str) -> Path:
             Detection(frame_idx=frame_idx, box=det.box, similarity=sim, source="detect")
             for det, sim in post_nms
         ]
-        detections[frame_idx] = result_dets
 
-        if cfg.runtime.save_visualizations and video_path:
+        needs_frame = (br_cfg.enabled and br_cfg.apply_in_stage3) or cfg.runtime.save_visualizations
+        frame_bgr = None
+        if needs_frame and video_path:
             try:
                 frame_bgr = read_frame(video_path, frame_idx)
-                vizmod.save_stage3_detections(
-                    frame_bgr, [d.box for d in result_dets],
-                    [d.similarity for d in result_dets],
-                    frame_idx, viz_dir,
-                )
             except Exception:
-                pass
+                frame_bgr = None
+
+        if br_cfg.enabled and br_cfg.apply_in_stage3 and frame_bgr is not None:
+            from aero_eyes.utils.box_refine import refine_box
+            result_dets = [
+                Detection(
+                    frame_idx=d.frame_idx,
+                    box=refine_box(br_cfg.method, frame_bgr, d.box, br_cfg.context_margin, segmenter=box_refine_segmenter),
+                    similarity=d.similarity, source=d.source,
+                )
+                for d in result_dets
+            ]
+
+        detections[frame_idx] = result_dets
+
+        if cfg.runtime.save_visualizations and frame_bgr is not None:
+            vizmod.save_stage3_detections(
+                frame_bgr, [d.box for d in result_dets],
+                [d.similarity for d in result_dets],
+                frame_idx, viz_dir,
+            )
 
     write_detections(detections, det_path, threshold=effective_threshold)
     elapsed = time.time() - t0

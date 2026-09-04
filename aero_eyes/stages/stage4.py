@@ -112,6 +112,20 @@ def run_stage4(cfg, sample_id: str) -> Path:
     s4 = cfg.stage4
     use_geco2 = cfg.pipeline.detector == "geco2"
 
+    # box_refine.apply_in_stage4 piggybacks on verify_interval's own cadence
+    # (frames_since_verify below) -- needs no DINOv2 prototype, so it's set
+    # up independently of the is_none_tracker/verify_interval extractor
+    # block further down.
+    br_cfg = cfg.box_refine
+    box_refine_active = (
+        br_cfg.enabled and br_cfg.apply_in_stage4
+        and s4.verify_interval > 0 and not is_none_tracker
+    )
+    box_refine_segmenter = None
+    if box_refine_active and br_cfg.method == "sam":
+        from aero_eyes.models.segmentation import MobileSAMSegmenter
+        box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+
     # For NoneTracker, we need proposal+matching on every frame. Which
     # detector backs re-detection must match whichever one produced
     # detections.json (legacy DINOv2+YOLO/FastSAM prototype vs GeCo2
@@ -250,18 +264,33 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     # max_track_age. 0 (default) = never runs, i.e. exactly
                     # the original conf/age-only logic.
                     if (track_ok and box is not None and s4.verify_interval > 0
-                            and extractor is not None and prototype is not None
                             and frames_since_verify >= s4.verify_interval):
                         frames_since_verify = 0
-                        if not _track_still_matches(
-                            frame_bgr, box, extractor, prototype,
-                            per_ref_features, cfg, match_threshold,
-                        ):
-                            log.debug(
-                                "[Stage4] frame %d: track failed re-verification "
-                                "(likely drifted) -- forcing re-detect", frame_idx,
+
+                        if extractor is not None and prototype is not None:
+                            if not _track_still_matches(
+                                frame_bgr, box, extractor, prototype,
+                                per_ref_features, cfg, match_threshold,
+                            ):
+                                log.debug(
+                                    "[Stage4] frame %d: track failed re-verification "
+                                    "(likely drifted) -- forcing re-detect", frame_idx,
+                                )
+                                track_ok = False
+
+                        # box_refine.apply_in_stage4 (opt-in, piggybacked on
+                        # this same verify_interval cadence): sharpen the
+                        # tracked box to the actual object silhouette and
+                        # re-anchor the tracker to it, independent of
+                        # whether the cosine re-verification above ran at
+                        # all (no DINOv2 prototype needed for this).
+                        if track_ok and box_refine_active:
+                            from aero_eyes.utils.box_refine import refine_box
+                            box = refine_box(
+                                br_cfg.method, frame_bgr, box, br_cfg.context_margin,
+                                segmenter=box_refine_segmenter,
                             )
-                            track_ok = False
+                            tracker.init(frame_bgr, box)
 
                     if track_ok:
                         box_out = box

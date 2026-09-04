@@ -815,6 +815,48 @@ class Stage123Geco2Config(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+class BoxRefineConfig(BaseModel):
+    """Sharpens an imprecise detection/tracking box to tightly fit the
+    actual object silhouette, via a lightweight per-box segmentation pass.
+    Addresses the "box not tight" (localization imprecision) component of
+    ST-IoU loss identified via scripts/check_st_iou_breakdown.py --
+    distinct from the tracking-COVERAGE component stage4.verify_interval
+    addresses (this doesn't help a box that's simply MISSING, only one
+    that IS present but loosely placed).
+
+    method:
+      sam      -- MobileSAM prompted directly with the box (reuses the
+                  same weights already used for Stage 1/GeCo2 reference
+                  segmentation, via stage1.segmentation.weights). Higher
+                  quality, costs one extra SAM forward pass per refined box.
+      grabcut  -- classic OpenCV GrabCut seeded from the box. No model, no
+                  weights, much cheaper, noticeably lower quality than SAM.
+
+    apply_in_stage3: refine the FINAL box Stage 3's cosine matching picked,
+      once per keyframe (see aero_eyes/stages/stage3.py) -- cheap (bounded
+      by keyframe count x topk_per_keyframe), safe to try first.
+    apply_in_stage4: ALSO refine periodically during Stage 4 tracking,
+      piggybacked on the SAME cadence as stage4.verify_interval (no
+      separate interval here -- only takes effect when
+      stage4.verify_interval > 0), re-initializing the tracker from the
+      refined box so both drift AND box shape get corrected together. More
+      expensive: runs during tracking, not just at keyframes.
+
+    Disabled by default -- boxes are used exactly as the detector/tracker
+    produced them, unchanged.
+    """
+    enabled: bool = False
+    method: Literal["sam", "grabcut"] = "sam"
+    # Padding kept around the original box, as a fraction of the box's own
+    # width/height, when cropping the region SAM/GrabCut segments -- gives
+    # the segmenter a bit of surrounding context instead of the box edge
+    # cutting through the object.
+    context_margin: float = 0.2
+    apply_in_stage3: bool = True
+    apply_in_stage4: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
 
@@ -831,6 +873,7 @@ class AeroEyesConfig(BaseModel):
     stage123_geco2: Stage123Geco2Config = Stage123Geco2Config()
     accuracy: AccuracyConfig = AccuracyConfig()
     eval: EvalConfig = EvalConfig()
+    box_refine: BoxRefineConfig = BoxRefineConfig()
 
     @model_validator(mode="after")
     def check_litetrack_path(self) -> "AeroEyesConfig":

@@ -380,6 +380,42 @@ def test_stage3_dynamic_prototype_produces_detections(cfg, synth_fixture):
     assert "frames" in data
 
 
+def test_stage3_box_refine_produces_detections(cfg, synth_fixture):
+    """Stage 3 with box_refine.enabled=True (method=grabcut, no model
+    needed) still runs to completion and writes valid detections.json --
+    covers the per-keyframe box-refinement wiring (reads the frame,
+    refines each surviving box, writes the refined boxes out)."""
+    cfg.box_refine.enabled = True
+    cfg.box_refine.method = "grabcut"
+    cfg.box_refine.apply_in_stage3 = True
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+    mock_prop = _mock_proposals()
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop):
+        from aero_eyes.stages.stage2 import run_stage2
+        run_stage2(cfg, FIXTURE_ID)
+
+    from aero_eyes.stages.stage3 import run_stage3
+    det_path = run_stage3(cfg, FIXTURE_ID)
+
+    assert det_path.exists(), f"detections.json not found at {det_path}"
+    with open(det_path) as f:
+        data = json.load(f)
+    assert "schema_version" in data
+    assert "frames" in data
+
+
 def test_pool_sims():
     """accuracy.cheap_boosters.multi_ref_pooling: 'mean' averages per-ref
     scores (diluted by a weak ref), 'max' keeps the single best-matching

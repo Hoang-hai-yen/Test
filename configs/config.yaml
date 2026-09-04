@@ -617,6 +617,28 @@ stage5:
   fill_short_gaps: 3         # linearly interpolate gaps <= this many frames
 
 # ----------------------------------------------------------------------------
+# BOX REFINE — sharpens an imprecise detection/tracking box to tightly fit
+# the actual object silhouette, via a per-box segmentation pass. Addresses
+# the "box not tight" (localization imprecision) part of ST-IoU loss (see
+# scripts/check_st_iou_breakdown.py) -- distinct from stage4.verify_interval,
+# which addresses tracking COVERAGE (a box that's simply missing), not
+# precision. Disabled by default.
+# ----------------------------------------------------------------------------
+box_refine:
+  enabled: false
+  method: sam                # "sam" (MobileSAM, higher quality, extra fwd pass)
+                              # | "grabcut" (no model, cheaper, lower quality)
+  context_margin: 0.2        # padding kept around the box when cropping to segment
+  # Refine the FINAL box Stage 3's cosine matching picked, once per
+  # keyframe -- cheap (bounded by keyframe count x topk_per_keyframe).
+  apply_in_stage3: true
+  # ALSO refine periodically during Stage 4 tracking, piggybacked on the
+  # SAME cadence as stage4.verify_interval (only takes effect when
+  # stage4.verify_interval > 0) -- re-inits the tracker from the refined
+  # box too. More expensive: runs during tracking, not just at keyframes.
+  apply_in_stage4: false
+
+# ----------------------------------------------------------------------------
 # ACCURACY MODE — progressively enables domain-gap mitigations.
 #   baseline       : single-scale, plain prototype
 #   cheap_boosters : multi-scale scan + tuned NMS/thresh + multi-ref averaging
