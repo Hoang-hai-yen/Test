@@ -34,14 +34,24 @@ gate would help.
 Also SIMULATES an agreement gate at a few floor values: a candidate's
 pooled score gets replaced by its own MIN per-ref score (a hard veto)
 whenever that min falls below the floor, and reports, at each floor, how
-many confuser-suspect candidates would drop below stage3.match_threshold
-vs how many GENUINE matches would ALSO get demoted (the gate's cost) --
-so you can pick a concrete multi_ref_pooling / floor setting backed by
-actual numbers on this dataset instead of guessing. This simulation uses
-the fixed stage3.match_threshold, not adaptive_threshold/dynamic_prototype's
-own re-scored threshold -- a deliberate simplification; see
-check_cosine_recall_loss.py if you need the exact Stage-3-replicated
-threshold instead.
+many confuser-suspect candidates would drop below the effective match
+threshold vs how many GENUINE matches would ALSO get demoted (the gate's
+cost) -- so you can pick a concrete multi_ref_pooling / floor setting
+backed by actual numbers on this dataset instead of guessing.
+
+The "effective match threshold" used for this simulation is read directly
+from detections.json (the ACTUAL bar Stage 3 last used -- adaptive_threshold's
+real per-video value when enabled, not stage3.match_threshold's static
+config default, which can be wildly irrelevant when adaptive_threshold is
+on: raw cosine scores from this project's ground-to-aerial domain gap can
+sit as low as ~0.05-0.15, while match_threshold's own default is 0.55).
+Falls back to stage3.match_threshold with a loud warning only if
+detections.json is missing or didn't record a threshold. Also note: like
+the per-ref scores above, this uses the ORIGINAL reference set only --
+dynamic_prototype's later rounds shift the real score distribution (and
+hence the real threshold) upward as rounds progress, so treat this as an
+approximation of the LAST round's regime, not an exact replay; see
+check_cosine_recall_loss.py for an exact Stage-3 replication instead.
 
 Read-only: does not touch detections.json/tracks.json/prototype.npz.
 Needs >=2 cached reference-image features (per_ref_features in
@@ -64,7 +74,7 @@ import numpy as np
 
 from aero_eyes.stages.stage3 import _pool_sims, _score_against_ref
 from aero_eyes.utils.geometry import box_iou
-from aero_eyes.utils.io import load_gt, read_prototype
+from aero_eyes.utils.io import load_gt, read_detections_threshold, read_prototype
 
 log = logging.getLogger(__name__)
 
@@ -186,21 +196,46 @@ def check_sample(
                     "with single-reference overfitting via multi_ref_pooling=max; an agreement "
                     "gate (see simulation below) is likely to help here."
                 )
+            elif l_spread_p50 > g_spread_p50 * 1.1:
+                print(
+                    f"  -> {label} candidates have a SOMEWHAT larger typical per-ref spread "
+                    f"({l_spread_p50:.3f}) than genuine matches ({g_spread_p50:.3f}) -- a real but "
+                    "modest effect; single-reference overfitting is probably only PART of the "
+                    "story here, not the whole explanation for these candidates' scores."
+                )
+            else:
+                print(
+                    f"  -> {label} candidates' typical per-ref spread ({l_spread_p50:.3f}) is NOT "
+                    f"meaningfully larger than genuine matches' ({g_spread_p50:.3f}) -- an "
+                    "agreement gate is unlikely to selectively filter these; the confuser is "
+                    "matching ALL references somewhat evenly, not overfitting to just one."
+                )
 
+    det_path = work_dir / "detections.json"
+    effective_threshold = read_detections_threshold(det_path) if det_path.exists() else None
+    if effective_threshold is None:
+        effective_threshold = s3.match_threshold
+        print(
+            f"  warning: could not read the real effective threshold from {det_path} "
+            "(missing, or Stage 3 didn't record one) -- falling back to the static "
+            f"stage3.match_threshold={s3.match_threshold:.3f}, which is almost certainly "
+            "WRONG if stage3.adaptive_threshold=true (the gate simulation below would then "
+            "compare against a threshold far from what Stage 3 actually used -- run Stage 3 "
+            "at least once for this sample first)."
+        )
     print(
         f"  simulated agreement gate (pooled score replaced by the candidate's own MIN "
         f"per-ref score whenever that min < floor -- vetoes a single-reference-only match; "
-        f"pass/fail measured against stage3.match_threshold={s3.match_threshold:.3f}, a "
-        "simplification that ignores adaptive_threshold/dynamic_prototype's own re-scoring):"
+        f"pass/fail measured against effective_threshold={effective_threshold:.3f}):"
     )
     confuser_idx = np.array(groups["unverifiable"] + groups["wrong_location"], dtype=int)
     genuine_idx = np.array(groups["genuine_match"], dtype=int)
     for floor in agreement_floors:
         gated = np.where(per_ref_min < floor, per_ref_min, pooled)
-        n_conf_before = int((pooled[confuser_idx] >= s3.match_threshold).sum()) if confuser_idx.size else 0
-        n_conf_after = int((gated[confuser_idx] >= s3.match_threshold).sum()) if confuser_idx.size else 0
-        n_gen_before = int((pooled[genuine_idx] >= s3.match_threshold).sum()) if genuine_idx.size else 0
-        n_gen_after = int((gated[genuine_idx] >= s3.match_threshold).sum()) if genuine_idx.size else 0
+        n_conf_before = int((pooled[confuser_idx] >= effective_threshold).sum()) if confuser_idx.size else 0
+        n_conf_after = int((gated[confuser_idx] >= effective_threshold).sum()) if confuser_idx.size else 0
+        n_gen_before = int((pooled[genuine_idx] >= effective_threshold).sum()) if genuine_idx.size else 0
+        n_gen_after = int((gated[genuine_idx] >= effective_threshold).sum()) if genuine_idx.size else 0
         print(
             f"    floor={floor:.2f}: confuser-suspects passing threshold {n_conf_before} -> {n_conf_after}  "
             f"|  genuine matches passing threshold {n_gen_before} -> {n_gen_after} "

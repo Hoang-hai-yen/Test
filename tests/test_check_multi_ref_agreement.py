@@ -46,12 +46,12 @@ def _write_candidates_and_feats(candidates: dict[int, list[Detection]], feats: l
     np.savez_compressed(str(path.with_suffix(".feats.npz")), features=np.stack(feats, axis=0))
 
 
-def _cfg(tmp_path, gt_path, pooling="max"):
+def _cfg(tmp_path, gt_path, pooling="max", match_threshold=0.5):
     from aero_eyes.config import AeroEyesConfig
     return AeroEyesConfig.model_validate({
         "project": {"work_dir": str(tmp_path / "runs")},
         "data": {"gt": {"global_file": str(gt_path)}},
-        "stage3": {"match_threshold": 0.5},
+        "stage3": {"match_threshold": match_threshold},
         "accuracy": {"cheap_boosters": {"multi_ref_pooling": pooling}},
     })
 
@@ -99,3 +99,62 @@ def test_confuser_shows_larger_spread_and_gate_demotes_it(tmp_path, capsys):
     # 0.6 -- still passes, unaffected (the gate's "cost" is zero here by construction).
     assert "floor=0.50: confuser-suspects passing threshold 1 -> 0" in out
     assert "genuine matches passing threshold 1 -> 1" in out
+    # no detections.json in this scenario -- must fall back to stage3.match_threshold
+    # with a loud warning, not silently use a wrong/undefined threshold.
+    assert "warning: could not read the real effective threshold" in out
+
+
+def test_uses_real_effective_threshold_from_detections_json_not_static_config(tmp_path, capsys):
+    """Regression test for a real bug: stage3.match_threshold is IRRELEVANT
+    when stage3.adaptive_threshold is what Stage 3 actually used (raw
+    cosine scores can sit far below match_threshold's static default in
+    this project's ground-to-aerial domain gap) -- the gate simulation
+    must compare against the REAL threshold Stage 3 recorded in
+    detections.json, not silently use the static config value, or every
+    number in the simulation is meaningless (observed in practice: an
+    all-zeros simulation when match_threshold=0.55 was used against
+    scores that never exceed ~0.15)."""
+    from aero_eyes.utils.io import write_detections
+
+    from scripts.check_multi_ref_agreement import check_sample
+
+    sample_id = "synth_sample"
+    gt_box = Box(0, 0, 10, 10)
+    gt_path = _gt_file(tmp_path, sample_id, {0: gt_box})
+    # Deliberately wrong/irrelevant static default -- nothing in this
+    # scenario would ever pass it.
+    cfg = _cfg(tmp_path, gt_path, pooling="max", match_threshold=0.95)
+
+    work_dir = tmp_path / "runs" / sample_id
+    ref_a = np.array([1.0, 0.0], dtype=np.float32)
+    ref_b = np.array([0.0, 1.0], dtype=np.float32)
+    write_prototype(np.array([0.7, 0.7], dtype=np.float32), {}, [ref_a, ref_b], work_dir / "prototype.npz")
+
+    genuine_box = gt_box
+    confuser_box = Box(500, 500, 510, 510)
+    candidates = {
+        0: [Detection(frame_idx=0, box=genuine_box, similarity=0.0, source="detect")],
+        1: [Detection(frame_idx=1, box=confuser_box, similarity=0.0, source="detect")],
+    }
+    genuine_feat = np.array([0.6, 0.6], dtype=np.float32)
+    confuser_feat = np.array([0.9, 0.05], dtype=np.float32)
+    _write_candidates_and_feats(candidates, [genuine_feat, confuser_feat], work_dir / "candidates.json")
+
+    # detections.json records the REAL effective threshold Stage 3 actually
+    # used (e.g. adaptive_threshold's own computed value) -- 0.5, nothing
+    # like the static config's 0.95.
+    write_detections(
+        {0: [Detection(frame_idx=0, box=genuine_box, similarity=0.6, source="detect")]},
+        work_dir / "detections.json", threshold=0.5,
+    )
+
+    check_sample(cfg, sample_id, iou_threshold=0.5, agreement_floors=(0.0, 0.5))
+
+    out = capsys.readouterr().out
+    assert "effective_threshold=0.500" in out
+    assert "warning: could not read the real effective threshold" not in out
+    # Same pass/fail pattern as the 0.5-threshold test above -- proves 0.5
+    # (from detections.json) was used, NOT the static 0.95 (which would
+    # have produced "0 -> 0" for everything, the exact bug observed).
+    assert "floor=0.00: confuser-suspects passing threshold 1 -> 1" in out
+    assert "floor=0.50: confuser-suspects passing threshold 1 -> 0" in out
