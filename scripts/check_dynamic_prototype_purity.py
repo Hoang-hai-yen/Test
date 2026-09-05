@@ -19,14 +19,31 @@ a purity score. A dropping purity across rounds is a warning sign of
 drift; a round with 0% purity (while non-empty) most likely selected a
 confuser.
 
-Read-only: does not touch detections.json/tracks.json/prototype.npz, does
-not write anything. Ground truth must be available (this is a dev/eval
+Read-only by default: does not touch detections.json/tracks.json/
+prototype.npz. Ground truth must be available (this is a dev/eval
 diagnostic, not something you'd run on unlabeled inference data).
+
+--export-crops (off by default, opt-in -- same convention as every other
+box_refine/verify_interval-style feature in this project: existing
+behavior is unchanged unless you explicitly ask for the new one) also
+saves an actual image crop of every candidate box each round selected as
+"high-confidence" (the ones that get blended into the prototype), so you
+can eyeball whether they're really the target object instead of only
+trusting the numeric IoU-vs-GT purity score above. Written to
+--export-dir (default: <work_dir>/<sample_id>/diagnostics/
+dynamic_prototype_crops/round_<N>/), one file per exported candidate,
+named frame<idx>_cand<local index>[_iou<gt iou>].jpg -- the _iou suffix is
+only present on frames where GT exists, so a quick sort/glance at
+filenames already flags the wrong ones. Rounds with more than
+--max-crops-per-round selections are evenly subsampled (not just the
+first N) so the exported set still spans the whole video instead of only
+its early frames.
 
 Usage:
     python -m scripts.check_dynamic_prototype_purity --config configs/config.yaml --sample BlackBox_0
     python -m scripts.check_dynamic_prototype_purity --config configs/config.yaml --iou-threshold 0.3
     python -m scripts.check_dynamic_prototype_purity --config configs/config.yaml   # all samples
+    python -m scripts.check_dynamic_prototype_purity --config configs/config.yaml --sample BlackBox_0 --export-crops
 """
 from __future__ import annotations
 
@@ -43,7 +60,11 @@ from aero_eyes.utils.io import load_gt, read_prototype
 log = logging.getLogger(__name__)
 
 
-def check_sample(cfg, sample_id: str, iou_threshold: float) -> None:
+def check_sample(
+    cfg, sample_id: str, iou_threshold: float,
+    export_crops: bool = False, export_dir: Path | None = None,
+    max_crops_per_round: int = 40,
+) -> None:
     from aero_eyes.stages.stage2 import read_candidates_with_features
 
     work_dir = Path(cfg.project.work_dir) / sample_id
@@ -103,6 +124,57 @@ def check_sample(cfg, sample_id: str, iou_threshold: float) -> None:
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
 
+    video_path = None
+    frame_cache: dict[int, object] = {}
+    if export_crops:
+        data_root = Path(cfg.data.data_root)
+        video_files = list((data_root / sample_id).glob(cfg.data.video_glob))
+        if video_files:
+            video_path = video_files[0]
+        else:
+            print(f"  warning: --export-crops requested but no video found under "
+                  f"{data_root / sample_id} -- crop export skipped.")
+
+    def _get_frame(frame_idx: int):
+        if frame_idx not in frame_cache:
+            from aero_eyes.utils.video import read_frame
+            try:
+                frame_cache[frame_idx] = read_frame(video_path, frame_idx)
+            except Exception:
+                frame_cache[frame_idx] = None
+        return frame_cache[frame_idx]
+
+    def _export_round_crops(round_idx: int, selected: np.ndarray) -> None:
+        import cv2
+
+        if len(selected) > max_crops_per_round:
+            pick = np.linspace(0, len(selected) - 1, max_crops_per_round).round().astype(int)
+            targets = selected[pick]
+        else:
+            targets = selected
+
+        round_dir = (export_dir or (work_dir / "diagnostics" / "dynamic_prototype_crops")) / f"round_{round_idx + 1}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        n_written = 0
+        for local_idx, idx in enumerate(targets.tolist()):
+            fi = all_frame_idxs[idx]
+            frame_bgr = _get_frame(fi)
+            if frame_bgr is None:
+                continue
+            box = all_dets[idx].box
+            h, w = frame_bgr.shape[:2]
+            x1, y1 = int(max(0, box.x1)), int(max(0, box.y1))
+            x2, y2 = int(min(w, box.x2)), int(min(h, box.y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame_bgr[y1:y2, x1:x2]
+            iou_tag = f"_iou{box_iou(gt[fi], box):.2f}" if fi in gt else ""
+            fname = f"frame{fi}_cand{local_idx:03d}{iou_tag}.jpg"
+            cv2.imwrite(str(round_dir / fname), crop)
+            n_written += 1
+        print(f"    exported {n_written}/{len(selected)} crop(s) to {round_dir} "
+              f"({'evenly subsampled' if len(selected) > max_crops_per_round else 'all'})")
+
     rounds_seen = 0
 
     def on_round(round_idx: int, high_conf_mask: np.ndarray, threshold: float) -> None:
@@ -133,6 +205,9 @@ def check_sample(cfg, sample_id: str, iou_threshold: float) -> None:
                 f"did NOT match the real object (IoU<{iou_threshold}) -- possible confuser drift."
             )
 
+        if export_crops and video_path is not None:
+            _export_round_crops(round_idx, selected)
+
     run_dynamic_prototype_rounds(
         sample_id, all_feats, all_sims, prototype, per_ref_features,
         use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
@@ -162,6 +237,16 @@ def main():
     p.add_argument("--set", action="append", default=[])
     p.add_argument("--iou-threshold", type=float, default=0.5,
                     help="IoU >= this counts as a correct pick (default: 0.5)")
+    p.add_argument("--export-crops", action="store_true",
+                    help="Off by default. Also save an image crop of every candidate box "
+                    "each round selected as high-confidence, so you can eyeball them instead "
+                    "of only trusting the numeric purity score above.")
+    p.add_argument("--export-dir", default=None,
+                    help="Where to write crops (default: <work_dir>/<sample_id>/diagnostics/"
+                    "dynamic_prototype_crops/). Only used with --export-crops.")
+    p.add_argument("--max-crops-per-round", type=int, default=40,
+                    help="Cap on exported crops per round -- evenly subsampled across the "
+                    "video if a round selected more than this (default: 40).")
     args = p.parse_args()
 
     from aero_eyes.config import load_config
@@ -174,7 +259,12 @@ def main():
         sample_ids = [d.name for d in sorted(data_root.iterdir()) if d.is_dir()]
 
     for sid in sample_ids:
-        check_sample(cfg, sid, args.iou_threshold)
+        export_dir = Path(args.export_dir) / sid if args.export_dir else None
+        check_sample(
+            cfg, sid, args.iou_threshold,
+            export_crops=args.export_crops, export_dir=export_dir,
+            max_crops_per_round=args.max_crops_per_round,
+        )
 
 
 if __name__ == "__main__":
