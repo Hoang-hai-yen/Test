@@ -5,9 +5,11 @@ a full pipeline re-run can never be silently confused with "the feature
 does nothing".
 
 Reads detections.json + the video + ground truth, and re-applies
-box_refine.* from the CURRENT config -- via the EXACT SAME
-aero_eyes.utils.box_refine.refine_box() call Stage 3 itself uses -- to
-every box that has a frame with GT available. Does not touch or depend on
+box_refine.* from the CURRENT config -- via the EXACT SAME dispatch Stage 3
+itself uses (refine_box() per box for "sam"/"grabcut"; refine_boxes_dense()
+per FRAME for "sam_dense"; GeCo2Detector.sam2_refine_boxes()+apply_iou_gate
+per frame for "sam2_dense") -- to every box that has a frame with GT
+available. Does not touch or depend on
 any cached detections.json/tracks.json from a previous box_refine setting;
 always reflects whatever box_refine.* is set to right now.
 
@@ -96,13 +98,23 @@ def check_sample(cfg, sample_id: str) -> None:
 
     br_cfg = cfg.box_refine
     segmenter = None
-    if br_cfg.method == "sam":
+    geco2_detector = None
+    geco2_prototype = None
+    if br_cfg.method in ("sam", "sam_dense"):
         from aero_eyes.models.segmentation import MobileSAMSegmenter
         segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
         if not segmenter._available:
             print("  warning: MobileSAM unavailable (weights missing/failed to load) -- "
                   "every box will silently fall back UNCHANGED. This alone can explain "
                   "a full pipeline run showing zero effect.")
+    elif br_cfg.method == "sam2_dense":
+        from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
+        geco2_detector, geco2_prototype = load_geco2_detector_and_prototype(cfg, work_dir)
+        if geco2_detector is None:
+            print(f"  warning: box_refine.method=sam2_dense but no "
+                  f"{cfg.stage123_geco2.prototype_cache_name} found under {work_dir} -- "
+                  "every box will silently fall back UNCHANGED (needs Stage 1+2's GeCo2 "
+                  "exemplar cache -- see stage123_geco2.py).")
 
     n_total = n_changed = 0
     n_better = n_worse = n_same = 0
@@ -129,13 +141,32 @@ def check_sample(cfg, sample_id: str) -> None:
         except Exception:
             continue
 
-        for det in dets:
+        original_boxes = [det.box for det in dets]
+        if br_cfg.method == "sam_dense":
+            from aero_eyes.utils.box_refine import refine_boxes_dense
+            refined_boxes = refine_boxes_dense(
+                segmenter, frame_bgr, original_boxes,
+                min_iou_with_original=br_cfg.min_iou_with_original,
+            )
+        elif br_cfg.method == "sam2_dense":
+            if geco2_detector is not None:
+                from aero_eyes.utils.box_refine import apply_iou_gate
+                refined_boxes = geco2_detector.sam2_refine_boxes(frame_bgr, geco2_prototype, original_boxes)
+                refined_boxes = apply_iou_gate(refined_boxes, original_boxes, br_cfg.min_iou_with_original)
+            else:
+                refined_boxes = original_boxes
+        else:
+            refined_boxes = [
+                refine_box(
+                    br_cfg.method, frame_bgr, box, br_cfg.context_margin,
+                    segmenter=segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
+                )
+                for box in original_boxes
+            ]
+
+        for det, refined in zip(dets, refined_boxes):
             n_total += 1
             iou_before = box_iou(gt_box, det.box)
-            refined = refine_box(
-                br_cfg.method, frame_bgr, det.box, br_cfg.context_margin,
-                segmenter=segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
-            )
             changed = (
                 refined.x1 != det.box.x1 or refined.y1 != det.box.y1
                 or refined.x2 != det.box.x2 or refined.y2 != det.box.y2
