@@ -108,11 +108,22 @@ def check_sample(cfg, sample_id: str) -> None:
     n_better = n_worse = n_same = 0
     iou_before_sum = 0.0
     iou_after_sum = 0.0
+    # Tests a second hypothesis, independent of "is the refined mask
+    # accurate": maybe GT boxes are drawn LOOSER than the object's true
+    # silhouette (annotators commonly leave some margin), so ANY method
+    # that tightens toward the true silhouette (SAM or GrabCut alike) gets
+    # penalized on IoU-vs-GT even when it's geometrically more correct --
+    # which would explain why two very different refinement mechanisms
+    # both come out "worse" (a shared cause, not two independent bugs).
+    area_ratio_before_sum = 0.0
+    area_ratio_after_sum = 0.0
+    n_area = 0
 
     for frame_idx, dets in detections.items():
         if frame_idx not in gt:
             continue  # can only judge refinement quality where GT exists
         gt_box = gt[frame_idx]
+        gt_area = gt_box.area()
         try:
             frame_bgr = read_frame(video_path, frame_idx)
         except Exception:
@@ -141,6 +152,11 @@ def check_sample(cfg, sample_id: str) -> None:
             else:
                 n_same += 1
 
+            if gt_area > 0:
+                n_area += 1
+                area_ratio_before_sum += det.box.area() / gt_area
+                area_ratio_after_sum += refined.area() / gt_area
+
     if n_total == 0:
         print("  no GT-checkable boxes found (no detections.json frame overlaps GT) -- nothing to report.")
         return
@@ -159,6 +175,21 @@ def check_sample(cfg, sample_id: str) -> None:
         f"WORSE={n_worse} ({100.0 * n_worse / n_total:.0f}%)  "
         f"SAME_IOU={n_same - (n_total - n_changed)} (changed but IoU tied)"
     )
+    if n_area > 0:
+        ratio_before = area_ratio_before_sum / n_area
+        ratio_after = area_ratio_after_sum / n_area
+        print(
+            f"  Mean box-area / GT-area ratio: before={ratio_before:.2f} -> after={ratio_after:.2f} "
+            "(1.0 = same size as GT; <1 = tighter/smaller than GT; >1 = looser/larger than GT)"
+        )
+        if ratio_after < ratio_before and ratio_after < 0.85:
+            print(
+                "  -> refined boxes are shrinking noticeably smaller than GT's own size. If GT "
+                "boxes were drawn with margin around the object (common in manual annotation), "
+                "a geometrically MORE ACCURATE (tighter) box will still score LOWER IoU against "
+                "a looser GT box -- this would explain why refinement looks harmful even if the "
+                "segmentation itself isn't wrong."
+            )
     if n_worse > n_better:
         print(
             "  -> box_refine is making localization WORSE on this sample more often than "
