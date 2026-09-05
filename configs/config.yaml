@@ -624,11 +624,46 @@ stage5:
 # which addresses tracking COVERAGE (a box that's simply missing), not
 # precision. Disabled by default.
 # ----------------------------------------------------------------------------
+# IMPORTANT (measured on this project's 6 labeled samples, not just
+# theoretical): whether ANY box_refine method helps or hurts ST-IoU depends
+# on whether the ORIGINAL box already runs larger or smaller than its GT box
+# on that particular video -- shrinking an already-undersized box makes it
+# worse; shrinking an oversized one helps. There is no way to know that
+# direction at real inference time (no GT then). See
+# scripts/check_box_size_bias.py and check_box_refine_effect.py before
+# trusting this on a new dataset -- method="sam" came out roughly
+# NET-NEUTRAL averaged across this project's samples (helped 3, hurt 3).
 box_refine:
   enabled: false
-  method: sam                # "sam" (MobileSAM, higher quality, extra fwd pass)
-                              # | "grabcut" (no model, cheaper, lower quality)
-  context_margin: 0.2        # padding kept around the box when cropping to segment
+  # sam        -- MobileSAM prompted with a small CROP around the box.
+  #               Empirically unreliable on small/low-res candidate boxes
+  #               (as small as ~20x10px) -- crop is too tiny for SAM to
+  #               segment consistently. Kept for comparison.
+  # sam_dense  -- MobileSAM, but encodes the WHOLE frame ONCE (no crop) and
+  #               reuses that embedding for every box on it -- same
+  #               "encode once, reuse for every box" principle GeCo2's own
+  #               SAM2-based sam_mask module uses on its dense backbone
+  #               features (GeCo2's Hiera features aren't compatible with
+  #               MobileSAM's SAM1-style decoder, so this re-encodes with
+  #               MobileSAM's own encoder instead of needing a separate
+  #               SAM2 checkpoint). Avoids "sam"'s small-crop problem;
+  #               usually cheaper too when topk_per_keyframe > 1.
+  # grabcut    -- classic OpenCV GrabCut seeded from the box. No model, no
+  #               weights, much cheaper, noticeably lower quality than
+  #               either SAM method.
+  # sam2_dense -- GeCo2's OWN SAM2-based mask refinement
+  #               (GECO2/models/sam_mask.py::MaskProcessor -- the same
+  #               submodule CNT.forward calls internally but this pipeline's
+  #               detect_frame() otherwise skips). Only usable when a GeCo2
+  #               exemplar prototype cache exists (see
+  #               stage123_geco2.prototype_cache_name). Refines using
+  #               GeCo2's OWN dense Hiera features -- no crop/second
+  #               encoder needed -- at the cost of one extra GeCo2 backbone
+  #               pass per refined frame and a one-time ~300+MB download of
+  #               Meta's public pretrained SAM2 checkpoint. Not yet
+  #               benchmarked on this project's dataset the way "sam" was.
+  method: sam                # "sam" | "sam_dense" | "grabcut" | "sam2_dense"
+  context_margin: 0.2        # padding kept around the box when cropping to segment (ignored by sam_dense/sam2_dense)
   # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box falls
   # below this -- guards against the segmenter latching onto a sub-part,
   # a nearby confuser, or background clutter within the padded crop

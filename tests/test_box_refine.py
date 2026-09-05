@@ -9,7 +9,9 @@ import pytest
 cv2 = pytest.importorskip("cv2", reason="opencv-python not importable", exc_type=ImportError)
 
 from aero_eyes.types import Box
-from aero_eyes.utils.box_refine import refine_box, refine_box_with_grabcut, refine_box_with_sam
+from aero_eyes.utils.box_refine import (
+    apply_iou_gate, refine_box, refine_box_with_grabcut, refine_box_with_sam, refine_boxes_dense,
+)
 
 
 def _synthetic_frame(size: int = 120) -> np.ndarray:
@@ -127,7 +129,7 @@ def test_refine_box_dispatcher_routes_by_method():
 def test_refine_box_unknown_method_raises():
     frame = _synthetic_frame()
     box = Box(35, 35, 85, 85)
-    with pytest.raises(ValueError, match="Unknown box_refine.method"):
+    with pytest.raises(ValueError, match="Unknown or unsupported box_refine.method"):
         refine_box("nearest-neighbor", frame, box, context_margin=0.2)
 
 
@@ -183,3 +185,93 @@ def test_refine_box_min_iou_gate_accepts_a_genuine_tightening():
         segmenter=_TighteningSegmenter(), min_iou_with_original=0.3,
     )
     assert (refined.x1, refined.y1, refined.x2, refined.y2) == (25.0, 25.0, 95.0, 95.0)
+
+
+class _DenseSegmenter:
+    """Fake segmenter for refine_boxes_dense: set_frame() must be called
+    exactly ONCE (records call count), segment_box_cached() returns a
+    fixed full-frame mask per box (independent of which box, to isolate
+    testing "one encode, N box calls" from mask-selection logic)."""
+
+    def __init__(self, mask=None, set_frame_ok: bool = True):
+        self.set_frame_calls = 0
+        self.mask = mask
+        self._set_frame_ok = set_frame_ok
+
+    def set_frame(self, frame_bgr):
+        self.set_frame_calls += 1
+        return self._set_frame_ok
+
+    def segment_box_cached(self, box):
+        return self.mask
+
+
+def test_refine_boxes_dense_encodes_frame_once_for_all_boxes():
+    frame = _synthetic_frame()
+    boxes = [Box(30, 30, 90, 90), Box(10, 10, 50, 50), Box(60, 60, 100, 100)]
+
+    mask = np.zeros((120, 120), dtype=bool)
+    mask[40:80, 40:80] = True  # tight bbox = (40,40,80,80) for every box
+    segmenter = _DenseSegmenter(mask=mask)
+
+    refined = refine_boxes_dense(segmenter, frame, boxes, min_iou_with_original=0.0)
+
+    assert segmenter.set_frame_calls == 1  # ONE shared encode, not one per box
+    assert len(refined) == 3
+    for r in refined:
+        assert (r.x1, r.y1, r.x2, r.y2) == (40.0, 40.0, 80.0, 80.0)
+
+
+def test_refine_boxes_dense_falls_back_when_set_frame_fails():
+    frame = _synthetic_frame()
+    boxes = [Box(30, 30, 90, 90), Box(10, 10, 50, 50)]
+    segmenter = _DenseSegmenter(set_frame_ok=False)
+
+    refined = refine_boxes_dense(segmenter, frame, boxes, min_iou_with_original=0.0)
+    assert refined == boxes  # unchanged, in original order
+
+
+def test_refine_boxes_dense_none_segmenter_falls_back():
+    frame = _synthetic_frame()
+    boxes = [Box(30, 30, 90, 90)]
+    refined = refine_boxes_dense(None, frame, boxes, min_iou_with_original=0.0)
+    assert refined == boxes
+
+
+def test_refine_boxes_dense_min_iou_gate_applies_per_box():
+    """The gate is checked independently for each box -- a box whose
+    shared mask overlaps it well is accepted, one whose mask barely
+    overlaps it is rejected and kept unchanged."""
+    frame = _synthetic_frame()
+    near_box = Box(35, 35, 85, 85)     # overlaps the mask's bbox (40,40,80,80) well
+    far_box = Box(0, 0, 5, 5)          # nowhere near the mask's bbox
+
+    mask = np.zeros((120, 120), dtype=bool)
+    mask[40:80, 40:80] = True
+    segmenter = _DenseSegmenter(mask=mask)
+
+    refined = refine_boxes_dense(segmenter, frame, [near_box, far_box], min_iou_with_original=0.3)
+
+    assert (refined[0].x1, refined[0].y1, refined[0].x2, refined[0].y2) == (40.0, 40.0, 80.0, 80.0)
+    assert refined[1] is far_box  # rejected by the gate, unchanged
+
+
+def test_apply_iou_gate_keeps_good_overlap_rejects_poor_overlap():
+    """apply_iou_gate is box_refine.method="sam2_dense"'s equivalent of the
+    gate baked into refine_box/refine_boxes_dense -- since GeCo2Detector.
+    sam2_refine_boxes can't route through this module's segmenter-based
+    dispatch (it needs live GeCo2 model state), it applies this shared
+    helper itself afterward."""
+    original = [Box(0, 0, 10, 10), Box(0, 0, 10, 10)]
+    refined = [Box(1, 1, 9, 9), Box(50, 50, 60, 60)]  # good overlap, no overlap
+
+    gated = apply_iou_gate(refined, original, min_iou_with_original=0.3)
+
+    assert gated[0] is refined[0]
+    assert gated[1] is original[1]
+
+
+def test_apply_iou_gate_noop_when_threshold_is_zero():
+    refined = [Box(50, 50, 60, 60)]
+    original = [Box(0, 0, 10, 10)]
+    assert apply_iou_gate(refined, original, min_iou_with_original=0.0) is refined

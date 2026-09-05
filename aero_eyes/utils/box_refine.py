@@ -123,15 +123,81 @@ def refine_box(
     returns.
 
     `segmenter` is required (and used) only for 'sam' -- ignored otherwise.
+    Does NOT handle 'sam_dense' -- that method needs one shared MobileSAM
+    frame encoding across multiple boxes, so it's driven by
+    refine_boxes_dense() instead (call sites loop per FRAME, not per box).
     """
     if method == "sam":
         refined = refine_box_with_sam(segmenter, frame_bgr, box, context_margin)
     elif method == "grabcut":
         refined = refine_box_with_grabcut(frame_bgr, box, context_margin)
     else:
-        raise ValueError(f"Unknown box_refine.method '{method}'. Must be 'sam' or 'grabcut'.")
+        raise ValueError(
+            f"Unknown or unsupported box_refine.method '{method}' for refine_box(). "
+            "Must be 'sam' or 'grabcut' -- 'sam_dense' uses refine_boxes_dense() instead."
+        )
 
     if min_iou_with_original > 0.0 and refined is not box:
         if box_iou(refined, box) < min_iou_with_original:
             return box
     return refined
+
+
+def apply_iou_gate(
+    refined_boxes: list[Box], original_boxes: list[Box], min_iou_with_original: float,
+) -> list[Box]:
+    """Shared version of refine_box()/refine_boxes_dense()'s own
+    min_iou_with_original safety gate, for callers that produce refined
+    boxes through a mechanism other than refine_box_with_sam/grabcut --
+    e.g. GeCo2Detector.sam2_refine_boxes (box_refine.method="sam2_dense"),
+    which needs GeCo2's own model state and so can't be driven through
+    this module's segmenter-based dispatch. `refined_boxes` and
+    `original_boxes` must be the same length and in the same order; for
+    each pair, keeps the refined box only if its IoU with the original is
+    >= min_iou_with_original (0.0 = no gate, accept every refined box
+    as-is)."""
+    if min_iou_with_original <= 0.0:
+        return refined_boxes
+    return [
+        refined if box_iou(refined, original) >= min_iou_with_original else original
+        for refined, original in zip(refined_boxes, original_boxes)
+    ]
+
+
+def refine_boxes_dense(
+    segmenter, frame_bgr, boxes: list[Box], min_iou_with_original: float = 0.0,
+) -> list[Box]:
+    """box_refine.method == "sam_dense": refine every box in `boxes` (all
+    on the SAME frame) using ONE shared MobileSAM image encoding, instead
+    of a separate crop+re-encode per box (refine_box_with_sam) -- avoids
+    the small/low-res crop reliability problem confirmed in practice on
+    tiny detection boxes, by giving the encoder full spatial context (the
+    same "encode once, reuse for every box prompt" principle GeCo2's own
+    SAM2-based sam_mask module uses on its own dense backbone features --
+    see MobileSAMSegmenter.set_frame's docstring for why MobileSAM can't
+    literally reuse GeCo2's own features and needs its own encode instead).
+
+    Applies the same min_iou_with_original safety gate as refine_box() to
+    each box independently. Falls back to returning `boxes` UNCHANGED
+    (never raises) if `segmenter` is None or the frame encoding fails.
+    """
+    if segmenter is None or not segmenter.set_frame(frame_bgr):
+        return boxes
+
+    refined_boxes: list[Box] = []
+    for box in boxes:
+        mask = segmenter.segment_box_cached(box)
+        if mask is None:
+            refined_boxes.append(box)
+            continue
+        tight = mask_bbox(mask)
+        if tight is None:
+            refined_boxes.append(box)
+            continue
+        x1, y1, x2, y2 = tight
+        candidate = Box(x1, y1, x2, y2, score=box.score)
+        if min_iou_with_original > 0.0 and box_iou(candidate, box) < min_iou_with_original:
+            refined_boxes.append(box)
+        else:
+            refined_boxes.append(candidate)
+    return refined_boxes

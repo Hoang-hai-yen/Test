@@ -22,9 +22,17 @@ the token/sequence dimension before being handed to the cross-attention
 adapter (adapt_features only ever attends over these as a flat KV sequence,
 so token count does not need to match any particular "num_objects").
 
-SAM2-based mask refinement (CNT.sam_mask) is intentionally NOT used here --
-aero_eyes only needs boxes, and skipping it avoids an extra heavy pass per
-keyframe.
+SAM2-based mask refinement (CNT.sam_mask) is skipped by detect_frame() by
+default -- aero_eyes only needs boxes, and skipping it avoids an extra
+heavy pass per keyframe. It's available opt-in as box_refine.method=
+"sam2_dense" (see sam2_refine_boxes below and aero_eyes/utils/box_refine.py),
+which reuses GeCo2's OWN dense backbone features (the SAME Hiera pass that
+scored the boxes) to refine already-chosen boxes via GECO2's own
+GECO2/models/sam_mask.py::MaskProcessor -- unlike this module's MobileSAM-
+based box_refine methods ("sam"/"sam_dense"), no separate crop or
+re-encode is needed, at the cost of one extra GeCo2 backbone forward pass
+per refined frame (feats aren't cached across calls; see
+sam2_refine_boxes's docstring).
 
 Requires the GECO2 repo's own dependencies (hydra-core, omegaconf, iopath,
 its vendored sam2 package) to be installed, and pretrained weights
@@ -95,6 +103,12 @@ class GeCo2Detector:
         self.nms_iou = g.nms_iou
         self.topk_per_keyframe = g.topk_per_keyframe
         self.use_shape_token = g.use_shape_token
+        self.emb_dim = g.emb_dim
+        self.reduction = g.reduction
+        # Lazily built by sam2_refine_boxes on first use (downloads GECO2's
+        # own pretrained SAM2 checkpoint) -- False (not None) once a build
+        # attempt has failed, so it isn't retried every call.
+        self._mask_processor = None
 
         args = _GeCo2Args(
             image_size=g.image_size,
@@ -247,7 +261,11 @@ class GeCo2Detector:
         half of CNT.forward on one frame, cross-attend with the precomputed
         exemplar tokens, and return the RAW (unfiltered) dense predictions.
         Returns (pred_boxes [N,4] normalized xyxy in padded canvas, box_v
-        [N] raw score, scale).
+        [N] raw score, scale, feats) -- feats is the raw backbone output
+        dict (m.backbone(x): vision_features/backbone_fpn/vision_pos_enc),
+        needed by sam2_refine_boxes to run GECO2's own SAM2 mask_decoder on
+        this SAME forward pass without re-running the backbone a second
+        time; every other caller ignores it.
         """
         from utils.box_ops import boxes_with_scores  # GECO2/utils/box_ops.py
 
@@ -274,7 +292,7 @@ class GeCo2Detector:
         centerness = m.class_embed(adapted_f).view(bs, w, h, 1).permute(0, 3, 1, 2)
         outputs_coord = m.bbox_embed(adapted_f).sigmoid().view(bs, w, h, 4).permute(0, 3, 1, 2)
         outputs, _ = boxes_with_scores(centerness, outputs_coord, sort=False, validate=True)
-        return outputs[0]["pred_boxes"], outputs[0]["box_v"], scale
+        return outputs[0]["pred_boxes"], outputs[0]["box_v"], scale, feats
 
     @torch.no_grad()
     def raw_scores(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> np.ndarray:
@@ -291,7 +309,7 @@ class GeCo2Detector:
         "nothing here" -- it always keeps at least the single highest-
         scoring point.
         """
-        _, box_v, _ = self._forward_scores(frame_bgr, prototype)
+        _, box_v, _, _ = self._forward_scores(frame_bgr, prototype)
         return box_v.cpu().numpy()
 
     @torch.no_grad()
@@ -308,7 +326,8 @@ class GeCo2Detector:
         two-pass shape as stage3.py's own adaptive_threshold, applied to
         GeCo2's score instead of DINOv2 cosine similarity.
         """
-        return self._forward_scores(frame_bgr, prototype)
+        pred_boxes, box_v, scale, _ = self._forward_scores(frame_bgr, prototype)
+        return pred_boxes, box_v, scale
 
     def filter_boxes_by_threshold(
         self,
@@ -375,7 +394,7 @@ class GeCo2Detector:
         stage123_geco2.global_adaptive_threshold for a whole-video
         alternative to this per-frame-relative decision.
         """
-        pred_boxes, box_v, scale = self._forward_scores(frame_bgr, prototype)
+        pred_boxes, box_v, scale, _ = self._forward_scores(frame_bgr, prototype)
         if pred_boxes.numel() == 0:
             return []
 
@@ -385,6 +404,110 @@ class GeCo2Detector:
 
         threshold = max_score * self.score_threshold_ratio
         return self.filter_boxes_by_threshold(pred_boxes, box_v, scale, frame_bgr, threshold)
+
+    # ------------------------------------------------------------------
+    # box_refine.method == "sam2_dense": GeCo2-native SAM2 mask refinement
+    # ------------------------------------------------------------------
+
+    def _get_mask_processor(self):
+        """Lazily build GECO2's own MaskProcessor (GECO2/models/sam_mask.py)
+        -- downloads Meta's public pretrained SAM2 checkpoint
+        (sam2_hiera_base_plus.pt, ~300+MB, cached by torch.hub after the
+        first call) the first time this is called on a given detector
+        instance. Returns None (and remembers not to retry) if the import
+        or build fails for any reason (e.g. no network access, sam2
+        package unavailable) -- callers must treat that as "refinement
+        unavailable" and fall back to the unrefined boxes.
+        """
+        if self._mask_processor is False:
+            return None
+        if self._mask_processor is not None:
+            return self._mask_processor
+        try:
+            from models.sam_mask import MaskProcessor  # GECO2/models/sam_mask.py
+            self._mask_processor = MaskProcessor(
+                self.emb_dim, int(self.image_size), self.reduction,
+            ).to(self.device)
+            self._mask_processor.eval()
+        except Exception:
+            log.warning(
+                "box_refine.method=sam2_dense: failed to build GECO2's "
+                "MaskProcessor (SAM2 checkpoint download or import failed) "
+                "-- refinement unavailable this run, boxes left unchanged.",
+                exc_info=True,
+            )
+            self._mask_processor = False
+            return None
+        return self._mask_processor
+
+    @torch.no_grad()
+    def sam2_refine_boxes(
+        self,
+        frame_bgr: np.ndarray,
+        prototype: dict[str, torch.Tensor],
+        boxes: list[Box],
+    ) -> list[Box]:
+        """box_refine.method == "sam2_dense": refine `boxes` (already-chosen
+        boxes on this frame, e.g. Stage 3's cosine-matched detections or a
+        Stage 4 tracked box) via GECO2's OWN SAM2-based mask_decoder
+        (GECO2/models/sam_mask.py::MaskProcessor, the same submodule
+        CNT.forward calls as `self.sam_mask(feats, outputs)` when its own
+        `validate=True` -- see GECO2/models/counter_infer.py) -- prompts it
+        with each box (as SAM2's box-as-2-corner-points convention) against
+        this frame's own dense Hiera features, always takes GECO2's own
+        mask index [2] (matching CNT.forward's own choice, not our
+        highest-score selection used elsewhere), and returns the tight
+        bbox of the resulting mask.
+
+        Unlike the MobileSAM-based "sam"/"sam_dense" box_refine methods,
+        this needs a FRESH GeCo2 backbone forward pass on `frame_bgr`
+        (feats aren't cached from whatever detection pass originally
+        produced `boxes` -- by the time box_refine runs, that pass is long
+        over) -- one pass per FRAME, shared across every box in `boxes`,
+        not one per box.
+
+        Falls back to leaving a box UNCHANGED (never raises) if
+        MaskProcessor is unavailable, or if that box's refined mask comes
+        back empty -- callers apply their own min_iou_with_original gate
+        afterward via aero_eyes.utils.box_refine.apply_iou_gate, same as
+        every other box_refine method.
+        """
+        if not boxes:
+            return boxes
+        mask_processor = self._get_mask_processor()
+        if mask_processor is None:
+            return boxes
+
+        _, _, scale, feats = self._forward_scores(frame_bgr, prototype)
+
+        norm_boxes = []
+        for b in boxes:
+            norm_boxes.append([
+                b.x1 * scale / self.image_size, b.y1 * scale / self.image_size,
+                b.x2 * scale / self.image_size, b.y2 * scale / self.image_size,
+            ])
+        norm_boxes_t = torch.tensor(norm_boxes, dtype=torch.float32, device=self.device).clamp(0.0, 1.0)
+        outputs_wrapped = [{"pred_boxes": norm_boxes_t.unsqueeze(0)}]
+
+        try:
+            _, _, corrected_bboxes = mask_processor(feats, outputs_wrapped)
+            corrected = corrected_bboxes[0]  # [N,4], padded-canvas PIXEL coords; zeros = empty mask
+        except Exception:
+            log.warning("box_refine.method=sam2_dense: MaskProcessor forward "
+                        "pass failed -- boxes left unchanged this frame.", exc_info=True)
+            return boxes
+
+        h_frame, w_frame = frame_bgr.shape[:2]
+        results: list[Box] = []
+        for i, b in enumerate(boxes):
+            cb = corrected[i]
+            if bool(torch.all(cb == 0)):
+                results.append(b)
+                continue
+            x1, y1, x2, y2 = (cb / scale).tolist()
+            refined = Box(x1, y1, x2, y2, score=b.score).clip(w_frame, h_frame)
+            results.append(refined if refined.area() > 0 else b)
+        return results
 
     # ------------------------------------------------------------------
     # Domain calibration (stage123_geco2.domain_calibration) -- shifts
@@ -470,6 +593,25 @@ class GeCo2Detector:
     @staticmethod
     def load_prototype(path: str | Path) -> dict[str, torch.Tensor]:
         return torch.load(str(path), map_location="cpu", weights_only=True)
+
+
+def load_geco2_detector_and_prototype(cfg, work_dir: Path) -> tuple:
+    """Lazily build a GeCo2Detector + load its cached exemplar prototype
+    (from stage123_geco2.py's Stage 1+2 exemplar-encoding step), for
+    callers that need on-demand GeCo2 forward passes OUTSIDE the main
+    stage123_geco2 keyframe loop -- Stage 4 re-detection
+    (aero_eyes/stages/stage4.py::_load_geco2) and box_refine.method=
+    "sam2_dense" refinement (aero_eyes/stages/stage3.py and stage4.py) both
+    need this same (detector, prototype) pair on demand rather than once
+    per keyframe. Returns (None, None) if the exemplar cache is missing
+    (Stage 1+2 not run yet, or pipeline.detector != "geco2").
+    """
+    proto_path = work_dir / cfg.stage123_geco2.prototype_cache_name
+    if not proto_path.exists():
+        return None, None
+    detector = GeCo2Detector(cfg)
+    prototype = GeCo2Detector.load_prototype(proto_path)
+    return detector, prototype
 
 
 class _GeCo2Args:

@@ -122,9 +122,20 @@ def run_stage4(cfg, sample_id: str) -> Path:
         and s4.verify_interval > 0 and not is_none_tracker
     )
     box_refine_segmenter = None
-    if box_refine_active and br_cfg.method == "sam":
+    geco2_refine_detector = None
+    geco2_refine_prototype = None
+    if box_refine_active and br_cfg.method in ("sam", "sam_dense"):
         from aero_eyes.models.segmentation import MobileSAMSegmenter
         box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+    elif box_refine_active and br_cfg.method == "sam2_dense":
+        from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
+        geco2_refine_detector, geco2_refine_prototype = load_geco2_detector_and_prototype(cfg, work_dir)
+        if geco2_refine_detector is None:
+            log.warning(
+                "[Stage4] %s: box_refine.method=sam2_dense but no %s found -- "
+                "refinement disabled this run (boxes left unchanged).",
+                sample_id, cfg.stage123_geco2.prototype_cache_name,
+            )
 
     # For NoneTracker, we need proposal+matching on every frame. Which
     # detector backs re-detection must match whichever one produced
@@ -285,11 +296,25 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         # whether the cosine re-verification above ran at
                         # all (no DINOv2 prototype needed for this).
                         if track_ok and box_refine_active:
-                            from aero_eyes.utils.box_refine import refine_box
-                            box = refine_box(
-                                br_cfg.method, frame_bgr, box, br_cfg.context_margin,
-                                segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
-                            )
+                            if br_cfg.method == "sam_dense":
+                                from aero_eyes.utils.box_refine import refine_boxes_dense
+                                box = refine_boxes_dense(
+                                    box_refine_segmenter, frame_bgr, [box],
+                                    min_iou_with_original=br_cfg.min_iou_with_original,
+                                )[0]
+                            elif br_cfg.method == "sam2_dense":
+                                if geco2_refine_detector is not None:
+                                    from aero_eyes.utils.box_refine import apply_iou_gate
+                                    refined = geco2_refine_detector.sam2_refine_boxes(
+                                        frame_bgr, geco2_refine_prototype, [box],
+                                    )[0]
+                                    box = apply_iou_gate([refined], [box], br_cfg.min_iou_with_original)[0]
+                            else:
+                                from aero_eyes.utils.box_refine import refine_box
+                                box = refine_box(
+                                    br_cfg.method, frame_bgr, box, br_cfg.context_margin,
+                                    segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
+                                )
                             tracker.init(frame_bgr, box)
 
                     if track_ok:
@@ -415,17 +440,15 @@ def _load_geco2(cfg, sample_id: str, work_dir: Path):
     latching onto a same-shape-different-color confuser) would silently
     bypass color filtering entirely, even with color_postfilter.enabled=true.
     """
-    from aero_eyes.models.geco2_detector import GeCo2Detector
+    from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
 
-    proto_path = work_dir / cfg.stage123_geco2.prototype_cache_name
-    if not proto_path.exists():
+    detector, prototype = load_geco2_detector_and_prototype(cfg, work_dir)
+    if detector is None:
         log.warning(
             "[Stage4] %s not found -- GeCo2 re-detection disabled for this run.",
-            proto_path,
+            work_dir / cfg.stage123_geco2.prototype_cache_name,
         )
         return None, None, None
-    detector = GeCo2Detector(cfg)
-    prototype = GeCo2Detector.load_prototype(proto_path)
     color_sig = None
     if cfg.stage123_geco2.color_postfilter.enabled:
         from aero_eyes.stages.stage123_geco2 import build_color_signature

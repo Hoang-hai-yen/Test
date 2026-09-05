@@ -153,9 +153,21 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     br_cfg = cfg.box_refine
     box_refine_segmenter = None
-    if br_cfg.enabled and br_cfg.apply_in_stage3 and br_cfg.method == "sam":
-        from aero_eyes.models.segmentation import MobileSAMSegmenter
-        box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+    geco2_refine_detector = None
+    geco2_refine_prototype = None
+    if br_cfg.enabled and br_cfg.apply_in_stage3:
+        if br_cfg.method in ("sam", "sam_dense"):
+            from aero_eyes.models.segmentation import MobileSAMSegmenter
+            box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+        elif br_cfg.method == "sam2_dense":
+            from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
+            geco2_refine_detector, geco2_refine_prototype = load_geco2_detector_and_prototype(cfg, work_dir)
+            if geco2_refine_detector is None:
+                log.warning(
+                    "[Stage3] %s: box_refine.method=sam2_dense but no %s found -- "
+                    "refinement disabled this run (boxes left unchanged).",
+                    sample_id, cfg.stage123_geco2.prototype_cache_name,
+                )
 
     # ---- Load prototype ----
     proto_path = work_dir / cfg.stage1.prototype.cache_name
@@ -336,18 +348,49 @@ def run_stage3(cfg, sample_id: str) -> Path:
             # diagnostic run would silently refine an already-refined box
             # a second time instead of comparing against the true original.
             pre_refine_detections[frame_idx] = result_dets
-            from aero_eyes.utils.box_refine import refine_box
-            result_dets = [
-                Detection(
-                    frame_idx=d.frame_idx,
-                    box=refine_box(
-                        br_cfg.method, frame_bgr, d.box, br_cfg.context_margin,
-                        segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
-                    ),
-                    similarity=d.similarity, source=d.source,
+            if br_cfg.method == "sam_dense":
+                # One shared MobileSAM frame encoding for every surviving
+                # box on this keyframe, instead of a crop+re-encode per box
+                # -- see refine_boxes_dense's docstring.
+                from aero_eyes.utils.box_refine import refine_boxes_dense
+                refined_boxes = refine_boxes_dense(
+                    box_refine_segmenter, frame_bgr, [d.box for d in result_dets],
+                    min_iou_with_original=br_cfg.min_iou_with_original,
                 )
-                for d in result_dets
-            ]
+                result_dets = [
+                    Detection(frame_idx=d.frame_idx, box=rb, similarity=d.similarity, source=d.source)
+                    for d, rb in zip(result_dets, refined_boxes)
+                ]
+            elif br_cfg.method == "sam2_dense":
+                # GeCo2's own dense Hiera features refine every surviving
+                # box on this keyframe in one extra backbone pass -- see
+                # GeCo2Detector.sam2_refine_boxes's docstring.
+                from aero_eyes.utils.box_refine import apply_iou_gate
+                original_boxes = [d.box for d in result_dets]
+                if geco2_refine_detector is not None:
+                    refined_boxes = geco2_refine_detector.sam2_refine_boxes(
+                        frame_bgr, geco2_refine_prototype, original_boxes,
+                    )
+                    refined_boxes = apply_iou_gate(refined_boxes, original_boxes, br_cfg.min_iou_with_original)
+                else:
+                    refined_boxes = original_boxes
+                result_dets = [
+                    Detection(frame_idx=d.frame_idx, box=rb, similarity=d.similarity, source=d.source)
+                    for d, rb in zip(result_dets, refined_boxes)
+                ]
+            else:
+                from aero_eyes.utils.box_refine import refine_box
+                result_dets = [
+                    Detection(
+                        frame_idx=d.frame_idx,
+                        box=refine_box(
+                            br_cfg.method, frame_bgr, d.box, br_cfg.context_margin,
+                            segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
+                        ),
+                        similarity=d.similarity, source=d.source,
+                    )
+                    for d in result_dets
+                ]
 
         detections[frame_idx] = result_dets
 

@@ -160,6 +160,71 @@ class MobileSAMSegmenter:
         except Exception as e:
             log.warning("MobileSAM download failed: %s", e)
 
+    def set_frame(self, frame_bgr: np.ndarray) -> bool:
+        """Encode `frame_bgr` ONCE via SAM's own image encoder, caching the
+        embedding for subsequent segment_box_cached() calls on THIS frame
+        -- the "dense feature" style of box refinement (box_refine.method
+        == "sam_dense"): one encode per FRAME, reused for every candidate
+        box on it, instead of a separate crop+re-encode per box (see
+        segment_box() above). Avoids the small/low-res crop reliability
+        problem confirmed in practice on tiny detection boxes, by giving
+        the encoder full spatial context -- the same principle GeCo2's own
+        SAM2-based sam_mask module uses (reusing its already-computed
+        dense backbone features instead of re-encoding a crop), just with
+        MobileSAM's own encoder instead of requiring a separate SAM2
+        checkpoint (GeCo2's Hiera features aren't compatible with
+        MobileSAM's SAM1-style decoder -- different training distribution).
+
+        Returns False (caller should treat refinement as unavailable for
+        this frame) if MobileSAM is unavailable or encoding fails.
+        """
+        if not self._available:
+            return False
+        try:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self._predictor.set_image(frame_rgb)
+            return True
+        except Exception as e:
+            log.warning("MobileSAM set_frame failed (%s).", e)
+            return False
+
+    def segment_box_cached(self, box: Box) -> np.ndarray | None:
+        """Refine `box` using the image embedding set_frame() already
+        cached for the CURRENT frame -- must be called after set_frame()
+        for that frame. `box` is in that frame's own pixel coordinates
+        (SamPredictor applies its own internal resize transform).
+
+        Unlike segment_box() (which applies area/border-touch plausibility
+        gates calibrated for a small CROP), this trusts SAM's own
+        predicted-IoU score directly and relies on the caller's
+        box_refine.min_iou_with_original gate (see aero_eyes.utils.
+        box_refine.refine_boxes_dense) as the safety check instead --
+        those crop-relative gates don't translate to a full-frame mask,
+        where a legitimate small object occupies a tiny fraction of the
+        whole image.
+
+        Returns a full-frame-sized mask, or None if unavailable, inference
+        fails, or the best mask is empty.
+        """
+        if not self._available:
+            return None
+        try:
+            box_arr = np.array([box.x1, box.y1, box.x2, box.y2])
+            masks, scores, _ = self._predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box_arr,
+                multimask_output=True,
+            )
+            best_idx = int(scores.argmax())
+            mask = masks[best_idx]
+            if not mask.any():
+                return None
+            return mask
+        except Exception as e:
+            log.warning("MobileSAM box-refine (cached-frame) inference failed (%s).", e)
+            return None
+
     def segment_box(
         self, image_bgr: np.ndarray, box: Box, context_margin: float = 0.2,
     ) -> tuple[np.ndarray | None, tuple[int, int] | None]:

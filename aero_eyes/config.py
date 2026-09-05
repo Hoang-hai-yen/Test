@@ -825,12 +825,58 @@ class BoxRefineConfig(BaseModel):
     that IS present but loosely placed).
 
     method:
-      sam      -- MobileSAM prompted directly with the box (reuses the
-                  same weights already used for Stage 1/GeCo2 reference
-                  segmentation, via stage1.segmentation.weights). Higher
-                  quality, costs one extra SAM forward pass per refined box.
-      grabcut  -- classic OpenCV GrabCut seeded from the box. No model, no
-                  weights, much cheaper, noticeably lower quality than SAM.
+      sam        -- MobileSAM prompted directly with a small CROP around
+                    the box (reuses the same weights already used for
+                    Stage 1/GeCo2 reference segmentation, via
+                    stage1.segmentation.weights). Empirically confirmed
+                    UNRELIABLE on small/low-res candidate boxes (as small
+                    as ~20x10px): the crop is too tiny/low-info for SAM to
+                    segment consistently -- kept for comparison, prefer
+                    "sam_dense" below.
+      sam_dense  -- MobileSAM, but encodes the WHOLE frame ONCE (no crop)
+                    and reuses that single embedding for every box prompt
+                    on it -- same "encode once, reuse for every box"
+                    principle GeCo2's own SAM2-based sam_mask module uses
+                    on its own dense backbone features (GeCo2's Hiera
+                    features can't literally be reused with MobileSAM's
+                    SAM1-style decoder -- different training distribution
+                    -- so this re-encodes with MobileSAM's own encoder
+                    instead, avoiding a second SAM2 checkpoint download).
+                    Costs one MobileSAM forward pass per KEYFRAME (not per
+                    box) instead of per box -- usually cheaper than "sam"
+                    when topk_per_keyframe > 1, and avoids the small-crop
+                    reliability problem "sam" has.
+      grabcut    -- classic OpenCV GrabCut seeded from the box. No model,
+                    no weights, much cheaper, noticeably lower quality
+                    than either SAM method.
+      sam2_dense -- GeCo2's OWN SAM2-based mask refinement
+                    (GECO2/models/sam_mask.py::MaskProcessor, the same
+                    submodule CNT.forward itself calls internally but this
+                    pipeline's detect_frame() otherwise skips). Only
+                    available when pipeline.detector == "geco2" (needs a
+                    GeCo2Detector + its cached exemplar prototype -- see
+                    stage123_geco2.prototype_cache_name). Refines using
+                    GeCo2's OWN dense Hiera backbone features -- no crop or
+                    second encoder, unlike "sam"/"sam_dense" -- at the cost
+                    of one extra GeCo2 backbone forward pass per refined
+                    FRAME (shared across every box on it, not per box) and
+                    a one-time download of Meta's public pretrained SAM2
+                    checkpoint (sam2_hiera_base_plus.pt, ~300+MB) on first
+                    use. Not yet benchmarked on this project's dataset the
+                    way "sam"/"grabcut" were (see the IMPORTANT note
+                    below) -- compare with scripts/check_box_refine_effect.py
+                    and check_box_size_bias.py before trusting it.
+
+    IMPORTANT (measured on this dataset, not just theoretical): whether
+    ANY of these methods helps or hurts ST-IoU is highly dependent on
+    whether the ORIGINAL box already runs larger or smaller than its GT
+    box on that particular video -- shrinking an already-undersized box
+    makes it worse; shrinking an oversized one helps. There is no way to
+    know that direction at real inference time (no GT then). See
+    scripts/check_box_size_bias.py and check_box_refine_effect.py before
+    trusting this on a new dataset -- averaged across this project's 6
+    labeled samples, method="sam" was roughly NET-NEUTRAL (helped 3,
+    hurt 3), not a reliable universal win.
 
     apply_in_stage3: refine the FINAL box Stage 3's cosine matching picked,
       once per keyframe (see aero_eyes/stages/stage3.py) -- cheap (bounded
@@ -846,7 +892,7 @@ class BoxRefineConfig(BaseModel):
     produced them, unchanged.
     """
     enabled: bool = False
-    method: Literal["sam", "grabcut"] = "sam"
+    method: Literal["sam", "sam_dense", "grabcut", "sam2_dense"] = "sam"
     # Padding kept around the original box, as a fraction of the box's own
     # width/height, when cropping the region SAM/GrabCut segments -- gives
     # the segmenter a bit of surrounding context instead of the box edge
