@@ -204,6 +204,18 @@ def check_sample(
                 f"    warning: {n_with_gt - n_correct} of {n_with_gt} GT-checkable picks this round "
                 f"did NOT match the real object (IoU<{iou_threshold}) -- possible confuser drift."
             )
+        n_without_gt = len(selected) - n_with_gt
+        if n_without_gt > 0:
+            print(
+                f"    note: {n_without_gt} of {len(selected)} selected pick(s) landed on a frame "
+                "with NO ground truth entry at all (outside the labeled range, or the object is "
+                "simply absent there per GT) -- purity above is silently BLIND to these; GeCo2/"
+                "Stage 2 still nominates a highest-scoring box on every keyframe even when nothing "
+                "is really there, so if the video has long GT-absent stretches, dynamic_prototype "
+                "can keep blending unverifiable (possibly background/confuser) picks into the "
+                "prototype without this purity check ever being able to catch it. Pass "
+                "--export-crops to eyeball a sample of them directly."
+            )
 
         if export_crops and video_path is not None:
             _export_round_crops(round_idx, selected)
