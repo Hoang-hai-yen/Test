@@ -46,6 +46,7 @@ def check_sample(cfg, sample_id: str) -> None:
 
     work_dir = Path(cfg.project.work_dir) / sample_id
     det_path = work_dir / "detections.json"
+    prerefine_path = work_dir / "detections_prerefine.json"
 
     print(f"\n=== {sample_id} ===")
 
@@ -53,8 +54,28 @@ def check_sample(cfg, sample_id: str) -> None:
         print("  box_refine.enabled is false in this config -- nothing to test "
               "(pass --set box_refine.enabled=true).")
         return
-    if not det_path.exists():
-        print(f"  detections.json not found at {det_path} -- run Stage 3 first.")
+
+    # Prefer detections_prerefine.json (written by Stage 3 whenever
+    # box_refine actually ran -- see run_stage3) as the "before" baseline:
+    # it's guaranteed to hold boxes BEFORE any refinement, regardless of
+    # what box_refine.* setting was active on the run that produced
+    # detections.json. Falling back to detections.json only makes sense
+    # when Stage 3 was last run with box_refine disabled entirely (in
+    # which case detections.json itself IS the clean baseline) -- if it
+    # was run with box_refine ENABLED, detections.json holds already-
+    # refined boxes and testing a new setting on top of it would silently
+    # compound two refinements instead of comparing against the original.
+    if prerefine_path.exists():
+        source_path = prerefine_path
+        print(f"  using detections_prerefine.json as the clean baseline (found at {prerefine_path}).")
+    elif det_path.exists():
+        source_path = det_path
+        print(f"  detections_prerefine.json not found -- using detections.json as-is. "
+              "If Stage 3's LAST run had box_refine.enabled=true, this baseline is "
+              "already refined once, and results below would compound a second "
+              "refinement on top of it.")
+    else:
+        print(f"  neither detections.json nor detections_prerefine.json found under {work_dir} -- run Stage 3 first.")
         return
 
     gt_file = cfg.data.gt.global_file
@@ -71,7 +92,7 @@ def check_sample(cfg, sample_id: str) -> None:
         return
     video_path = video_files[0]
 
-    detections = read_detections(det_path)
+    detections = read_detections(source_path)
 
     br_cfg = cfg.box_refine
     segmenter = None

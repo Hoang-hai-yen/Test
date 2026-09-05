@@ -293,6 +293,8 @@ def run_stage3(cfg, sample_id: str) -> Path:
     for fi, det, sim in selected:
         frame_groups[fi].append((det, sim))
 
+    pre_refine_detections: dict[int, list[Detection]] = {}
+
     for frame_idx, det_sim_pairs in frame_groups.items():
         det_sim_pairs.sort(key=lambda x: x[1], reverse=True)
         dets_f = [d for d, _ in det_sim_pairs]
@@ -323,6 +325,17 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 frame_bgr = None
 
         if br_cfg.enabled and br_cfg.apply_in_stage3 and frame_bgr is not None:
+            # Snapshot the PRE-refine boxes before box_refine mutates
+            # result_dets -- written out below as detections_prerefine.json
+            # whenever box_refine actually ran, so a diagnostic script (see
+            # scripts/check_box_refine_effect.py) always has a guaranteed-
+            # clean "before" baseline to compare against, no matter what
+            # box_refine.* setting was active on THIS run -- without this,
+            # re-running Stage 3 with box_refine enabled overwrites
+            # detections.json with already-refined boxes, so a later
+            # diagnostic run would silently refine an already-refined box
+            # a second time instead of comparing against the true original.
+            pre_refine_detections[frame_idx] = result_dets
             from aero_eyes.utils.box_refine import refine_box
             result_dets = [
                 Detection(
@@ -346,6 +359,11 @@ def run_stage3(cfg, sample_id: str) -> Path:
             )
 
     write_detections(detections, det_path, threshold=effective_threshold)
+    if pre_refine_detections:
+        prerefine_path = work_dir / "detections_prerefine.json"
+        write_detections(pre_refine_detections, prerefine_path, threshold=effective_threshold)
+        log.info("[Stage3] %s: box_refine was applied -- pre-refine boxes also saved to %s "
+                 "(see scripts/check_box_refine_effect.py)", sample_id, prerefine_path)
     elapsed = time.time() - t0
     log.info("[Stage3] %s done in %.1fs -> %s (%d detection frames)",
              sample_id, elapsed, det_path, len(detections))

@@ -384,7 +384,10 @@ def test_stage3_box_refine_produces_detections(cfg, synth_fixture):
     """Stage 3 with box_refine.enabled=True (method=grabcut, no model
     needed) still runs to completion and writes valid detections.json --
     covers the per-keyframe box-refinement wiring (reads the frame,
-    refines each surviving box, writes the refined boxes out)."""
+    refines each surviving box, writes the refined boxes out). Also
+    verifies detections_prerefine.json (the pre-refine snapshot
+    scripts/check_box_refine_effect.py relies on as a clean baseline) gets
+    written alongside it."""
     cfg.box_refine.enabled = True
     cfg.box_refine.method = "grabcut"
     cfg.box_refine.apply_in_stage3 = True
@@ -414,6 +417,16 @@ def test_stage3_box_refine_produces_detections(cfg, synth_fixture):
         data = json.load(f)
     assert "schema_version" in data
     assert "frames" in data
+
+    prerefine_path = det_path.parent / "detections_prerefine.json"
+    assert prerefine_path.exists(), (
+        f"detections_prerefine.json not found at {prerefine_path} -- box_refine ran "
+        "(box_refine.enabled=True) so a pre-refine snapshot should have been saved."
+    )
+    with open(prerefine_path) as f:
+        pre_data = json.load(f)
+    assert "schema_version" in pre_data
+    assert "frames" in pre_data
 
 
 def test_pool_sims():
