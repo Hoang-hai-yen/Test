@@ -10,8 +10,19 @@ the other reference(s)).
 For every candidate in candidates.json, computes its cosine (or l1/l2)
 score against EACH reference image INDIVIDUALLY (via
 aero_eyes.stages.stage3._score_against_ref, imported -- not reimplemented),
-not just the single pooled value Stage 3 actually uses, then splits
-candidates into 3 groups by ground truth:
+not just the single pooled value Stage 3 actually uses. Also replays
+stage3.dynamic_prototype's own rounds (via run_dynamic_prototype_rounds,
+imported -- a no-op if disabled) BEFORE computing per-ref scores/spread,
+so both reflect the FINAL reference set / prototype Stage 3's own
+effective threshold was actually computed from -- dynamic_prototype can
+append new references (or blend a new prototype) each round, and scoring
+against only the ORIGINAL references would badly understate real scores
+once that has happened, making any threshold comparison meaningless (this
+was a real bug in an earlier version of this script: pooled scores came
+out far below the real effective_threshold for EVERY group, including
+genuine matches, because they were being compared on different scales).
+
+Then splits candidates into 3 groups by ground truth:
   genuine_match   -- GT present on this frame AND IoU >= --iou-threshold
   wrong_location  -- GT present on this frame but IoU < --iou-threshold
                       (some other box, or a badly-placed one)
@@ -46,12 +57,7 @@ config default, which can be wildly irrelevant when adaptive_threshold is
 on: raw cosine scores from this project's ground-to-aerial domain gap can
 sit as low as ~0.05-0.15, while match_threshold's own default is 0.55).
 Falls back to stage3.match_threshold with a loud warning only if
-detections.json is missing or didn't record a threshold. Also note: like
-the per-ref scores above, this uses the ORIGINAL reference set only --
-dynamic_prototype's later rounds shift the real score distribution (and
-hence the real threshold) upward as rounds progress, so treat this as an
-approximation of the LAST round's regime, not an exact replay; see
-check_cosine_recall_loss.py for an exact Stage-3 replication instead.
+detections.json is missing or didn't record a threshold.
 
 Read-only: does not touch detections.json/tracks.json/prototype.npz.
 Needs >=2 cached reference-image features (per_ref_features in
@@ -72,7 +78,7 @@ from pathlib import Path
 
 import numpy as np
 
-from aero_eyes.stages.stage3 import _pool_sims, _score_against_ref
+from aero_eyes.stages.stage3 import _pool_sims, _score_against_ref, run_dynamic_prototype_rounds
 from aero_eyes.utils.geometry import box_iou
 from aero_eyes.utils.io import load_gt, read_detections_threshold, read_prototype
 
@@ -109,7 +115,7 @@ def check_sample(
         print(f"  not found in {gt_file}, skipping.")
         return
 
-    _, _, per_ref_features = read_prototype(proto_path)
+    prototype, _, per_ref_features = read_prototype(proto_path)
     if len(per_ref_features) < 2:
         print(f"  only {len(per_ref_features)} cached reference feature(s) found in "
               f"{proto_path} -- per-reference agreement needs >=2 (re-run Stage 1 with "
@@ -133,19 +139,56 @@ def check_sample(
 
     s3 = cfg.stage3
     multi_ref_pooling = cfg.accuracy.cheap_boosters.multi_ref_pooling
+    use_multi_ref = (
+        cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+        and cfg.accuracy.cheap_boosters.multi_reference_embedding
+        and len(per_ref_features) > 0
+    )
 
-    sims_per_ref = np.stack(
-        [_score_against_ref(all_feats, ref, s3.similarity) for ref in per_ref_features], axis=0,
-    )  # [R, N]
-    pooled = _pool_sims(list(sims_per_ref), multi_ref_pooling)
-    per_ref_max = sims_per_ref.max(axis=0)
-    per_ref_min = sims_per_ref.min(axis=0)
-    spread = per_ref_max - per_ref_min
+    if use_multi_ref:
+        sims_per_ref = [_score_against_ref(all_feats, ref, s3.similarity) for ref in per_ref_features]
+        initial_pooled = _pool_sims(sims_per_ref, multi_ref_pooling)
+    else:
+        initial_pooled = _score_against_ref(all_feats, prototype, s3.similarity)
 
-    if s3.dynamic_prototype.enabled:
-        print("  note: stage3.dynamic_prototype.enabled -- this script only scores against "
-              "the ORIGINAL reference set, not any round-2+ dynamically-appended reference; "
-              "see check_dynamic_prototype_purity.py for round-by-round picks instead.")
+    # Replay dynamic_prototype's rounds (no-op if disabled) so `pooled` below
+    # reflects the FINAL reference set / prototype Stage 3's own effective
+    # threshold was actually computed from -- scoring only against the
+    # ORIGINAL references (as an earlier version of this script did) badly
+    # understates real scores once rounds have appended new references or
+    # blended a new prototype, making any threshold comparison meaningless.
+    _, pooled, final_per_ref_features = run_dynamic_prototype_rounds(
+        sample_id, all_feats, initial_pooled, prototype, list(per_ref_features),
+        use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
+    )
+
+    if use_multi_ref:
+        sims_per_ref_final = np.stack(
+            [_score_against_ref(all_feats, ref, s3.similarity) for ref in final_per_ref_features], axis=0,
+        )  # [R, N] -- R may be larger than len(per_ref_features) if rounds appended any
+        per_ref_min = sims_per_ref_final.min(axis=0)
+        spread = sims_per_ref_final.max(axis=0) - per_ref_min
+        if len(final_per_ref_features) > len(per_ref_features):
+            print(
+                f"  note: stage3.dynamic_prototype appended "
+                f"{len(final_per_ref_features) - len(per_ref_features)} dynamically-derived "
+                f"reference(s) during its rounds -- scores/spread below use the FULL final set "
+                f"of {len(final_per_ref_features)} references (what Stage 3's own final "
+                "threshold decision actually used), not just the original ones. See "
+                "check_dynamic_prototype_purity.py --export-crops to inspect which candidates "
+                "got appended."
+            )
+    else:
+        sims_per_ref_final = None
+        per_ref_min = pooled
+        spread = np.zeros_like(pooled)
+        print(
+            "  note: accuracy.cheap_boosters.multi_reference_embedding / accuracy.mode "
+            "currently means Stage 3 does NOT use per-reference scoring -- dynamic_prototype "
+            "(if enabled) blends into ONE prototype vector instead. Per-reference spread below "
+            "is not applicable (always 0); only the pooled-score groups and the threshold gate "
+            "simulation are meaningful in this mode."
+        )
 
     groups: dict[str, list[int]] = {"genuine_match": [], "wrong_location": [], "unverifiable": []}
     for i in range(len(all_dets)):
@@ -170,6 +213,8 @@ def check_sample(
         )
 
     for label in ("unverifiable", "wrong_location"):
+        if sims_per_ref_final is None:
+            break  # not use_multi_ref -- no per-ref breakdown to show, already noted above
         idxs = groups[label]
         if not idxs:
             continue
@@ -177,7 +222,7 @@ def check_sample(
         print(f"  highest-spread {label} candidates (confuser suspects -- matches one ref far "
               "better than the others):")
         for i in top:
-            per_ref_str = ", ".join(f"{s:.3f}" for s in sims_per_ref[:, i])
+            per_ref_str = ", ".join(f"{s:.3f}" for s in sims_per_ref_final[:, i])
             print(
                 f"    frame {all_frame_idxs[i]}: per-ref=[{per_ref_str}] "
                 f"pooled({multi_ref_pooling})={pooled[i]:.3f} spread={spread[i]:.3f}"

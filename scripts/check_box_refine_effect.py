@@ -57,6 +57,16 @@ def check_sample(cfg, sample_id: str) -> None:
               "(pass --set box_refine.enabled=true).")
         return
 
+    if cfg.box_refine.apply_in_stage4:
+        print(
+            "  note: box_refine.apply_in_stage4=true, but this script ONLY evaluates the "
+            "apply_in_stage3 code path -- it re-refines detections.json's own (keyframe) "
+            "boxes, never tracks.json. apply_in_stage4's periodic re-refine of TRACKED boxes "
+            "during Stage 4 (on stage4.verify_interval's cadence) is not exercised or measured "
+            "here at all; the numbers below reflect apply_in_stage3 only, regardless of "
+            "apply_in_stage3's own true/false value."
+        )
+
     # Prefer detections_prerefine.json (written by Stage 3 whenever
     # box_refine actually ran -- see run_stage3) as the "before" baseline:
     # it's guaranteed to hold boxes BEFORE any refinement, regardless of

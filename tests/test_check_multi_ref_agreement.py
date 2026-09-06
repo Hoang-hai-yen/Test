@@ -52,7 +52,10 @@ def _cfg(tmp_path, gt_path, pooling="max", match_threshold=0.5):
         "project": {"work_dir": str(tmp_path / "runs")},
         "data": {"gt": {"global_file": str(gt_path)}},
         "stage3": {"match_threshold": match_threshold},
-        "accuracy": {"cheap_boosters": {"multi_ref_pooling": pooling}},
+        "accuracy": {
+            "mode": "cheap_boosters",  # required for use_multi_ref -- see stage3.py
+            "cheap_boosters": {"multi_ref_pooling": pooling, "multi_reference_embedding": True},
+        },
     })
 
 
@@ -102,6 +105,70 @@ def test_confuser_shows_larger_spread_and_gate_demotes_it(tmp_path, capsys):
     # no detections.json in this scenario -- must fall back to stage3.match_threshold
     # with a loud warning, not silently use a wrong/undefined threshold.
     assert "warning: could not read the real effective threshold" in out
+
+
+def test_uses_dynamic_prototype_final_reference_set_not_stale_initial_scores(tmp_path, capsys):
+    """Regression test for a real bug: dynamic_prototype can APPEND a new
+    reference during its rounds, and Stage 3's own effective threshold is
+    computed against that FINAL, larger reference set -- scoring only
+    against the ORIGINAL references (as an earlier version of this script
+    did) badly understates real scores once that has happened, making the
+    whole gate simulation meaningless (observed in practice: pooled scores
+    for every group, including genuine matches, came out far below the
+    real effective_threshold read from detections.json)."""
+    from aero_eyes.config import AeroEyesConfig
+    from scripts.check_multi_ref_agreement import check_sample
+
+    sample_id = "synth_sample"
+    gt_box = Box(0, 0, 10, 10)
+    gt_path = _gt_file(tmp_path, sample_id, {0: gt_box})  # only frame 0 has GT
+
+    cfg = AeroEyesConfig.model_validate({
+        "project": {"work_dir": str(tmp_path / "runs")},
+        "data": {"gt": {"global_file": str(gt_path)}},
+        "stage3": {
+            "match_threshold": 0.55,
+            "dynamic_prototype": {
+                "enabled": True, "rounds": 1, "alpha": 0.3,
+                "high_conf_percentile": 0.0, "high_conf_abs_floor": 0.85,
+                "min_support": 1,
+            },
+        },
+        "accuracy": {
+            "mode": "cheap_boosters",
+            "cheap_boosters": {"multi_ref_pooling": "max", "multi_reference_embedding": True},
+        },
+    })
+
+    work_dir = tmp_path / "runs" / sample_id
+    ref_a = np.array([1.0, 0.0], dtype=np.float32)
+    ref_b = np.array([0.0, 1.0], dtype=np.float32)
+    write_prototype(np.array([0.5, 0.5], dtype=np.float32), {}, [ref_a, ref_b], work_dir / "prototype.npz")
+
+    genuine_box = gt_box
+    driver_box = Box(200, 200, 210, 210)   # the round's only high-confidence pick -- becomes the appended ref
+    confuser_box = Box(500, 500, 510, 510)
+
+    candidates = {
+        0: [Detection(frame_idx=0, box=genuine_box, similarity=0.0, source="detect")],
+        1: [Detection(frame_idx=1, box=driver_box, similarity=0.0, source="detect")],
+        2: [Detection(frame_idx=2, box=confuser_box, similarity=0.0, source="detect")],
+    }
+    genuine_feat = np.array([0.6, 0.6], dtype=np.float32)   # initial pooled(max) vs original 2 refs = 0.6
+    driver_feat = np.array([0.9, 0.9], dtype=np.float32)    # initial pooled(max) = 0.9 -- only one >= abs_floor(0.85)
+    confuser_feat = np.array([0.4, 0.4], dtype=np.float32)  # initial pooled(max) = 0.4
+    _write_candidates_and_feats(
+        candidates, [genuine_feat, driver_feat, confuser_feat], work_dir / "candidates.json",
+    )
+
+    check_sample(cfg, sample_id, iou_threshold=0.5, agreement_floors=(0.0,))
+
+    out = capsys.readouterr().out
+    assert "appended 1 dynamically-derived reference(s)" in out
+    # genuine's FINAL pooled score must reflect the round-appended reference
+    # (normalize([0.9,0.9]) = [0.7071,0.7071]; [0.6,0.6] . that = 0.8485),
+    # NOT its stale initial score against the 2 original refs alone (0.600).
+    assert "genuine_match: n=1  pooled(mean=0.849" in out
 
 
 def test_uses_real_effective_threshold_from_detections_json_not_static_config(tmp_path, capsys):
