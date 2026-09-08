@@ -253,6 +253,16 @@ def main():
     cfg.stage123_geco2.weights_path = args.base_checkpoint
 
     device = torch.device(cfg.device())
+    if device.type == "cuda":
+        # GECO2's vendored MSDeformAttn CUDA extension calls
+        # at::cuda::getCurrentCUDAStream() with no device guard, so it uses
+        # whatever torch.cuda.current_device() is (default: 0) rather than
+        # the device the tensors actually live on. On a non-default GPU
+        # (e.g. cuda:1) this launches kernels against the wrong device's
+        # stream and causes "illegal memory access" in
+        # ms_deformable_im2col_cuda, which then corrupts the CUDA context
+        # for the rest of the process.
+        torch.cuda.set_device(device)
 
     from aero_eyes.models.geco2_train_wrapper import build_training_model
     model = build_training_model(cfg, device=device)
