@@ -71,7 +71,9 @@ python -m aero_eyes.stages.stage2 --config configs/config.yaml --sample s001 \
 - `stage2.proposal_model`: `yolov11n` | `fastsam_s` (YOLOv8 not allowed)
 - `stage2.sahi.use_sahi`: SAHI tiling on/off
 - `stage4.tracker`: `builtin` (default, no extra weights) | `litetrack`
-  (needs `litetrack.onnx_path`) | `none` (detect every frame)
+  (needs `litetrack.onnx_path_z` + `litetrack.onnx_path_x`, exported from a
+  trained checkpoint with `LiteTrack/tracking/export_litetrack_onnx.py`) |
+  `none` (detect every frame)
 - `accuracy.mode`: `baseline` | `cheap_boosters` | `max_accuracy`
   (the last adds synthetic viewpoint augmentation + CD-ViTO-style domain
   prompter; each technique individually ablatable)

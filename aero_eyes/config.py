@@ -118,6 +118,29 @@ class SegmentationConfig(BaseModel):
     center_fallback_ratio: float = 0.75
 
 
+class ProjectionHeadConfig(BaseModel):
+    """Optional small trainable head applied ON TOP of the frozen backbone
+    embedding (whichever stage1.feature_extractor.model is selected), to
+    close the domain gap between close-up reference photos and tiny aerial
+    crops WITHOUT fine-tuning the backbone itself -- see
+    scripts/train_projection_head.py for how weights_path is produced.
+
+    Disabled by default: build_feature_extractor() returns the raw backbone
+    extractor unchanged unless this is explicitly turned on with a valid
+    weights_path. Applies everywhere that extractor is used (Stage 1
+    prototype build, Stage 3/Stage12-GeCo2 candidate features, Stage 4
+    verify_interval re-check) since they all go through the same factory.
+    """
+    enabled: bool = False
+    weights_path: Optional[str] = None
+    # Must match the architecture the checkpoint at weights_path was
+    # actually trained with -- see train_projection_head.py's --output-dim/
+    # --hidden-dim. Kept here (not read off the checkpoint alone) so a
+    # config typo mismatching the checkpoint fails loudly at load time.
+    output_dim: int = 256
+    hidden_dim: Optional[int] = None   # null = single Linear layer, no hidden layer
+
+
 class FeatureExtractorConfig(BaseModel):
     model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
@@ -129,6 +152,7 @@ class FeatureExtractorConfig(BaseModel):
     siglip_variant: Literal["base", "large", "so400m"] = "base"
     weights: Optional[str] = None
     image_size: int = 224
+    projection_head: ProjectionHeadConfig = ProjectionHeadConfig()
 
 
 class PrototypeConfig(BaseModel):
@@ -293,8 +317,19 @@ class BuiltinTrackerConfig(BaseModel):
 
 
 class LiteTrackConfig(BaseModel):
-    onnx_path: Optional[str] = None
-    input_size: int = 256
+    # LiteTrack's real network is 2 separate graphs (see
+    # aero_eyes/models/trackers.py module docstring for why one ONNX file
+    # isn't enough), both produced by LiteTrack/tracking/export_litetrack_onnx.py
+    # from a real trained checkpoint (e.g. LiteTrack_ep0300.pth.tar).
+    onnx_path_z: Optional[str] = None   # template crop -> template_feats (run once per track init)
+    onnx_path_x: Optional[str] = None   # template_feats + search crop -> response/size/offset maps (every tracked frame)
+    # Must match the exported checkpoint's own experiment yaml (TEST.* /
+    # MODEL.BACKBONE.STRIDE) -- defaults here are LiteTrack's B4 config.
+    template_size: int = 128
+    search_size: int = 256
+    template_factor: float = 2.0
+    search_factor: float = 4.0
+    stride: int = 16
 
 
 class DetectionConfirmationConfig(BaseModel):
@@ -763,6 +798,21 @@ class Stage123Geco2Config(BaseModel):
     # ScaleCalibrationConfig docstring) -- it only affects blur/detail level.
     # Use scale_calibration below to actually fix apparent-size mismatch.
     ref_downscale_factor: float = 1.0
+    # Multi-blur appearance-token ensemble (opt-in, config toggle since we
+    # don't yet know if it helps): when set (non-empty), OVERRIDES
+    # ref_downscale_factor above -- instead of shrinking each ref image by
+    # ONE fixed factor, builds one exemplar entry PER (ref image, factor in
+    # this list), all concatenated into a single exemplar token sequence
+    # (exactly like scale_calibration.multi_scale_mode="all" already does
+    # for canvas size -- adapt_features attends over the prototype as a
+    # flat K/V sequence regardless of token count, so this needs no model
+    # changes). Lets cross-attention pick whichever blur/detail level best
+    # matches a given query object's own apparent scale, instead of a
+    # single hand-picked ref_downscale_factor that may only suit one
+    # altitude/distance. null (default) = old single-factor behavior,
+    # unchanged. Combines with scale_calibration.multi_scale_mode="all" if
+    # both are enabled (their entries stack).
+    ref_downscale_levels: Optional[list[float]] = None
     # Crop each reference image to its MobileSAM tight mask box (expanded by
     # crop_context_margin) BEFORE resize_and_pad -- keeps 100% real pixels,
     # no masking/fill (unlike background_mode), just a tighter field of view
@@ -935,11 +985,16 @@ class AeroEyesConfig(BaseModel):
     @model_validator(mode="after")
     def check_litetrack_path(self) -> "AeroEyesConfig":
         if self.stage4.tracker == "litetrack":
-            if not self.stage4.litetrack.onnx_path:
+            missing = [
+                f for f in ("onnx_path_z", "onnx_path_x")
+                if not getattr(self.stage4.litetrack, f)
+            ]
+            if missing:
                 raise ValueError(
-                    "stage4.tracker is 'litetrack' but stage4.litetrack.onnx_path is not set. "
-                    "Download the LiteTrack-B4 ONNX weights and set "
-                    "stage4.litetrack.onnx_path=/path/to/litetrack.onnx in your config."
+                    f"stage4.tracker is 'litetrack' but stage4.litetrack.{missing[0]} is not set. "
+                    "Export both ONNX graphs from a trained checkpoint with "
+                    "LiteTrack/tracking/export_litetrack_onnx.py and set "
+                    "stage4.litetrack.onnx_path_z / onnx_path_x in your config."
                 )
         return self
 

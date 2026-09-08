@@ -49,9 +49,9 @@ it. Do not deviate from the stage boundaries.
 2. **SAHI is a toggle** (`stage2.sahi.use_sahi`). Off → run proposals on
    the full resized frame.
 3. **Tracker is a toggle** (`stage4.tracker`): `builtin` (OpenCV, default,
-   zero extra weights), `litetrack` (ONNX; REQUIRES `litetrack.onnx_path`,
-   else raise a clear actionable error — never an opaque crash), `none`
-   (detect every frame).
+   zero extra weights), `litetrack` (ONNX; REQUIRES `litetrack.onnx_path_z`
+   and `litetrack.onnx_path_x`, else raise a clear actionable error — never
+   an opaque crash), `none` (detect every frame).
 4. **Every stage runs standalone**, consuming the prior stage's on-disk
    artifact and producing inspectable artifacts (JSON/NPZ + visual
    overlays). `run_all` is a thin wrapper only — no logic the stages lack.

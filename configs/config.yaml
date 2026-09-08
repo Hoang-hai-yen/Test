@@ -104,6 +104,19 @@ stage1:
     siglip_variant: base     # base (768-d) | large (1024-d) | so400m (1152-d, slow)
     weights: null            # null = load from torch.hub / hf
     image_size: 224
+    # Optional small trained head on top of the frozen backbone above (see
+    # scripts/train_projection_head.py) -- closes the domain gap between
+    # close-up reference photos and tiny aerial crops WITHOUT fine-tuning
+    # the backbone itself. Applies everywhere this extractor is used
+    # (Stage 1 prototype, Stage 3/Stage12-GeCo2 candidate features, Stage 4
+    # verify_interval). Disabled by default -- no effect unless both
+    # enabled=true AND weights_path point at a checkpoint trained against
+    # THIS SAME model/variant above (dimension mismatch raises at load).
+    projection_head:
+      enabled: false
+      weights_path: null
+      output_dim: 256   # must match --output-dim used when training weights_path
+      hidden_dim: null  # must match --hidden-dim used when training weights_path (null = single Linear)
   prototype:
     # How the 3 per-reference feature sets are fused.
     fusion: mean             # mean | max | concat_then_pca
@@ -368,6 +381,15 @@ stage123_geco2:
   # to image_size regardless of any uniform pre-shrink, so this only affects
   # blur/detail. Use scale_calibration below to fix apparent-size mismatch.
   ref_downscale_factor: 1.0   # e.g. 0.125 = resize down to 1/8 size
+  # Multi-blur appearance-token ensemble (opt-in -- config toggle since we
+  # don't yet know if it helps): when set, OVERRIDES ref_downscale_factor
+  # above with one exemplar entry per (ref image, factor in this list), all
+  # concatenated into one exemplar token sequence -- cross-attention
+  # attends over all of them and can pick whichever blur/detail level best
+  # matches this query object's own apparent scale, instead of one
+  # hand-picked factor that may only suit one altitude/distance.
+  # null (default) = old single-factor behavior, unchanged.
+  ref_downscale_levels: null   # e.g. [1.0, 0.3, 0.1, 0.03]
   # Crop each ref image to its MobileSAM tight mask box (expanded by
   # crop_context_margin) BEFORE resize_and_pad -- keeps 100% real pixels, no
   # masking/fill (unlike background_mode above), just a tighter field of
@@ -567,8 +589,21 @@ stage4:
   builtin:
     algorithm: csrt          # csrt | kcf | mosse
   litetrack:
-    onnx_path: null          # REQUIRED if tracker=litetrack; else fail clearly
-    input_size: 256
+    # Both REQUIRED if tracker=litetrack; else fail clearly. Real LiteTrack
+    # inference is 2 separate graphs, not 1 -- see
+    # aero_eyes/models/trackers.py module docstring. Export both from a
+    # trained checkpoint (e.g. LiteTrack_ep0300.pth.tar) with
+    # LiteTrack/tracking/export_litetrack_onnx.py.
+    onnx_path_z: null        # template crop -> template_feats (run once per track init)
+    onnx_path_x: null        # template_feats + search crop -> response/size/offset maps (every tracked frame)
+    # Must match the exported checkpoint's own experiment yaml
+    # (experiments/litetrack/*.yaml TEST.* / MODEL.BACKBONE.STRIDE).
+    # Defaults below are LiteTrack's B4 config.
+    template_size: 128
+    search_size: 256
+    template_factor: 2.0
+    search_factor: 4.0
+    stride: 16
   tracker_conf_threshold: 0.40   # τ: below this → re-detect immediately
   max_track_age: 30          # frames a track survives without re-detection
 
