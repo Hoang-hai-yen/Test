@@ -358,6 +358,7 @@ class ProjectedFeatureExtractor:
         from aero_eyes.models.projection_head import ProjectionHead
 
         self.base = base
+        self.device = device
         self.head = ProjectionHead.load(weights_path, device=device)
         if self.head.in_dim != base._feature_dim():
             raise ValueError(
@@ -371,7 +372,12 @@ class ProjectedFeatureExtractor:
         raw = self.base.extract(images, batch_size)
         if raw.shape[0] == 0:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        projected = self.head(torch.from_numpy(raw).float())
+        # base.extract() always returns a CPU numpy array (every extractor's
+        # own .extract() ends in .cpu().numpy()) -- must move onto the
+        # head's own device before this forward pass, or a non-CPU device
+        # (e.g. runtime.device="cuda:1") crashes with a device-mismatch
+        # RuntimeError inside the Linear layer.
+        projected = self.head(torch.from_numpy(raw).float().to(self.device))
         return projected.cpu().numpy().astype(np.float32)
 
     def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],

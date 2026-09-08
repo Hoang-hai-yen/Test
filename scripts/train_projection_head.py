@@ -184,15 +184,28 @@ def info_nce_loss(ref_proj: torch.Tensor, pos_proj: torch.Tensor, neg_proj: torc
 
 
 @torch.no_grad()
-def eval_top1(head, val_data: list[tuple[np.ndarray, np.ndarray, np.ndarray]], device: str) -> float:
+def eval_top1(
+    head, val_data: list[tuple[np.ndarray, np.ndarray, np.ndarray]], device: str,
+    val_ids: list[str] | None = None,
+) -> tuple[float, float]:
     """Top-1 retrieval accuracy: pool EVERY val sample's positive crops +
     hard negatives into one set, and check whether each sample's
     reference's single nearest neighbor in that pool belongs to its OWN
-    category -- a direct proxy for "does the head separate this sample's
-    target from every other sample's target/confusers", i.e. exactly what
-    generalizing to an unseen category at eval time requires. NOT a
-    substitute for scripts/check_cosine_effect.py end to end (see module
-    docstring)."""
+    sample -- a direct proxy for "does the head separate this sample's
+    target from every other sample's target/confusers". NOT a substitute
+    for scripts/check_cosine_effect.py end to end (see module docstring).
+
+    Returns (sample_acc, category_acc). sample_acc requires the exact same
+    sample id to win; category_acc (only meaningful when val_ids is given)
+    additionally counts a match against a DIFFERENT sample of the SAME
+    object category (e.g. Lifering_0's ref matching a Lifering_1 crop) as
+    correct too -- when a category has >1 video in val (this dataset's
+    "_0"/"_1" pairs are near-duplicate videos of the SAME physical object,
+    see video_category), sample_acc alone artificially penalizes the model
+    for a match that is semantically correct, understating real
+    cross-category separation. Watch category_acc, not sample_acc, in that
+    situation.
+    """
     if len(val_data) < 2:
         log.warning(
             "Only %d val sample(s) -- top-1 retrieval needs >=2 to have any cross-category "
@@ -214,13 +227,25 @@ def eval_top1(head, val_data: list[tuple[np.ndarray, np.ndarray, np.ndarray]], d
             pool_owner += [-1] * nj.shape[0]  # -1 = never counts as a correct match
     pool = torch.cat(pool_chunks, dim=0)  # [T, D]
 
-    correct = 0
+    if val_ids is not None:
+        from aero_eyes.models.geco2_finetune_data import video_category
+        val_cats = [video_category(s) for s in val_ids]
+    else:
+        val_cats = None
+
+    correct_sample = 0
+    correct_category = 0
     for i in range(len(val_data)):
         sims = ref_proj[i] @ pool.t()
         best = int(torch.argmax(sims).item())
-        if pool_owner[best] == i:
-            correct += 1
-    return correct / len(val_data)
+        owner = pool_owner[best]
+        if owner == i:
+            correct_sample += 1
+            correct_category += 1
+        elif val_cats is not None and owner != -1 and val_cats[owner] == val_cats[i]:
+            correct_category += 1
+    n = len(val_data)
+    return correct_sample / n, correct_category / n
 
 
 def main():
@@ -377,29 +402,32 @@ def main():
             n_batches += 1
 
         head.eval()
-        val_acc = eval_top1(head, val_data, device)
-        # >= (not strict >): with few val samples (often true here -- top1
-        # can only take a handful of discrete values), val_acc plateaus
-        # easily and legitimately ties for many epochs in a row. Strict `>`
-        # would freeze best_state at the FIRST epoch that ever reached the
-        # plateau -- observed in practice: an 11-sample/3-val-sample run hit
-        # 0.667 at epoch 1 and never moved, silently saving essentially the
-        # UNTRAINED epoch-1 head despite 200 epochs of continued loss
+        val_acc_sample, val_acc_cat = eval_top1(head, val_data, device, val_ids=val_ids)
+        # Select on CATEGORY accuracy, not sample accuracy: when a val
+        # category has >1 video (this dataset's "_0"/"_1" near-duplicate
+        # pairs), sample accuracy wrongly penalizes a match against the
+        # SIBLING video of the same physical object -- see eval_top1's
+        # docstring. >= (not strict >): with few val samples, this metric
+        # plateaus easily and legitimately ties for many epochs in a row;
+        # strict `>` would freeze best_state at the FIRST epoch that ever
+        # reached the plateau -- observed in practice: an early run hit its
+        # plateau at epoch 1 and never moved, silently saving essentially
+        # the UNTRAINED epoch-1 head despite 200 epochs of continued loss
         # improvement. >= keeps the LATEST tying epoch instead, which is at
         # least as converged.
-        if val_acc >= best_val_acc:
-            best_val_acc = val_acc
+        if val_acc_cat >= best_val_acc:
+            best_val_acc = val_acc_cat
             best_state = {k: v.clone() for k, v in head.state_dict().items()}
 
         log_every = max(1, args.epochs // 20)
         if epoch % log_every == 0 or epoch == 1:
-            log.info("epoch %d/%d: train_loss=%.4f val_top1=%.3f (best=%.3f)",
-                      epoch, args.epochs, epoch_loss / max(1, n_batches), val_acc, best_val_acc)
+            log.info("epoch %d/%d: train_loss=%.4f val_top1_sample=%.3f val_top1_category=%.3f (best_category=%.3f)",
+                      epoch, args.epochs, epoch_loss / max(1, n_batches), val_acc_sample, val_acc_cat, best_val_acc)
 
     if best_state is not None:
         head.load_state_dict(best_state)
     head.save(args.output)
-    log.info("Saved projection head (best val_top1=%.3f) -> %s", best_val_acc, args.output)
+    log.info("Saved projection head (best val_top1_category=%.3f) -> %s", best_val_acc, args.output)
     log.info(
         "This in-memory top-1 metric is a PROXY, not the real answer. Now run the actual pipeline "
         "with --set stage1.feature_extractor.projection_head.enabled=true --set "
