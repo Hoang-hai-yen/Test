@@ -341,46 +341,106 @@ class EnsembleFeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
+# Projection head wrapper (opt-in, stage1.feature_extractor.projection_head)
+# ---------------------------------------------------------------------------
+
+class ProjectedFeatureExtractor:
+    """Wraps any of the extractors above, applying a trained ProjectionHead
+    to its raw output -- see aero_eyes.models.projection_head and
+    scripts/train_projection_head.py. The base extractor stays frozen;
+    only the (much smaller) head was trained, so this is a drop-in
+    replacement everywhere build_feature_extractor() is used (Stage 1
+    prototype build, Stage 3/Stage12-GeCo2 candidate features, Stage 4
+    verify_interval) -- callers never need to know a projection is active.
+    """
+
+    def __init__(self, base, weights_path: str, device: str = "cpu"):
+        from aero_eyes.models.projection_head import ProjectionHead
+
+        self.base = base
+        self.head = ProjectionHead.load(weights_path, device=device)
+        if self.head.in_dim != base._feature_dim():
+            raise ValueError(
+                f"Projection head at {weights_path} expects input dim {self.head.in_dim}, "
+                f"but the base extractor ({type(base).__name__}) produces {base._feature_dim()}-d "
+                "features. Was this head trained against a different stage1.feature_extractor.model?"
+            )
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        raw = self.base.extract(images, batch_size)
+        if raw.shape[0] == 0:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        projected = self.head(torch.from_numpy(raw).float())
+        return projected.cpu().numpy().astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self.head.out_dim
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtractor | CLIPFeatureExtractor | SiglipFeatureExtractor | EnsembleFeatureExtractor:
+def build_feature_extractor(cfg):
     """Build the feature extractor specified by cfg.stage1.feature_extractor."""
     fe  = cfg.stage1.feature_extractor
     dev = cfg.device()
 
     if fe.model == "dinov2":
-        return DINOv2FeatureExtractor(
+        base = DINOv2FeatureExtractor(
             variant    = fe.dinov2_variant,
             device     = dev,
             image_size = fe.image_size,
         )
-    if fe.model == "dinov3":
-        return DINOv3FeatureExtractor(
+    elif fe.model == "dinov3":
+        base = DINOv3FeatureExtractor(
             variant = fe.dinov3_variant,
             device  = dev,
         )
-    if fe.model == "clip":
-        return CLIPFeatureExtractor(
+    elif fe.model == "clip":
+        base = CLIPFeatureExtractor(
             variant = fe.clip_variant,
             device  = dev,
         )
-    if fe.model == "siglip":
-        return SiglipFeatureExtractor(
+    elif fe.model == "siglip":
+        base = SiglipFeatureExtractor(
             variant = fe.siglip_variant,
             device  = dev,
         )
-    if fe.model == "ensemble":
-        return EnsembleFeatureExtractor(
+    elif fe.model == "ensemble":
+        base = EnsembleFeatureExtractor(
             dinov2_variant = fe.dinov2_variant,
             clip_variant   = fe.clip_variant,
             device         = dev,
             image_size     = fe.image_size,
         )
-    raise ValueError(
-        f"Unknown feature extractor model '{fe.model}'. "
-        "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
-    )
+    else:
+        raise ValueError(
+            f"Unknown feature extractor model '{fe.model}'. "
+            "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
+        )
+
+    ph = fe.projection_head
+    if ph.enabled:
+        if not ph.weights_path:
+            raise ValueError(
+                "stage1.feature_extractor.projection_head.enabled=true but weights_path is not "
+                "set. Train one first with scripts/train_projection_head.py, then point "
+                "weights_path at the saved .pt file."
+            )
+        log.info("Feature extractor: wrapping %s with projection head from %s", fe.model, ph.weights_path)
+        return ProjectedFeatureExtractor(base, ph.weights_path, device=dev)
+    return base
 
 
 # ---------------------------------------------------------------------------

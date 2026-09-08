@@ -316,12 +316,25 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             # to fix apparent-size mismatch. crop_to_object above (if
             # enabled) is the mechanism that DOES change the object's final
             # canvas size, without needing an oracle scale estimate.
-            f = g.ref_downscale_factor
-            ref_boxes = [
-                tuple(c * f for c in b) if b is not None else None
-                for b in raw_boxes
-            ]
-            ref_imgs = [_apply_ref_downscale(img, f) for img in ref_imgs]
+            # ref_downscale_levels (opt-in): one exemplar entry per (ref
+            # image, factor) instead of one fixed factor -- see
+            # Stage123Geco2Config.ref_downscale_levels docstring. Defaults
+            # to [ref_downscale_factor], i.e. exactly the old behavior.
+            levels = list(g.ref_downscale_levels) if g.ref_downscale_levels else [g.ref_downscale_factor]
+            multiscale_imgs: list[np.ndarray] = []
+            multiscale_boxes: list[tuple[float, float, float, float] | None] = []
+            for img, b in zip(ref_imgs, raw_boxes):
+                for f in levels:
+                    multiscale_boxes.append(tuple(c * f for c in b) if b is not None else None)
+                    multiscale_imgs.append(_apply_ref_downscale(img, f))
+            if len(levels) > 1:
+                log.info(
+                    "[Stage123-GeCo2] %s: ref_downscale_levels multi-scale exemplar -- "
+                    "%d ref image(s) x %d level(s) = %d exemplar entries (levels=%s)",
+                    sample_id, len(ref_imgs), len(levels), len(multiscale_imgs), levels,
+                )
+            ref_imgs = multiscale_imgs
+            ref_boxes = multiscale_boxes
 
     prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
 
@@ -785,10 +798,31 @@ def main():
     p.add_argument("--config", required=True)
     p.add_argument("--sample", required=True)
     p.add_argument("--set", action="append", default=[])
+    # Off by default (unchanged behavior: writes detections.json via
+    # run_stage123_geco2). With this flag, only generates candidates.json
+    # via run_stage12_geco2_candidates (the cosine_rescore variant) --
+    # useful to build candidates.json for a sample WITHOUT also paying for
+    # Stage 4/5 tracking, e.g. to prepare hard-negative mining data for
+    # scripts/train_projection_head.py on samples that were never run
+    # through the full pipeline. Still requires
+    # stage123_geco2.cosine_rescore.enabled=true (same requirement
+    # run_stage12_geco2_candidates itself has via run_all.py).
+    p.add_argument("--candidates-only", action="store_true",
+                    help="write only candidates.json (run_stage12_geco2_candidates) instead of "
+                    "running the full GeCo2-only detector to detections.json. Requires "
+                    "stage123_geco2.cosine_rescore.enabled=true.")
     args = p.parse_args()
     from aero_eyes.config import load_config
     cfg = load_config(args.config, args.set)
-    run_stage123_geco2(cfg, args.sample)
+    if args.candidates_only:
+        if not cfg.stage123_geco2.cosine_rescore.enabled:
+            raise ValueError(
+                "--candidates-only requires stage123_geco2.cosine_rescore.enabled=true "
+                "(pass --set stage123_geco2.cosine_rescore.enabled=true)."
+            )
+        run_stage12_geco2_candidates(cfg, args.sample)
+    else:
+        run_stage123_geco2(cfg, args.sample)
 
 
 if __name__ == "__main__":
