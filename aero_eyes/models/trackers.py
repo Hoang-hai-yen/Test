@@ -295,9 +295,9 @@ class LiteTrackTracker(Tracker):
         patch, resize_factor = _lt_sample_target(frame_bgr, state, self.template_factor, self.template_size)
         template = self._to_tensor(patch)
         template_bb = np.array(
-            [[_lt_template_bb_xyxy_norm(w, h, resize_factor, self.template_size)]],
+            [_lt_template_bb_xyxy_norm(w, h, resize_factor, self.template_size)],
             dtype=np.float32,
-        )  # (1, 1, 4)
+        )  # (1, 4) -- see export_litetrack_onnx.py's dummy_template_bb comment for why not (1,1,4)
         outputs = self._sess_z.run(None, {
             self._sess_z.get_inputs()[0].name: template,
             self._sess_z.get_inputs()[1].name: template_bb,

@@ -594,8 +594,8 @@ stage4:
     # aero_eyes/models/trackers.py module docstring. Export both from a
     # trained checkpoint (e.g. LiteTrack_ep0300.pth.tar) with
     # LiteTrack/tracking/export_litetrack_onnx.py.
-    onnx_path_z: null        # template crop -> template_feats (run once per track init)
-    onnx_path_x: null        # template_feats + search crop -> response/size/offset maps (every tracked frame)
+    onnx_path_z: C:\Projects\LiteTrack\onnx_export\litetrack_B4_cae_center_all_ep300_z.onnx
+    onnx_path_x: C:\Projects\LiteTrack\onnx_export\litetrack_B4_cae_center_all_ep300_x.onnx
     # Must match the exported checkpoint's own experiment yaml
     # (experiments/litetrack/*.yaml TEST.* / MODEL.BACKBONE.STRIDE).
     # Defaults below are LiteTrack's B4 config.
