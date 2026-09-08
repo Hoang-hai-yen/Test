@@ -247,6 +247,8 @@ def main():
     p.add_argument("--set", action="append", default=[], help="cfg override k=v")
     args = p.parse_args()
 
+    from aero_eyes.models.geco2_finetune_data import video_category
+
     train_ids = [s.strip() for s in args.train_samples.split(",") if s.strip()]
     val_ids = [s.strip() for s in args.val_samples.split(",") if s.strip()]
     overlap = set(train_ids) & set(val_ids)
@@ -254,6 +256,26 @@ def main():
         raise ValueError(
             f"--train-samples and --val-samples share sample(s) {overlap} -- they must be disjoint "
             "object categories (see module docstring: this measures generalization to unseen objects)."
+        )
+    # Category-level check, NOT just sample-id equality: 'Person1_0' (train)
+    # and 'Person1_1' (val) are different sample ids but -- per this
+    # dataset's own naming convention (see video_category's docstring in
+    # geco2_finetune_data.py) -- almost certainly two takes of the SAME
+    # physical object, sharing very similar/identical reference photos.
+    # Putting one in train and the other in val leaks that object's
+    # appearance into "validation", making the generalization check
+    # meaningless for exactly that category -- the same footgun this
+    # project already learned to guard against for the GeCo2 finetune
+    # train/val split (split_train_val), now guarded here too.
+    train_cats = {video_category(s) for s in train_ids}
+    val_cats = {video_category(s) for s in val_ids}
+    cat_overlap = train_cats & val_cats
+    if cat_overlap:
+        raise ValueError(
+            f"--train-samples and --val-samples share object CATEGORY/categories {cat_overlap} "
+            "(e.g. 'Person1_0' in train + 'Person1_1' in val) -- these are almost certainly two "
+            "videos of the SAME physical object, which leaks its appearance into validation. Move "
+            "every sample of an affected category to the same side (all-train or all-val)."
         )
 
     from aero_eyes.config import load_config
@@ -356,7 +378,16 @@ def main():
 
         head.eval()
         val_acc = eval_top1(head, val_data, device)
-        if val_acc > best_val_acc:
+        # >= (not strict >): with few val samples (often true here -- top1
+        # can only take a handful of discrete values), val_acc plateaus
+        # easily and legitimately ties for many epochs in a row. Strict `>`
+        # would freeze best_state at the FIRST epoch that ever reached the
+        # plateau -- observed in practice: an 11-sample/3-val-sample run hit
+        # 0.667 at epoch 1 and never moved, silently saving essentially the
+        # UNTRAINED epoch-1 head despite 200 epochs of continued loss
+        # improvement. >= keeps the LATEST tying epoch instead, which is at
+        # least as converged.
+        if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.clone() for k, v in head.state_dict().items()}
 
