@@ -116,7 +116,7 @@ def cfg(synth_fixture, tmp_path):
         "stage4": {
             "tracker": "none",
             "builtin": {"algorithm": "csrt"},
-            "litetrack": {"onnx_path": None, "input_size": 128},
+            "litetrack": {"onnx_path_z": None, "onnx_path_x": None, "template_size": 128, "search_size": 256},
             "tracker_conf_threshold": 0.4,
             "max_track_age": 10,
         },
@@ -610,13 +610,14 @@ def test_stage4_verify_interval_forces_redetect_on_drift(cfg, synth_fixture):
 
 
 def test_stage4_litetrack_missing_path_raises(cfg):
-    """Stage 4 with litetrack + no onnx_path raises a clear error."""
+    """Stage 4 with litetrack + no onnx_path_z/onnx_path_x raises a clear error."""
     from pydantic import ValidationError
     import copy
 
     cfg_dict = cfg.model_dump()
     cfg_dict["stage4"]["tracker"] = "litetrack"
-    cfg_dict["stage4"]["litetrack"]["onnx_path"] = None
+    cfg_dict["stage4"]["litetrack"]["onnx_path_z"] = None
+    cfg_dict["stage4"]["litetrack"]["onnx_path_x"] = None
 
     from aero_eyes.config import AeroEyesConfig
     with pytest.raises(Exception) as exc_info:

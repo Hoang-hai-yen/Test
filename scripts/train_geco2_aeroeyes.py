@@ -197,6 +197,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--contrast-hi", type=float, default=1.0,
                     help="Reference-image contrast jitter range (multiplies pixel values). "
                          "Default (1,1) is a no-op; try e.g. 0.7..1.3 to enable.")
+    p.add_argument("--query-downscale-lo", type=float, default=1.0)
+    p.add_argument("--query-downscale-hi", type=float, default=1.0,
+                    help="Query-frame detail-loss jitter range (shrink-then-upscale-back, same "
+                         "effect as ref-downscale but applied to the QUERY frame instead). "
+                         "Symmetrizes an asymmetry found empirically: only the reference image was "
+                         "ever degraded during training, but detecting very small/distant objects "
+                         "at inference still requires manually blurring the QUERY frame -- the "
+                         "model never trained on that direction. NOT YET VALIDATED to help -- "
+                         "default (1,1) is a no-op; try e.g. 0.1..1.0 and compare val_loss / "
+                         "downstream check_cosine_effect.py against a run without it before "
+                         "trusting this.")
     p.add_argument("--lr-patience", type=int, default=3,
                     help="Epochs with no val_loss improvement before ReduceLROnPlateau halves LR -- "
                          "added after the first finetune attempt showed train+val loss oscillating "
@@ -254,6 +265,7 @@ def main():
         p_present=args.p_present, ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
         brightness_range=(args.brightness_lo, args.brightness_hi),
         contrast_range=(args.contrast_lo, args.contrast_hi),
+        query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
         seed=args.seed,
     )
     val_ds = Geco2FinetuneDataset(
@@ -261,6 +273,7 @@ def main():
         p_present=args.p_present, ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
         brightness_range=(args.brightness_lo, args.brightness_hi),
         contrast_range=(args.contrast_lo, args.contrast_hi),
+        query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
         seed=args.seed + 1,
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,

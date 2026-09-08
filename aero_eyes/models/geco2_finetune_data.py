@@ -170,6 +170,26 @@ def sample_brightness_contrast(
     return brightness, contrast
 
 
+def _apply_query_downscale(img: np.ndarray, downscale_factor: float) -> np.ndarray:
+    """Shrink-then-upscale-BACK-to-original-size detail-loss degradation
+    for the QUERY frame. Deliberately NOT _apply_ref_downscale (which
+    leaves the array smaller, relying on GeCo2Detector._load_and_pad's
+    LATER resize_and_pad to re-normalize canvas size): convert_gt_box_to_
+    canvas computes its scale factor from frame_bgr.shape and multiplies
+    gt_box (fixed, ORIGINAL video-frame coordinates) by it, so frame_bgr's
+    pixel DIMENSIONS must stay exactly unchanged here, or that scale would
+    silently desync from gt_box's true coordinate space and corrupt every
+    training target. No-op at the default 1.0 (downscale_factor >= 1.0).
+    """
+    if downscale_factor >= 1.0:
+        return img
+    h, w = img.shape[:2]
+    small_w = max(1, int(round(w * downscale_factor)))
+    small_h = max(1, int(round(h * downscale_factor)))
+    small = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def apply_brightness_contrast(img: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
     """out = clip(img * contrast + brightness, 0, 255), matching OpenCV's
     own standard brightness/contrast convention. No-op fast path when both
@@ -325,6 +345,7 @@ class Geco2FinetuneDataset(Dataset):
         ref_downscale_range: tuple[float, float] = (0.03, 1.0),
         brightness_range: tuple[float, float] = (0.0, 0.0),
         contrast_range: tuple[float, float] = (1.0, 1.0),
+        query_downscale_range: tuple[float, float] = (1.0, 1.0),
         seed: int | None = None,
     ):
         if not video_ids:
@@ -339,6 +360,20 @@ class Geco2FinetuneDataset(Dataset):
         # sample_brightness_contrast's docstring for the rationale.
         self.brightness_range = brightness_range
         self.contrast_range = contrast_range
+        # Opt-in QUERY-side detail-loss augmentation -- default (1.0,1.0) is
+        # a no-op. Symmetric counterpart to ref_downscale_range: until now,
+        # only the reference image was ever degraded during training (the
+        # query frame was always read raw), so the model only ever learned
+        # "degraded exemplar vs. sharp query", never the reverse. Empirically,
+        # detecting very small/distant objects at inference still requires
+        # manually blurring the QUERY frame first -- i.e. the model needs
+        # exactly this direction of robustness too, and never saw it during
+        # training. Uses the SAME log-uniform sampler/effect as
+        # ref_downscale_range (sample_ref_downscale_factor + the shared
+        # _apply_ref_downscale shrink, applied to the whole query frame
+        # before it reaches the model) -- not yet known to help, hence a
+        # separate opt-in range rather than folding it into an existing one.
+        self.query_downscale_lo, self.query_downscale_hi = query_downscale_range
         self.rng = np.random.default_rng(seed)
 
         self._gt: dict[str, dict[int, Box]] = {}
@@ -401,6 +436,17 @@ class Geco2FinetuneDataset(Dataset):
 
         video_path = self._video_paths[video_id]
         frame_bgr = read_frame(video_path, frame_idx)
+        # Query-side counterpart to the ref-side downscale above -- see
+        # query_downscale_range's docstring in __init__. Uses
+        # _apply_query_downscale (shrink-then-upscale-BACK), NOT
+        # _apply_ref_downscale -- convert_gt_box_to_canvas below computes
+        # its scale factor from frame_bgr.shape and multiplies gt_box
+        # (fixed, ORIGINAL video coordinates) by it, so frame_bgr's pixel
+        # DIMENSIONS must stay unchanged here or the GT target would be
+        # silently corrupted (see _apply_query_downscale's docstring).
+        # No-op at the default (1.0, 1.0) range.
+        query_factor = sample_ref_downscale_factor(self.rng, self.query_downscale_lo, self.query_downscale_hi)
+        frame_bgr = _apply_query_downscale(frame_bgr, query_factor)
         gt_box = self._gt[video_id].get(frame_idx)
 
         return FinetuneSample(
