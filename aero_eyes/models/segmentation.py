@@ -131,7 +131,7 @@ class MobileSAMSegmenter:
 
             best_score = float(np.max(scores))
             border_total = float(2 * (h + w))
-            valid_candidates = []
+            plausible = []  # (mask, area_frac, border_frac) passing area + score only
 
             for m, s in zip(masks, scores):
                 m_bool = m.astype(bool)
@@ -145,19 +145,16 @@ class MobileSAMSegmenter:
                 if s < (best_score * self.score_ratio_floor):
                     continue
 
-                # Border touch filter
                 border_touch_px = float(
                     np.sum(m_bool[0, :])
                     + np.sum(m_bool[-1, :])
                     + np.sum(m_bool[:, 0])
                     + np.sum(m_bool[:, -1])
                 )
-                if (border_touch_px / border_total) > self.max_border_touch_frac:
-                    continue
+                border_frac = border_touch_px / border_total
+                plausible.append((m_bool, area_frac, border_frac))
 
-                valid_candidates.append((m_bool, area_frac))
-
-            if not valid_candidates:
+            if not plausible:
                 # Fallback: Pick highest-scoring mask that satisfies area bounds
                 best_idx = int(np.argmax(scores))
                 mask = masks[best_idx].astype(bool)
@@ -170,9 +167,21 @@ class MobileSAMSegmenter:
                     return fallback_mask
                 return mask
 
-            # Prefer the largest mask among valid candidates
-            valid_candidates.sort(key=lambda x: x[1], reverse=True)
-            return valid_candidates[0][0]
+            # Border touch is a *preference* (low-leak masks first), not a hard
+            # cutoff: some reference objects (e.g. a helmet photographed close
+            # up) legitimately fill the frame edge-to-edge, so their correct
+            # whole-object mask touches the border a lot. Rejecting every
+            # candidate in that case used to fall through to an unconstrained
+            # score-only pick, which can latch onto a confident sub-part (SAM's
+            # own textbook ambiguity example is exactly a helmet: shell vs.
+            # visor vs. whole helmet). Instead, prefer clean (low border-touch)
+            # candidates when they exist, otherwise fall back to the largest
+            # area/score-plausible one rather than discarding the border signal
+            # entirely.
+            clean = [c for c in plausible if c[2] <= self.max_border_touch_frac]
+            pool = clean if clean else plausible
+            pool.sort(key=lambda c: c[1], reverse=True)  # largest area first
+            return pool[0][0]
 
         except Exception as e:
             log.warning("MobileSAM inference failed (%s), using passthrough mask.", e)
