@@ -253,7 +253,7 @@ def main():
     cfg.stage123_geco2.weights_path = args.base_checkpoint
 
     device = torch.device(cfg.device())
-    if device.type == "cuda":
+    if device.type == "cuda" and device.index is not None:
         # GECO2's vendored MSDeformAttn CUDA extension calls
         # at::cuda::getCurrentCUDAStream() with no device guard, so it uses
         # whatever torch.cuda.current_device() is (default: 0) rather than
@@ -262,6 +262,14 @@ def main():
         # stream and causes "illegal memory access" in
         # ms_deformable_im2col_cuda, which then corrupts the CUDA context
         # for the rest of the process.
+        #
+        # device.index is None for plain "cuda" (e.g. runtime.device=auto
+        # resolving via cfg.device()) -- torch.cuda.set_device() requires
+        # an explicit index/integer and raises ValueError on a bare
+        # torch.device("cuda"). That case needs no correction anyway: bare
+        # "cuda" already means "whatever the current default device is"
+        # (index 0 unless changed), which is exactly torch.cuda.
+        # current_device()'s own default -- nothing to reconcile.
         torch.cuda.set_device(device)
 
     from aero_eyes.models.geco2_train_wrapper import build_training_model
