@@ -167,21 +167,27 @@ class MobileSAMSegmenter:
                     return fallback_mask
                 return mask
 
-            # Border touch is a *preference* (low-leak masks first), not a hard
-            # cutoff: some reference objects (e.g. a helmet photographed close
-            # up) legitimately fill the frame edge-to-edge, so their correct
-            # whole-object mask touches the border a lot. Rejecting every
-            # candidate in that case used to fall through to an unconstrained
-            # score-only pick, which can latch onto a confident sub-part (SAM's
-            # own textbook ambiguity example is exactly a helmet: shell vs.
-            # visor vs. whole helmet). Instead, prefer clean (low border-touch)
-            # candidates when they exist, otherwise fall back to the largest
-            # area/score-plausible one rather than discarding the border signal
-            # entirely.
+            # Border touch is used to pick a trustworthy candidate, never to
+            # guess among untrustworthy ones. A previous version of this
+            # picked the *largest*-area mask when none were border-clean —
+            # that is backwards: on a cluttered reference photo (e.g. a
+            # textured pavement background), a lightweight model like
+            # MobileSAM can return a degenerate "whole frame is foreground"
+            # mask as one of its 3 candidates, and it is by construction the
+            # largest one. Confirmed on Helmet_0/Helmet_1's reference photos:
+            # every candidate touched the border, and picking the largest
+            # produced a near-100%-area mask (visually verified — nothing in
+            # the frame was excluded), tanking their score far below even
+            # leaving MobileSAM out entirely. When no candidate is border
+            # clean, the segmentation itself is untrustworthy, so return
+            # passthrough instead of guessing: the caller (stage1/stage12)
+            # already treats a >max_valid_mask_ratio mask as implausible and
+            # substitutes a safe center-crop, which is what we want here.
             clean = [c for c in plausible if c[2] <= self.max_border_touch_frac]
-            pool = clean if clean else plausible
-            pool.sort(key=lambda c: c[1], reverse=True)  # largest area first
-            return pool[0][0]
+            if not clean:
+                return fallback_mask
+            clean.sort(key=lambda c: c[1], reverse=True)  # largest area first
+            return clean[0][0]
 
         except Exception as e:
             log.warning("MobileSAM inference failed (%s), using passthrough mask.", e)
