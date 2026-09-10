@@ -5,6 +5,7 @@ Supports CLI overrides:  --set stage2.proposal_model=fastsam_s
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -1002,6 +1003,20 @@ class AeroEyesConfig(BaseModel):
         return Path(self.project.work_dir) / sample_id
 
     def device(self) -> str:
+        # Pure infra escape-hatch for a known cuDNN issue seen on some
+        # GPU/driver combos ("Unable to find a valid cuDNN algorithm to run
+        # convolution" / "GET was unable to find an engine..."), NOT a real
+        # modeling choice -- deliberately an env var, not a config.yaml
+        # field, since it has nothing to do with the experiment being run.
+        # Disabling cuDNN falls back to a slower but much more reliable
+        # conv implementation. Set AERO_EYES_DISABLE_CUDNN=1 in the shell
+        # BEFORE running any aero_eyes command if you hit that error.
+        if os.environ.get("AERO_EYES_DISABLE_CUDNN"):
+            try:
+                import torch
+                torch.backends.cudnn.enabled = False
+            except ImportError:
+                pass
         if self.runtime.device != "auto":
             return self.runtime.device
         try:
