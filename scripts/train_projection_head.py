@@ -268,6 +268,17 @@ def main():
                     help="a candidate scoring below this IoU against GT on its own frame counts as a hard negative")
     p.add_argument("--max-positives-per-sample", type=int, default=30)
     p.add_argument("--max-hard-negatives-per-sample", type=int, default=30)
+    p.add_argument("--early-stop-patience", type=int, default=20,
+                    help="stop once val_top1_category hasn't matched or beaten its best value for "
+                         "this many CONSECUTIVE epochs. Ties count as 'still fine' (patience resets), "
+                         "not just strict improvement -- with only a handful of val samples, "
+                         "val_top1_category legitimately plateaus at a GOOD value for the entire run "
+                         "(discrete metric, few possible values); this must not be mistaken for "
+                         "stagnation. Only a sustained STRICT DROP below the best-ever value (e.g. the "
+                         "head catastrophically overfitting train categories within ~10 epochs and "
+                         "never recovering, observed in practice: val_top1 1.0->0.0 and flat for 190 "
+                         "more epochs) triggers this -- saves the remaining GPU time in exactly that "
+                         "failure case instead of running all --epochs regardless.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--set", action="append", default=[], help="cfg override k=v")
     args = p.parse_args()
@@ -362,6 +373,7 @@ def main():
     batch_size = min(args.batch_size, len(train_data))
     best_val_acc = -1.0
     best_state = None
+    epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
         head.train()
@@ -418,11 +430,25 @@ def main():
         if val_acc_cat >= best_val_acc:
             best_val_acc = val_acc_cat
             best_state = {k: v.clone() for k, v in head.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         log_every = max(1, args.epochs // 20)
         if epoch % log_every == 0 or epoch == 1:
             log.info("epoch %d/%d: train_loss=%.4f val_top1_sample=%.3f val_top1_category=%.3f (best_category=%.3f)",
                       epoch, args.epochs, epoch_loss / max(1, n_batches), val_acc_sample, val_acc_cat, best_val_acc)
+
+        if epochs_without_improvement >= args.early_stop_patience:
+            log.info(
+                "Early stopping at epoch %d: val_top1_category has been STRICTLY below its best "
+                "(%.3f) for %d consecutive epochs -- this is a sustained drop, not a plateau at a "
+                "good value (which ties every epoch and would never trigger this). Saving the best "
+                "state seen (likely an early epoch) instead of continuing to train on what looks "
+                "like a collapsed/overfit trajectory.",
+                epoch, best_val_acc, epochs_without_improvement,
+            )
+            break
 
     if best_state is not None:
         head.load_state_dict(best_state)
