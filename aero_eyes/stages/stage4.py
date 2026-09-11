@@ -7,7 +7,7 @@ Flow:  detections.json + video
        -> every verify_interval frames (opt-in): re-embed the tracked crop
           and cross-check it against the prototype, forcing a re-detect if
           it no longer matches -- catches silent drift builtin trackers'
-          placeholder confidence can't (see _track_still_matches)
+          placeholder confidence can't (see _track_similarity)
        -> every frame (opt-in, stage4.kalman_motion_check): cheap Kalman
           motion-plausibility check, forcing a re-detect on a geometrically
           implausible jump verify_interval's cosine check wouldn't catch
@@ -168,7 +168,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
     elif s4.verify_interval > 0:
         # An active tracker (builtin/litetrack) doesn't need extractor/
         # prototype for tracking itself, but verify_interval's periodic
-        # re-check (_track_still_matches below) does -- load them here, from
+        # re-check (_track_similarity below) does -- load them here, from
         # prototype.npz (the DINOv2 embedding space), whenever it exists.
         # Always exists for the legacy pipeline; for pipeline.detector=geco2
         # it only exists when stage123_geco2.cosine_rescore.enabled built
@@ -303,6 +303,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     track_ok = (conf >= s4.tracker_conf_threshold
                                 and track_age <= s4.max_track_age
                                 and box is not None)
+                    # Set below (stage4.absence_check) when verify_interval's
+                    # cosine similarity comes back so far below
+                    # match_threshold that re-detect is skipped outright
+                    # instead of attempted -- see that block for why.
+                    skip_redetect = False
 
                     # Motion-plausibility check (stage4.kalman_motion_check,
                     # opt-in): cheap enough to run every frame, unlike
@@ -336,15 +341,37 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         frames_since_verify = 0
 
                         if extractor is not None and prototype is not None:
-                            if not _track_still_matches(
+                            sim = _track_similarity(
                                 frame_bgr, box, extractor, prototype,
-                                per_ref_features, cfg, match_threshold,
-                            ):
-                                log.debug(
-                                    "[Stage4] frame %d: track failed re-verification "
-                                    "(likely drifted) -- forcing re-detect", frame_idx,
-                                )
+                                per_ref_features, cfg,
+                            )
+                            if sim is not None and sim < match_threshold:
                                 track_ok = False
+                                ac_cfg = s4.absence_check
+                                if ac_cfg.enabled and sim < match_threshold * ac_cfg.absence_ratio:
+                                    # Similarity isn't just borderline-low --
+                                    # it's far enough below match_threshold
+                                    # that a re-detect attempt would almost
+                                    # certainly either fail outright or lock
+                                    # onto an unrelated confuser (the object
+                                    # has most likely genuinely left the
+                                    # frame). Skip re-detect entirely and
+                                    # report absent this frame instead of
+                                    # giving it a chance to extend the track
+                                    # past a real departure.
+                                    skip_redetect = True
+                                    log.debug(
+                                        "[Stage4] frame %d: track failed re-verification "
+                                        "(sim=%.3f well below absence threshold %.3f) -- "
+                                        "object likely gone, skipping re-detect", frame_idx,
+                                        sim, match_threshold * ac_cfg.absence_ratio,
+                                    )
+                                else:
+                                    log.debug(
+                                        "[Stage4] frame %d: track failed re-verification "
+                                        "(sim=%.3f < %.3f, likely drifted) -- forcing re-detect",
+                                        frame_idx, sim, match_threshold,
+                                    )
 
                         # box_refine.apply_in_stage4 (opt-in, piggybacked on
                         # this same verify_interval cadence): sharpen the
@@ -379,6 +406,18 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     if track_ok:
                         box_out = box
                         source = "track"
+                    elif skip_redetect:
+                        # stage4.absence_check: re-verification similarity
+                        # was far enough below match_threshold that the
+                        # object is judged almost certainly gone -- skip
+                        # re-detect and report absent outright rather than
+                        # giving it a chance to lock onto a confuser and
+                        # extend the track past a real departure.
+                        tracker_active = False
+                        box_out = None
+                        source = "none"
+                        if confirmer is not None:
+                            confirmer.reset()
                     else:
                         # Confidence too low, track too old, or failed
                         # re-verification — try re-detect
@@ -453,21 +492,29 @@ def run_stage4(cfg, sample_id: str) -> Path:
     return tracks_path
 
 
-def _track_still_matches(
+def _track_similarity(
     frame_bgr,
     box: Box,
     extractor,
     prototype,
     per_ref_features: list,
     cfg,
-    match_threshold: float,
-) -> bool:
-    """Re-embed the crop the tracker is CURRENTLY reporting and check it
-    still resembles the target, using the same DINOv2 embedding space and
-    threshold Stage 3 used to decide the original match -- the real
-    correctness check BuiltinTracker's own fixed placeholder confidence
-    (see aero_eyes/models/trackers.py) cannot provide. Used by
+) -> float | None:
+    """Re-embed the crop the tracker is CURRENTLY reporting and return its
+    cosine similarity to the target, using the same DINOv2 embedding space
+    Stage 3 used to decide the original match -- the real correctness check
+    BuiltinTracker's own fixed placeholder confidence (see
+    aero_eyes/models/trackers.py) cannot provide. Used by
     stage4.verify_interval's periodic re-check.
+
+    Returns the raw similarity (not a match/no-match bool) so the caller
+    can apply BOTH match_threshold (still the same object?) and, if
+    stage4.absence_check is enabled, a stricter absence_threshold below it
+    (is the object almost certainly gone, vs. merely a borderline/drifted
+    match worth a re-detect attempt?) -- see stage4.absence_check's own
+    config docstring for why that distinction matters. None if the crop
+    couldn't be embedded at all (e.g. degenerate box) -- not evidence of
+    absence, just a failed measurement.
     """
     feats = extractor.extract_crops(
         frame_bgr, [box],
@@ -475,7 +522,7 @@ def _track_still_matches(
         batch_size=1,
     )
     if feats.shape[0] == 0:
-        return False
+        return None
 
     use_multi_ref = (
         cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
@@ -483,11 +530,8 @@ def _track_still_matches(
         and len(per_ref_features) > 0
     )
     if use_multi_ref:
-        sim = float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
-    else:
-        sim = float(feats[0] @ prototype)
-
-    return sim >= match_threshold
+        return float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
+    return float(feats[0] @ prototype)
 
 
 def _load_geco2(cfg, sample_id: str, work_dir: Path):

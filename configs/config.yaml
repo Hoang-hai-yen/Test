@@ -656,6 +656,24 @@ stage4:
   # 0 (default) = disabled, reproduces the original tracking logic exactly.
   verify_interval: 0
 
+  # Refines what happens once verify_interval's cosine check above already
+  # fails (sim < match_threshold): distinguishes "borderline/drifted, still
+  # worth a re-detect attempt" from "similarity is far enough below
+  # match_threshold the object has almost certainly left the frame -- don't
+  # bother re-detecting". Without this, every verify_interval failure still
+  # triggers a full re-detect attempt, which can succeed at finding SOME
+  # box (via its own separate score, not cosine) even though the real
+  # object is genuinely gone -- extending a post_departure_drift run
+  # instead of ending it. Needs verify_interval > 0 to have any effect.
+  absence_check:
+    enabled: false
+    # absence_threshold = match_threshold * absence_ratio. A ratio, not an
+    # absolute cosine cutoff, since match_threshold itself can be adaptive
+    # per video (stage3.adaptive_threshold). Lower = stricter (only the
+    # most extreme mismatches skip re-detect); higher = more lenient (skips
+    # re-detect more readily, risks giving up on a recoverable drift).
+    absence_ratio: 0.5
+
   # pipeline.detector=geco2 only: GeCo2's own re-detect score is relative
   # per-frame (see scripts/check_geco2_score_separation.py), so it sometimes
   # locks onto a confuser instead of correctly reporting "not found" (shows

@@ -489,12 +489,15 @@ def test_stage4_produces_tracks_with_none_tracker(cfg, synth_fixture):
     assert "frames" in data
 
 
-def test_track_still_matches():
-    """Unit test for stage4._track_still_matches -- the periodic
-    re-verification check driven by stage4.verify_interval. Covers both the
-    single-ref and multi-reference-embedding paths, and both the
-    match/no-match outcomes."""
-    from aero_eyes.stages.stage4 import _track_still_matches
+def test_track_similarity():
+    """Unit test for stage4._track_similarity -- the raw cosine similarity
+    behind stage4.verify_interval's periodic re-check (and, when
+    stage4.absence_check is enabled, its absence-vs-drift distinction).
+    Covers both the single-ref and multi-reference-embedding paths, and
+    the "no crop extracted" case. Callers compare the returned value
+    against match_threshold themselves -- this function no longer takes a
+    threshold or returns a bool."""
+    from aero_eyes.stages.stage4 import _track_similarity
     from aero_eyes.types import Box
 
     prototype = np.array([1.0, 0.0, 0.0], dtype=np.float32)
@@ -509,33 +512,36 @@ def test_track_still_matches():
             class cheap_boosters:
                 multi_reference_embedding = False
 
-    # Crop feature identical to prototype -- similarity 1.0, above any
-    # reasonable threshold.
+    # Crop feature identical to prototype -- similarity 1.0.
     matching_extractor = MagicMock()
     matching_extractor.extract_crops.return_value = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
-    assert _track_still_matches(
+    sim = _track_similarity(
         np.zeros((20, 20, 3), dtype=np.uint8), box, matching_extractor,
-        prototype, [], _Cfg(), match_threshold=0.5,
-    ) is True
+        prototype, [], _Cfg(),
+    )
+    assert sim == pytest.approx(1.0)
 
-    # Crop feature orthogonal to prototype -- similarity 0.0, below threshold.
+    # Crop feature orthogonal to prototype -- similarity 0.0.
     drifted_extractor = MagicMock()
     drifted_extractor.extract_crops.return_value = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
-    assert _track_still_matches(
+    sim = _track_similarity(
         np.zeros((20, 20, 3), dtype=np.uint8), box, drifted_extractor,
-        prototype, [], _Cfg(), match_threshold=0.5,
-    ) is False
+        prototype, [], _Cfg(),
+    )
+    assert sim == pytest.approx(0.0)
 
-    # No crop extracted at all (e.g. degenerate box) -- treated as no match.
+    # No crop extracted at all (e.g. degenerate box) -- None, not a low
+    # similarity value, since this is a failed measurement, not evidence
+    # of absence.
     empty_extractor = MagicMock()
     empty_extractor.extract_crops.return_value = np.zeros((0, 3), dtype=np.float32)
-    assert _track_still_matches(
+    assert _track_similarity(
         np.zeros((20, 20, 3), dtype=np.uint8), box, empty_extractor,
-        prototype, [], _Cfg(), match_threshold=0.5,
-    ) is False
+        prototype, [], _Cfg(),
+    ) is None
 
     # Multi-reference-embedding path: average similarity across per-ref
-    # features, still compared against match_threshold.
+    # features.
     class _MultiRefCfg(_Cfg):
         class accuracy:
             mode = "cheap_boosters"
@@ -545,14 +551,11 @@ def test_track_still_matches():
     per_ref = [np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])]  # mean sim = 0.5
     multi_extractor = MagicMock()
     multi_extractor.extract_crops.return_value = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
-    assert _track_still_matches(
+    sim = _track_similarity(
         np.zeros((20, 20, 3), dtype=np.uint8), box, multi_extractor,
-        prototype, per_ref, _MultiRefCfg(), match_threshold=0.4,
-    ) is True
-    assert _track_still_matches(
-        np.zeros((20, 20, 3), dtype=np.uint8), box, multi_extractor,
-        prototype, per_ref, _MultiRefCfg(), match_threshold=0.6,
-    ) is False
+        prototype, per_ref, _MultiRefCfg(),
+    )
+    assert sim == pytest.approx(0.5)
 
 
 def test_stage4_verify_interval_forces_redetect_on_drift(cfg, synth_fixture):
@@ -561,7 +564,7 @@ def test_stage4_verify_interval_forces_redetect_on_drift(cfg, synth_fixture):
     whose re-embedded crop no longer matches the prototype must trigger the
     same re-detect path as a low-confidence/aged-out track -- Stage 4 must
     not just trust the tracker's own "success" forever. Uses a fake tracker
-    (not real CSRT) and a mocked _track_still_matches so the test is
+    (not real CSRT) and a mocked _track_similarity so the test is
     deterministic and independent of actual tracking/embedding numerics."""
     from aero_eyes.types import Box
 
@@ -598,7 +601,7 @@ def test_stage4_verify_interval_forces_redetect_on_drift(cfg, synth_fixture):
     with patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop), \
          patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
          patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
-         patch("aero_eyes.stages.stage4._track_still_matches", return_value=False) as mock_verify:
+         patch("aero_eyes.stages.stage4._track_similarity", return_value=0.1) as mock_verify:
         from aero_eyes.stages.stage4 import run_stage4
         tracks_path = run_stage4(cfg, FIXTURE_ID)
 

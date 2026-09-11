@@ -401,6 +401,41 @@ class DetectionConfirmationConfig(BaseModel):
     iou_threshold: float = 0.3
 
 
+class AbsenceCheckConfig(BaseModel):
+    """stage4.absence_check -- refines what verify_interval's cosine check
+    does once it already fails (sim < match_threshold): distinguishes
+    "borderline/drifted, still worth a re-detect attempt" from "similarity
+    is so far below match_threshold the object has almost certainly left
+    the frame, don't bother re-detecting". match_threshold itself was
+    calibrated to separate "is this candidate the right object" during
+    Stage 3 matching -- it was never calibrated as a presence/absence
+    boundary, so a fixed cutoff there conflates two different questions.
+
+    Without this, every verify_interval failure -- however low the
+    similarity -- still triggers a full re-detect attempt (GeCo2/YOLO+
+    DINOv2). That costs compute either way, but the real harm is when it
+    SUCCEEDS at finding some box (via its own separate scoring, not
+    cosine) even though the real object is genuinely gone -- extending a
+    post_departure_drift run instead of ending it (see
+    scripts/check_tracker_coverage.py's post_departure_drift attribution).
+
+    Needs stage4.verify_interval > 0 (same DINOv2 prototype/extractor) to
+    have any effect -- this only fires once verify_interval's own check has
+    already failed.
+    """
+    enabled: bool = False
+    # absence_threshold = match_threshold * absence_ratio. Expressed as a
+    # RATIO (not an absolute cosine cutoff) since match_threshold itself
+    # can be adaptive per video (stage3.adaptive_threshold) -- a fixed
+    # absolute absence value would need separate re-tuning per video/
+    # threshold regime, a ratio automatically tracks match_threshold.
+    # Lower = stricter (only the most extreme mismatches skip re-detect,
+    # closer to today's always-re-detect behavior); higher = more lenient
+    # (skips re-detect more readily, risks giving up on a merely-drifted
+    # track that a re-detect could have recovered).
+    absence_ratio: float = 0.5
+
+
 class KalmanMotionCheckConfig(BaseModel):
     """stage4.kalman_motion_check -- a cheap per-frame motion-plausibility
     check, complementary to verify_interval's (appearance-based) cosine
@@ -460,6 +495,8 @@ class Stage4Config(BaseModel):
     # 0 (default) = disabled -- reproduces the exact original tracking
     # logic (confidence/age only), unchanged.
     verify_interval: int = 0
+
+    absence_check: AbsenceCheckConfig = AbsenceCheckConfig()
 
     # When pipeline.detector=geco2, GeCo2's own re-detect score (relative
     # per-frame, not cosine -- see geco2_detector.py) sometimes locks onto a
