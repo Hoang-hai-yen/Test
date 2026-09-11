@@ -1,8 +1,11 @@
-"""Tracker backends: builtin (OpenCV) | litetrack (ONNX) | none.
+"""Tracker backends: builtin (OpenCV) | litetrack (ONNX) | cotracker3 | none.
 
 Selected by config stage4.tracker.
   builtin   : OpenCV CSRT/KCF/MOSSE — no extra weights (DEFAULT)
   litetrack : LiteTrack ONNX — REQUIRES stage4.litetrack.onnx_path_z/onnx_path_x
+  cotracker3: CoTracker3 (facebookresearch/co-tracker), point-tracker adapted
+              to a per-frame box interface — EXPERIMENTAL, see
+              CoTrackerTracker's own docstring for the design trade-offs.
   none      : sentinel; Stage 4 will run detection on every frame
 
 LiteTrack needs 2 ONNX graphs, not 1 -- its real forward pass is split into
@@ -333,6 +336,172 @@ class LiteTrackTracker(Tracker):
         return img_rgb.transpose(2, 0, 1)[None].astype(np.float32)  # (1,3,H,W)
 
 
+class CoTrackerTracker(Tracker):
+    """CoTracker3 (facebookresearch/co-tracker) adapted to this project's
+    single-box-per-frame Tracker interface.
+
+    CoTracker3 tracks POINTS across a video, with a predicted visibility
+    (occluded vs. not) per point per frame -- unlike BuiltinTracker's fixed
+    0.9 placeholder (see that class above), that visibility fraction IS a
+    real per-frame confidence: this class fits a box from the query grid's
+    currently-visible points and reports confidence = fraction still
+    visible, so stage4.tracker_conf_threshold actually means something here.
+
+    Design trade-offs (deliberate simplifications, not a full port of
+    CoTracker's own online mode):
+      - CoTracker's real online predictor is windowed and needs `step`
+        frames of FUTURE context before it can emit a result for a given
+        frame -- incompatible with Stage 4's frame-by-frame loop, which
+        needs an answer for THIS frame before advancing. This class instead
+        calls the OFFLINE predictor's simple full-clip forward repeatedly on
+        a small buffer, always reading out the box for the buffer's LAST
+        (current) frame -- every update() call is causally correct for
+        "now", at the cost of recomputing over the buffer each time instead
+        of reusing CoTracker's own incremental state.
+      - window_len bounds that buffer: once it would grow past window_len,
+        the tracker RE-ANCHORS (fresh query grid resampled from the current
+        box, buffer reset to just this frame) instead of growing forever.
+        Bounds memory/compute for long tracks; loses long-range point
+        identity across the reset -- acceptable here since Stage 4 already
+        layers verify_interval/kalman_motion_check on top of whichever
+        tracker is configured.
+      - recompute_stride: on frames that aren't a recompute frame, the last
+        box/confidence is held as-is (the frame is still buffered, so
+        context keeps accumulating for the next real recompute) -- the
+        knob for trading tracking granularity against compute cost.
+
+    Experimental. Needs CoTracker's own runtime available via
+    torch.hub.load("facebookresearch/co-tracker", variant).
+    """
+
+    def __init__(
+        self,
+        variant: str = "cotracker3_offline",
+        device: str = "auto",
+        grid_size: int = 5,
+        window_len: int = 16,
+        recompute_stride: int = 1,
+        min_visible_ratio: float = 0.3,
+        outlier_trim_pct: float = 10.0,
+    ):
+        import torch
+        from aero_eyes.models.features import _resolve_device
+
+        self.grid_size = max(1, grid_size)
+        self.window_len = max(2, window_len)
+        self.recompute_stride = max(1, recompute_stride)
+        self.min_visible_ratio = min_visible_ratio
+        self.outlier_trim_pct = outlier_trim_pct
+        self.device = _resolve_device(device)
+        self._torch = torch
+
+        self._model = torch.hub.load("facebookresearch/co-tracker", variant)
+        self._model = self._model.to(self.device).eval()
+
+        self._frames: list[np.ndarray] = []
+        self._queries = None
+        self._last_box: Box | None = None
+        self._last_conf: float = 0.0
+        self._since_recompute = 0
+        log.info("CoTracker3 (%s) loaded on %s", variant, self.device)
+
+    def init(self, frame_bgr: np.ndarray, box: Box) -> None:
+        w, h = box.x2 - box.x1, box.y2 - box.y1
+        if w <= 0 or h <= 0:
+            log.warning(
+                "CoTrackerTracker.init: degenerate box (w=%.1f, h=%.1f) -- "
+                "refusing to initialize, treating as tracker-not-active.", w, h,
+            )
+            self._queries = None
+            return
+        self._reset_buffer(frame_bgr, box)
+        # A fresh init is always a trusted detection (keyframe or a
+        # confirmed re-detect) -- unlike an internal re-anchor (see
+        # _reset_buffer callers in update()), which carries the PREVIOUS
+        # confidence forward since no new evidence was gathered this frame.
+        self._last_conf = 1.0
+
+    def _reset_buffer(self, frame_bgr: np.ndarray, box: Box) -> None:
+        torch = self._torch
+        # Margin keeps query points off the exact box edge, where a
+        # tightly-cropped detection is most likely to sit ON the object's
+        # boundary (background visible on one side of the point) rather
+        # than solidly on the object.
+        mx, my = (box.x2 - box.x1) * 0.1, (box.y2 - box.y1) * 0.1
+        xs = np.linspace(box.x1 + mx, box.x2 - mx, self.grid_size)
+        ys = np.linspace(box.y1 + my, box.y2 - my, self.grid_size)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        pts = np.stack([grid_x.ravel(), grid_y.ravel()], axis=1).astype(np.float32)  # (N, 2)
+
+        # CoTracker query format: (t, x, y) per point, t=0 = first frame of
+        # whatever clip this queries tensor is paired with.
+        t0 = np.zeros((pts.shape[0], 1), dtype=np.float32)
+        queries = np.concatenate([t0, pts], axis=1)  # (N, 3)
+        self._queries = torch.from_numpy(queries).unsqueeze(0).to(self.device)  # (1, N, 3)
+        self._frames = [frame_bgr]
+        self._last_box = box
+        self._since_recompute = 0
+
+    def update(self, frame_bgr: np.ndarray) -> tuple[Box | None, float]:
+        if self._queries is None:
+            return None, 0.0
+
+        self._frames.append(frame_bgr)
+        self._since_recompute += 1
+
+        if len(self._frames) > self.window_len:
+            # Bound the buffer -- re-anchor on the last known box rather
+            # than growing forever. No new evidence about THIS frame is
+            # gathered by the reset itself, so hold the previous confidence.
+            if self._last_box is None:
+                self._queries = None
+                return None, 0.0
+            kept_conf = self._last_conf
+            self._reset_buffer(frame_bgr, self._last_box)
+            self._last_conf = kept_conf
+            return self._last_box, self._last_conf
+
+        if self._since_recompute < self.recompute_stride:
+            # Cheap hold -- frame is buffered for context, but the model
+            # isn't re-run every single frame (recompute_stride > 1).
+            return self._last_box, self._last_conf
+        self._since_recompute = 0
+
+        box, conf = self._run_model()
+        self._last_box, self._last_conf = box, conf
+        return box, conf
+
+    def _run_model(self) -> tuple[Box | None, float]:
+        torch = self._torch
+        video_bgr = np.stack(self._frames, axis=0)  # (T, H, W, 3) BGR uint8
+        video_rgb = video_bgr[..., ::-1].copy()
+        video_t = (
+            torch.from_numpy(video_rgb).permute(0, 3, 1, 2).float()[None].to(self.device)
+        )  # (1, T, 3, H, W)
+
+        with torch.no_grad():
+            pred_tracks, pred_visibility = self._model(video_t, queries=self._queries)
+
+        # Points on the LAST (current) frame of the buffer.
+        pts = pred_tracks[0, -1].detach().cpu().numpy()            # (N, 2)
+        vis = pred_visibility[0, -1].detach().cpu().numpy() > 0.5  # (N,)
+
+        n = len(vis)
+        n_visible = int(vis.sum())
+        conf = n_visible / n if n > 0 else 0.0
+        if n_visible < max(1, int(self.min_visible_ratio * n)):
+            return None, conf
+
+        vis_pts = pts[vis]
+        lo, hi = self.outlier_trim_pct / 2, 100 - self.outlier_trim_pct / 2
+        x1, x2 = np.percentile(vis_pts[:, 0], [lo, hi])
+        y1, y2 = np.percentile(vis_pts[:, 1], [lo, hi])
+        if x2 <= x1 or y2 <= y1:
+            return None, conf
+
+        return Box(float(x1), float(y1), float(x2), float(y2)), conf
+
+
 def build_tracker(cfg) -> Tracker:
     """Factory: construct the configured tracker."""
     name = cfg.stage4.tracker
@@ -359,4 +528,15 @@ def build_tracker(cfg) -> Tracker:
             search_factor=lt_cfg.search_factor,
             stride=lt_cfg.stride,
         )
-    raise ValueError(f"Unknown tracker '{name}'. Choose from: builtin, litetrack, none.")
+    if name == "cotracker3":
+        ct_cfg = cfg.stage4.cotracker
+        return CoTrackerTracker(
+            variant=ct_cfg.variant,
+            device=ct_cfg.device,
+            grid_size=ct_cfg.grid_size,
+            window_len=ct_cfg.window_len,
+            recompute_stride=ct_cfg.recompute_stride,
+            min_visible_ratio=ct_cfg.min_visible_ratio,
+            outlier_trim_pct=ct_cfg.outlier_trim_pct,
+        )
+    raise ValueError(f"Unknown tracker '{name}'. Choose from: builtin, litetrack, cotracker3, none.")

@@ -333,6 +333,48 @@ class LiteTrackConfig(BaseModel):
     stride: int = 16
 
 
+class CoTrackerConfig(BaseModel):
+    """stage4.tracker=cotracker3 -- see aero_eyes/models/trackers.py's
+    CoTrackerTracker docstring for the windowed-recompute adaptation this
+    project uses (CoTracker3 tracks POINTS, not boxes, and its real
+    "online" predictor needs FUTURE frames of context before it can emit a
+    result for a given frame -- incompatible with a per-frame-causal
+    Tracker.update() like CSRT/LiteTrack's. This class instead calls the
+    OFFLINE predictor's simple full-clip forward repeatedly on a small
+    growing/sliding buffer, always reading out the box for the buffer's
+    LAST frame, trading CoTracker's own incremental-state efficiency for a
+    synchronous per-frame answer). Experimental -- see that module for the
+    known trade-offs before relying on this in place of builtin/litetrack.
+    """
+    # torch.hub entrypoint name under facebookresearch/co-tracker. The
+    # offline predictor's forward signature (model(video, queries=...) over
+    # one self-contained clip) is what CoTrackerTracker's windowed-recompute
+    # design actually calls -- see class docstring. Only override to
+    # "cotracker3_online" if you also adapt CoTrackerTracker._run_model to
+    # that predictor's own step-wise/is_first_step calling convention.
+    variant: str = "cotracker3_offline"
+    device: str = "auto"
+    # NxN grid of query points sampled inside the box at (re-)init/re-anchor.
+    grid_size: int = 5
+    # Frames buffered before the tracker re-anchors (fresh grid re-sampled
+    # from the current box, buffer reset) -- bounds memory/compute for long
+    # tracks at the cost of losing point identity across the reset.
+    window_len: int = 16
+    # Re-run the model every Nth frame; on skipped frames the last box is
+    # held as-is (still appended to the buffer) -- the cheap knob for
+    # trading tracking granularity against compute cost.
+    recompute_stride: int = 1
+    # Fraction of the grid's query points that must still be "visible"
+    # (CoTracker's own occlusion prediction) on the current frame for the
+    # fitted box to be trusted -- this IS a real confidence signal, unlike
+    # BuiltinTracker's fixed 0.9 placeholder (see trackers.py).
+    min_visible_ratio: float = 0.3
+    # Trim this total percentage (half from each tail) of visible points'
+    # x/y coordinates before fitting the box, so a few residual outlier
+    # points among the "visible" ones don't blow the box out.
+    outlier_trim_pct: float = 10.0
+
+
 class DetectionConfirmationConfig(BaseModel):
     """Guards against a SINGLE spurious detection getting amplified into a
     long false track: a detector "hit" (whether the initial keyframe scan
@@ -389,6 +431,7 @@ class Stage4Config(BaseModel):
     tracker: str = "builtin"
     builtin: BuiltinTrackerConfig = BuiltinTrackerConfig()
     litetrack: LiteTrackConfig = LiteTrackConfig()
+    cotracker: CoTrackerConfig = CoTrackerConfig()
     tracker_conf_threshold: float = 0.40
     max_track_age: int = 30
     confirm_detections: DetectionConfirmationConfig = DetectionConfirmationConfig()
@@ -442,7 +485,7 @@ class Stage4Config(BaseModel):
     @field_validator("tracker")
     @classmethod
     def check_tracker(cls, v: str) -> str:
-        allowed = {"builtin", "litetrack", "none"}
+        allowed = {"builtin", "litetrack", "cotracker3", "none"}
         if v not in allowed:
             raise ValueError(f"stage4.tracker must be one of {allowed}; got '{v}'.")
         return v

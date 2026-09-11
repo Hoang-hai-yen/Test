@@ -582,12 +582,28 @@ stage123_geco2:
 # STAGE 4 — Tracking between keyframes
 # ----------------------------------------------------------------------------
 stage4:
-  tracker: builtin           # <<< "builtin" | "litetrack" | "none"
+  tracker: builtin           # <<< "builtin" | "litetrack" | "cotracker3" | "none"
                              #   builtin   = OpenCV CSRT/KCF (no extra weights)
                              #   litetrack = LiteTrack-B4 ONNX (needs weights)
+                             #   cotracker3 = CoTracker3 point-tracker, adapted to
+                             #                a per-frame box (EXPERIMENTAL, see
+                             #                aero_eyes/models/trackers.py's
+                             #                CoTrackerTracker docstring)
                              #   none      = run detection on EVERY frame
   builtin:
     algorithm: csrt          # csrt | kcf | mosse
+  cotracker3:
+    # Experimental -- see aero_eyes/models/trackers.py's CoTrackerTracker
+    # docstring for the windowed-recompute design and its trade-offs vs.
+    # CoTracker's own true online mode. Needs CoTracker's own runtime
+    # reachable via torch.hub.load("facebookresearch/co-tracker", variant).
+    variant: cotracker3_offline
+    device: auto
+    grid_size: 5             # NxN query points sampled inside the box at (re-)init
+    window_len: 16           # buffer cap before re-anchoring (bounds memory/compute)
+    recompute_stride: 1      # re-run the model every Nth frame (1 = every frame)
+    min_visible_ratio: 0.3   # fraction of grid points that must stay visible to trust the box
+    outlier_trim_pct: 10.0   # trim this % (half each tail) of visible points before fitting the box
   litetrack:
     # Both REQUIRED if tracker=litetrack; else fail clearly. Real LiteTrack
     # inference is 2 separate graphs, not 1 -- see
