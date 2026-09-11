@@ -187,6 +187,27 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 sample_id, s4.verify_interval, proto_path,
             )
 
+    # geco2_redetect_cosine_filter needs the same DINOv2 extractor/prototype
+    # as verify_interval above, but on a different trigger (use_geco2, not
+    # tracker-active-ness) -- reuse it if verify_interval already loaded it,
+    # otherwise load it here. Covers tracker=none (which skips the
+    # if/elif above entirely) and verify_interval=0 (which skips the elif).
+    if use_geco2 and s4.geco2_redetect_cosine_filter and extractor is None:
+        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.utils.io import read_prototype
+
+        proto_path = work_dir / cfg.stage1.prototype.cache_name
+        if proto_path.exists():
+            extractor = build_feature_extractor(cfg)
+            prototype, _, per_ref_features = read_prototype(proto_path)
+        else:
+            log.warning(
+                "[Stage4] %s: stage4.geco2_redetect_cosine_filter=true but no prototype.npz "
+                "found at %s -- cosine filter unavailable this run (needs "
+                "stage123_geco2.cosine_rescore.enabled to have built one).",
+                sample_id, proto_path,
+            )
+
     # ---- Video writer for visualizations ----
     writer = None
     if cfg.runtime.save_visualizations:
@@ -221,6 +242,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 if use_geco2:
                     raw_box, source = _detect_on_frame_geco2(
                         frame_bgr, geco2_detector, geco2_prototype, geco2_color_sig, cfg.stage123_geco2.color_postfilter,
+                        cosine_extractor=extractor if s4.geco2_redetect_cosine_filter else None,
+                        cosine_prototype=prototype if s4.geco2_redetect_cosine_filter else None,
+                        per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
                     )
                 else:
                     raw_box, source = _detect_on_frame(
@@ -329,6 +353,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 geco2_detector, geco2_prototype, geco2_color_sig = _load_geco2(cfg, sample_id, work_dir)
                             raw_box, source = _detect_on_frame_geco2(
                                 frame_bgr, geco2_detector, geco2_prototype, geco2_color_sig, cfg.stage123_geco2.color_postfilter,
+                                cosine_extractor=extractor if s4.geco2_redetect_cosine_filter else None,
+                                cosine_prototype=prototype if s4.geco2_redetect_cosine_filter else None,
+                                per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
                             )
                         else:
                             # Lazy-init for re-detect fallback -- guarded
@@ -456,12 +483,25 @@ def _load_geco2(cfg, sample_id: str, work_dir: Path):
     return detector, prototype, color_sig
 
 
-def _detect_on_frame_geco2(frame_bgr, detector, prototype, color_sig=None, cpf_cfg=None):
+def _detect_on_frame_geco2(
+    frame_bgr, detector, prototype, color_sig=None, cpf_cfg=None,
+    cosine_extractor=None, cosine_prototype=None, per_ref_features=None,
+    cfg=None, match_threshold=None,
+):
     """GeCo2-backed equivalent of _detect_on_frame: single best re-detection
     box on one frame, or (None, "none") if nothing passed threshold/NMS or
     the detector/prototype weren't available. Applies the same color
     post-filter as stage123_geco2.py's keyframe loop when color_sig is
     given -- see _load_geco2's docstring for why this path needs it too.
+
+    cosine_extractor/cosine_prototype (stage4.geco2_redetect_cosine_filter):
+    GeCo2's own score is relative per-frame, not a similarity to a known
+    target, so it sometimes locks onto a confuser instead of reporting
+    "not found". When given, every surviving candidate is additionally
+    embedded with DINOv2 and dropped unless its cosine similarity to
+    cosine_prototype clears match_threshold (the same adaptive/fixed
+    threshold Stage 3 used) -- the best GeCo2 score among the SURVIVORS
+    wins, or (None, "none") if none survive.
     """
     if detector is None or prototype is None:
         return None, "none"
@@ -471,6 +511,26 @@ def _detect_on_frame_geco2(frame_bgr, detector, prototype, color_sig=None, cpf_c
         boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
     if not boxes:
         return None, "none"
+
+    if cosine_extractor is not None and cosine_prototype is not None:
+        feats = cosine_extractor.extract_crops(
+            frame_bgr, boxes,
+            pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+            batch_size=cfg.runtime.batch_size,
+        )
+        use_multi_ref = (
+            cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+            and cfg.accuracy.cheap_boosters.multi_reference_embedding
+            and per_ref_features
+        )
+        if use_multi_ref:
+            sims = np.mean([feats @ ref_feat for ref_feat in per_ref_features], axis=0)
+        else:
+            sims = feats @ cosine_prototype
+        boxes = [b for b, sim in zip(boxes, sims) if sim >= match_threshold]
+        if not boxes:
+            return None, "none"
+
     best = max(boxes, key=lambda b: b.score)
     return best, "detect"
 

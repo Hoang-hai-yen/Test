@@ -392,6 +392,25 @@ class Stage4Config(BaseModel):
     # logic (confidence/age only), unchanged.
     verify_interval: int = 0
 
+    # When pipeline.detector=geco2, GeCo2's own re-detect score (relative
+    # per-frame, not cosine -- see geco2_detector.py) sometimes locks onto a
+    # confuser object instead of correctly reporting "not found" (observed
+    # as unrelated_false_positive runs via check_tracker_coverage.py). When
+    # this is enabled, every GeCo2 re-detect (NoneTracker's per-frame loop
+    # AND the active-tracker's re-detect-on-track-loss fallback) additionally
+    # embeds each GeCo2 candidate box with DINOv2 and drops any candidate
+    # whose cosine similarity to the prototype falls below the SAME
+    # match_threshold Stage 3 used (adaptive z-score value when
+    # stage3.adaptive_threshold is enabled, else the fixed config default --
+    # see stage4.py's match_threshold loading) -- the best-scoring GeCo2 box
+    # among the survivors is returned, or None if none survive. No effect on
+    # the legacy pipeline (already cosine-gated) or when verify_interval's
+    # own prototype.npz isn't available (needs stage123_geco2.cosine_rescore
+    # .enabled, same requirement as verify_interval above).
+    #
+    # False (default) = disabled -- GeCo2 re-detect behavior unchanged.
+    geco2_redetect_cosine_filter: bool = False
+
     @field_validator("tracker")
     @classmethod
     def check_tracker(cls, v: str) -> str:

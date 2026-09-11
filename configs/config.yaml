@@ -640,6 +640,20 @@ stage4:
   # 0 (default) = disabled, reproduces the original tracking logic exactly.
   verify_interval: 0
 
+  # pipeline.detector=geco2 only: GeCo2's own re-detect score is relative
+  # per-frame (see scripts/check_geco2_score_separation.py), so it sometimes
+  # locks onto a confuser instead of correctly reporting "not found" (shows
+  # up as unrelated_false_positive runs in check_tracker_coverage.py). When
+  # enabled, every GeCo2 re-detect additionally embeds each candidate box
+  # with DINOv2 and drops any candidate whose cosine similarity to the
+  # prototype falls below the SAME adaptive/fixed match_threshold Stage 3
+  # used; the best-scoring GeCo2 box among the survivors wins (None if none
+  # survive). No effect on the legacy pipeline, and no effect if
+  # prototype.npz isn't available (same stage123_geco2.cosine_rescore
+  # .enabled requirement as verify_interval above).
+  # false (default) = disabled, GeCo2 re-detect behavior unchanged.
+  geco2_redetect_cosine_filter: false
+
 # ----------------------------------------------------------------------------
 # STAGE 5 — Spatio-temporal output
 # ----------------------------------------------------------------------------
