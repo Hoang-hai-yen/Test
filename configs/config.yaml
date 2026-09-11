@@ -654,6 +654,26 @@ stage4:
   # false (default) = disabled, GeCo2 re-detect behavior unchanged.
   geco2_redetect_cosine_filter: false
 
+  # Cheap per-frame motion-plausibility check, complementary to
+  # verify_interval's (appearance-based) cosine check above -- catches a
+  # confuser that LOOKS similar enough to pass cosine but sits somewhere the
+  # real object couldn't plausibly have moved to since last frame. Runs
+  # EVERY frame of active tracking (a Kalman predict/correct is far cheaper
+  # than a DINOv2 embed) -- if it flags a frame, verify_interval's own
+  # check for that frame is skipped (track_ok is already False by then).
+  # See aero_eyes/utils/motion_kalman.py for the filter and why this
+  # borrows ByteTrack's core idea instead of its whole per-frame-detection
+  # multi-object framework (this project tracks one object per video).
+  kalman_motion_check:
+    enabled: false
+    # How far (in units of the box's own diagonal) the center may land from
+    # the filter's prediction before being judged an implausible jump.
+    # Lower = stricter (catches smaller jumps, more false alarms on genuine
+    # fast/erratic real motion).
+    max_dist_ratio: 3.0
+    process_noise: 0.01
+    measurement_noise: 1.0
+
 # ----------------------------------------------------------------------------
 # STAGE 5 — Spatio-temporal output
 # ----------------------------------------------------------------------------

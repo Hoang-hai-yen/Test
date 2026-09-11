@@ -359,6 +359,32 @@ class DetectionConfirmationConfig(BaseModel):
     iou_threshold: float = 0.3
 
 
+class KalmanMotionCheckConfig(BaseModel):
+    """stage4.kalman_motion_check -- a cheap per-frame motion-plausibility
+    check, complementary to verify_interval's (appearance-based) cosine
+    check. verify_interval can only catch a confuser that LOOKS different
+    from the prototype; it is blind to a confuser that looks similar but
+    sits somewhere the real object could not plausibly have moved to since
+    the last frame. See aero_eyes/utils/motion_kalman.py for the filter
+    itself and why this borrows ByteTrack's core idea instead of the whole
+    (multi-object, per-frame-detection) framework.
+
+    Runs EVERY frame of active tracking (not gated by verify_interval's own
+    cadence), since a constant-velocity Kalman predict/correct is orders of
+    magnitude cheaper than a DINOv2 embed -- if it already flags a frame,
+    verify_interval's own (more expensive) cosine check for that same frame
+    is skipped, since track_ok is already False by then.
+    """
+    enabled: bool = False
+    # How far (in units of the reported box's own diagonal) the box's
+    # center may land from where the filter predicted, before being judged
+    # an implausible jump. Lower = stricter (catches smaller jumps, but
+    # more likely to flag genuine fast/erratic real motion as drift).
+    max_dist_ratio: float = 3.0
+    process_noise: float = 1e-2
+    measurement_noise: float = 1.0
+
+
 class Stage4Config(BaseModel):
     tracker: str = "builtin"
     builtin: BuiltinTrackerConfig = BuiltinTrackerConfig()
@@ -410,6 +436,8 @@ class Stage4Config(BaseModel):
     #
     # False (default) = disabled -- GeCo2 re-detect behavior unchanged.
     geco2_redetect_cosine_filter: bool = False
+
+    kalman_motion_check: KalmanMotionCheckConfig = KalmanMotionCheckConfig()
 
     @field_validator("tracker")
     @classmethod

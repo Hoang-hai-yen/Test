@@ -8,6 +8,10 @@ Flow:  detections.json + video
           and cross-check it against the prototype, forcing a re-detect if
           it no longer matches -- catches silent drift builtin trackers'
           placeholder confidence can't (see _track_still_matches)
+       -> every frame (opt-in, stage4.kalman_motion_check): cheap Kalman
+          motion-plausibility check, forcing a re-detect on a geometrically
+          implausible jump verify_interval's cosine check wouldn't catch
+          (see aero_eyes/utils/motion_kalman.py)
        -> tracks.json
 
 Tracker options: builtin | litetrack | none
@@ -208,6 +212,17 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 sample_id, proto_path,
             )
 
+    # ---- Kalman motion-plausibility check (active tracker only -- see
+    # KalmanMotionCheckConfig for why this doesn't apply to tracker=none,
+    # which has no continuous track for motion to be judged against) ----
+    motion_kf = None
+    if not is_none_tracker and s4.kalman_motion_check.enabled:
+        from aero_eyes.utils.motion_kalman import BoxMotionKalman
+        motion_kf = BoxMotionKalman(
+            process_noise=s4.kalman_motion_check.process_noise,
+            measurement_noise=s4.kalman_motion_check.measurement_noise,
+        )
+
     # ---- Video writer for visualizations ----
     writer = None
     if cfg.runtime.save_visualizations:
@@ -268,6 +283,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
                         if confirmed is not None:
                             tracker.init(frame_bgr, confirmed)
+                            if motion_kf is not None:
+                                motion_kf.init(confirmed)
                             tracker_active = True
                             track_age = 0
                             frames_since_verify = 0
@@ -286,6 +303,22 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     track_ok = (conf >= s4.tracker_conf_threshold
                                 and track_age <= s4.max_track_age
                                 and box is not None)
+
+                    # Motion-plausibility check (stage4.kalman_motion_check,
+                    # opt-in): cheap enough to run every frame, unlike
+                    # verify_interval's DINOv2 cosine check below -- catches
+                    # a confuser that looks similar enough to pass cosine but
+                    # sits somewhere the real object couldn't plausibly have
+                    # moved to since last frame. Runs first so a frame it
+                    # already flags skips the more expensive cosine check
+                    # too (track_ok is already False by then).
+                    if track_ok and box is not None and motion_kf is not None:
+                        if not motion_kf.check_and_update(box, s4.kalman_motion_check.max_dist_ratio):
+                            log.debug(
+                                "[Stage4] frame %d: track failed motion-plausibility check "
+                                "(implausible jump) -- forcing re-detect", frame_idx,
+                            )
+                            track_ok = False
 
                     # OpenCV's own tracker confidence is a near-constant
                     # placeholder (BuiltinTracker.update always returns 0.9
@@ -340,6 +373,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
                                 )
                             tracker.init(frame_bgr, box)
+                            if motion_kf is not None:
+                                motion_kf.init(box)
 
                     if track_ok:
                         box_out = box
@@ -391,6 +426,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 source = "none"
                         if box_out is not None:
                             tracker.init(frame_bgr, box_out)
+                            if motion_kf is not None:
+                                motion_kf.init(box_out)
                             tracker_active = True
                             track_age = 0
                             frames_since_verify = 0
