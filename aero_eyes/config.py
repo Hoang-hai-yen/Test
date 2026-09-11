@@ -437,29 +437,43 @@ class AbsenceCheckConfig(BaseModel):
 
 
 class KalmanMotionCheckConfig(BaseModel):
-    """stage4.kalman_motion_check -- a cheap per-frame motion-plausibility
+    """stage4.kalman_motion_check -- a cheap per-frame drift-plausibility
     check, complementary to verify_interval's (appearance-based) cosine
     check. verify_interval can only catch a confuser that LOOKS different
     from the prototype; it is blind to a confuser that looks similar but
-    sits somewhere the real object could not plausibly have moved to since
-    the last frame. See aero_eyes/utils/motion_kalman.py for the filter
+    sits somewhere the track's own recent trajectory could not plausibly
+    have led to. See aero_eyes/utils/motion_drift_check.py for the check
     itself and why this borrows ByteTrack's core idea instead of the whole
     (multi-object, per-frame-detection) framework.
 
+    v1 of this (single-step constant-velocity Kalman filter) was swept
+    empirically (scripts/sweep_kalman_max_dist_ratio.py) and found NET
+    HARMFUL at every ratio strict enough to ever trigger, on real footage
+    with plenty of genuine frame-to-frame acceleration (drone camera +
+    falling/tumbling objects) -- it mistook real motion for drift far more
+    often than it caught actual confuser locks. v2 (current) fits a robust
+    linear trend over window_frames PAST positions instead of trusting just
+    the immediately preceding frame, to damp that false-alarm rate -- NOT
+    yet validated the same way; re-sweep before trusting this in production.
+
     Runs EVERY frame of active tracking (not gated by verify_interval's own
-    cadence), since a constant-velocity Kalman predict/correct is orders of
-    magnitude cheaper than a DINOv2 embed -- if it already flags a frame,
-    verify_interval's own (more expensive) cosine check for that same frame
-    is skipped, since track_ok is already False by then.
+    cadence), since fitting a short linear trend is far cheaper than a
+    DINOv2 embed -- if it already flags a frame, verify_interval's own
+    (more expensive) cosine check for that same frame is skipped, since
+    track_ok is already False by then.
     """
     enabled: bool = False
     # How far (in units of the reported box's own diagonal) the box's
-    # center may land from where the filter predicted, before being judged
-    # an implausible jump. Lower = stricter (catches smaller jumps, but
-    # more likely to flag genuine fast/erratic real motion as drift).
+    # center may land from where the fitted trend predicted, before being
+    # judged an implausible departure from the track's own recent
+    # trajectory. Lower = stricter (catches smaller departures, but more
+    # likely to flag genuine fast/erratic real motion as drift).
     max_dist_ratio: float = 3.0
-    process_noise: float = 1e-2
-    measurement_noise: float = 1.0
+    # How many past frames the linear trend is fit over. Larger = smoother
+    # (more resistant to single-frame noise, but slower to notice a real
+    # direction change); needs >=3 to fit a trend at all -- below that the
+    # check is a no-op (always plausible) until enough history accumulates.
+    window_frames: int = 10
 
 
 class Stage4Config(BaseModel):

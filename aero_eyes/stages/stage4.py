@@ -8,10 +8,10 @@ Flow:  detections.json + video
           and cross-check it against the prototype, forcing a re-detect if
           it no longer matches -- catches silent drift builtin trackers'
           placeholder confidence can't (see _track_similarity)
-       -> every frame (opt-in, stage4.kalman_motion_check): cheap Kalman
-          motion-plausibility check, forcing a re-detect on a geometrically
-          implausible jump verify_interval's cosine check wouldn't catch
-          (see aero_eyes/utils/motion_kalman.py)
+       -> every frame (opt-in, stage4.kalman_motion_check): cheap windowed
+          drift-plausibility check, forcing a re-detect when the box departs
+          from its own recent trajectory in a way verify_interval's cosine
+          check wouldn't catch (see aero_eyes/utils/motion_drift_check.py)
        -> tracks.json
 
 Tracker options: builtin | litetrack | none
@@ -217,11 +217,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
     # which has no continuous track for motion to be judged against) ----
     motion_kf = None
     if not is_none_tracker and s4.kalman_motion_check.enabled:
-        from aero_eyes.utils.motion_kalman import BoxMotionKalman
-        motion_kf = BoxMotionKalman(
-            process_noise=s4.kalman_motion_check.process_noise,
-            measurement_noise=s4.kalman_motion_check.measurement_noise,
-        )
+        from aero_eyes.utils.motion_drift_check import BoxDriftCheck
+        motion_kf = BoxDriftCheck(window_frames=s4.kalman_motion_check.window_frames)
 
     # ---- Video writer for visualizations ----
     writer = None
@@ -241,6 +238,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
     tracker_active = False
     track_age = 0
     frames_since_verify = 0
+    # Temporary diagnostic counters for box_refine.apply_in_stage4 -- this
+    # path had no visibility at all (unlike scripts/check_box_refine_effect.py,
+    # which counts changed/rejected boxes for the apply_in_stage3 path).
+    br_attempts = 0
+    br_changed = 0
     confirm_cfg = s4.confirm_detections
     confirmer = (
         _DetectionConfirmer(confirm_cfg.required_hits, confirm_cfg.iou_threshold)
@@ -309,19 +311,19 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     # instead of attempted -- see that block for why.
                     skip_redetect = False
 
-                    # Motion-plausibility check (stage4.kalman_motion_check,
+                    # Drift-plausibility check (stage4.kalman_motion_check,
                     # opt-in): cheap enough to run every frame, unlike
                     # verify_interval's DINOv2 cosine check below -- catches
                     # a confuser that looks similar enough to pass cosine but
-                    # sits somewhere the real object couldn't plausibly have
-                    # moved to since last frame. Runs first so a frame it
-                    # already flags skips the more expensive cosine check
-                    # too (track_ok is already False by then).
+                    # sits somewhere the box's own recent trajectory couldn't
+                    # plausibly have led to. Runs first so a frame it already
+                    # flags skips the more expensive cosine check too
+                    # (track_ok is already False by then).
                     if track_ok and box is not None and motion_kf is not None:
                         if not motion_kf.check_and_update(box, s4.kalman_motion_check.max_dist_ratio):
                             log.debug(
-                                "[Stage4] frame %d: track failed motion-plausibility check "
-                                "(implausible jump) -- forcing re-detect", frame_idx,
+                                "[Stage4] frame %d: track failed drift-plausibility check "
+                                "(diverged from recent trajectory) -- forcing re-detect", frame_idx,
                             )
                             track_ok = False
 
@@ -380,6 +382,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         # whether the cosine re-verification above ran at
                         # all (no DINOv2 prototype needed for this).
                         if track_ok and box_refine_active:
+                            br_attempts += 1
+                            box_before_refine = box
                             if br_cfg.method == "sam_dense":
                                 from aero_eyes.utils.box_refine import refine_boxes_dense
                                 box = refine_boxes_dense(
@@ -399,6 +403,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     br_cfg.method, frame_bgr, box, br_cfg.context_margin,
                                     segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
                                 )
+                            if box != box_before_refine:
+                                br_changed += 1
                             tracker.init(frame_bgr, box)
                             if motion_kf is not None:
                                 motion_kf.init(box)
@@ -489,6 +495,13 @@ def run_stage4(cfg, sample_id: str) -> Path:
     present = sum(1 for v in tracks.values() if v is not None)
     log.info("[Stage4] %s done in %.1fs -> %s (%d/%d frames with box)",
              sample_id, elapsed, tracks_path, present, total_frames)
+    if box_refine_active:
+        log.info(
+            "[Stage4] %s: box_refine.apply_in_stage4 fired %d time(s), actually "
+            "changed the box %d time(s) (rest left unchanged by "
+            "min_iou_with_original=%.2f gate or no plausible mask found)",
+            sample_id, br_attempts, br_changed, br_cfg.min_iou_with_original,
+        )
     return tracks_path
 
 
