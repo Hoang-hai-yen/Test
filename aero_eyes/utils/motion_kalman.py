@@ -47,7 +47,11 @@ class BoxMotionKalman:
         whenever the caller's own tracker.init() is called (new keyframe
         lock, post-refine re-anchor, or re-detect after track loss)."""
         cx, cy = (box.x1 + box.x2) / 2.0, (box.y1 + box.y2) / 2.0
-        self._kf.statePost = np.array([cx, cy, 0.0, 0.0], dtype=np.float32)
+        # Explicit (4,1) column vector -- a bare 1D (4,) array is coerced
+        # differently across OpenCV major versions (silently worked as a
+        # column vector on 4.x here, but OpenCV 5.0's gemm inside predict()
+        # asserts on the resulting shape instead of coercing it).
+        self._kf.statePost = np.array([[cx], [cy], [0.0], [0.0]], dtype=np.float32)
         self._kf.errorCovPost = np.eye(4, dtype=np.float32)
         self._ready = True
 
@@ -76,5 +80,5 @@ class BoxMotionKalman:
         dist = ((cx - pred_cx) ** 2 + (cy - pred_cy) ** 2) ** 0.5
         plausible = diag <= 0 or (dist / diag) <= max_dist_ratio
 
-        self._kf.correct(np.array([cx, cy], dtype=np.float32))
+        self._kf.correct(np.array([[cx], [cy]], dtype=np.float32))
         return plausible
