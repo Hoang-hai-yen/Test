@@ -13,6 +13,26 @@ from typing import Any, Literal, Optional
 import yaml
 from pydantic import BaseModel, field_validator, model_validator
 
+# Pure infra escape-hatch for a known cuDNN issue seen on some GPU/driver
+# combos ("Unable to find a valid cuDNN algorithm to run convolution" /
+# "GET was unable to find an engine..."), NOT a real modeling choice --
+# deliberately an env var, not a config.yaml field, since it has nothing to
+# do with the experiment being run. Disabling cuDNN falls back to a slower
+# but much more reliable conv implementation. Set AERO_EYES_DISABLE_CUDNN=1
+# in the shell BEFORE running any aero_eyes command if you hit that error.
+#
+# Applied at IMPORT time (not inside Config.device()) -- a stage can run its
+# own model (e.g. stage1.py's MobileSAMSegmenter) and fire the first CUDA
+# conv of the whole process before anything ever calls cfg.device(), so
+# setting torch.backends.cudnn.enabled=False only there arrives too late for
+# that first call and the env var silently does nothing for it.
+if os.environ.get("AERO_EYES_DISABLE_CUDNN"):
+    try:
+        import torch
+        torch.backends.cudnn.enabled = False
+    except ImportError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Sub-models
@@ -1144,20 +1164,8 @@ class AeroEyesConfig(BaseModel):
         return Path(self.project.work_dir) / sample_id
 
     def device(self) -> str:
-        # Pure infra escape-hatch for a known cuDNN issue seen on some
-        # GPU/driver combos ("Unable to find a valid cuDNN algorithm to run
-        # convolution" / "GET was unable to find an engine..."), NOT a real
-        # modeling choice -- deliberately an env var, not a config.yaml
-        # field, since it has nothing to do with the experiment being run.
-        # Disabling cuDNN falls back to a slower but much more reliable
-        # conv implementation. Set AERO_EYES_DISABLE_CUDNN=1 in the shell
-        # BEFORE running any aero_eyes command if you hit that error.
-        if os.environ.get("AERO_EYES_DISABLE_CUDNN"):
-            try:
-                import torch
-                torch.backends.cudnn.enabled = False
-            except ImportError:
-                pass
+        # AERO_EYES_DISABLE_CUDNN is applied at module-import time above,
+        # not here -- see that comment for why.
         if self.runtime.device != "auto":
             return self.runtime.device
         try:
