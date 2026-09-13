@@ -356,6 +356,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 refined_boxes = refine_boxes_dense(
                     box_refine_segmenter, frame_bgr, [d.box for d in result_dets],
                     min_iou_with_original=br_cfg.min_iou_with_original,
+                    context_margin=br_cfg.context_margin,
                 )
                 result_dets = [
                     Detection(frame_idx=d.frame_idx, box=rb, similarity=d.similarity, source=d.source)

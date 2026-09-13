@@ -1106,9 +1106,17 @@ class BoxRefineConfig(BaseModel):
     enabled: bool = False
     method: Literal["sam", "sam_dense", "grabcut", "sam2_dense"] = "sam"
     # Padding kept around the original box, as a fraction of the box's own
-    # width/height, when cropping the region SAM/GrabCut segments -- gives
-    # the segmenter a bit of surrounding context instead of the box edge
-    # cutting through the object.
+    # width/height. For "sam"/"grabcut": how much extra context to include
+    # when CROPPING the region that gets segmented, so the segmenter isn't
+    # starved of surrounding context right at the box edge. For "sam_dense":
+    # expands the box PROMPT itself before querying SAM's (already
+    # full-frame-encoded) embedding -- without this, SAM's box-conditioned
+    # decoder tends to stay close to whatever box it's given, so an
+    # UNDERSIZED detector box (e.g. only ~60% of the true object) rarely
+    # gets expanded back out even with min_iou_with_original=0.0 (confirmed
+    # in practice -- see MobileSAMSegmenter.segment_box_cached's own
+    # docstring). Ignored by "sam2_dense" (GeCo2Detector.sam2_refine_boxes
+    # has its own prompting, not routed through this field).
     context_margin: float = 0.2
     apply_in_stage3: bool = True
     apply_in_stage4: bool = False

@@ -202,7 +202,7 @@ class _DenseSegmenter:
         self.set_frame_calls += 1
         return self._set_frame_ok
 
-    def segment_box_cached(self, box):
+    def segment_box_cached(self, box, margin=0.0):
         return self.mask
 
 

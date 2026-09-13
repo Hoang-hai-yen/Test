@@ -166,6 +166,7 @@ def apply_iou_gate(
 
 def refine_boxes_dense(
     segmenter, frame_bgr, boxes: list[Box], min_iou_with_original: float = 0.0,
+    context_margin: float = 0.0,
 ) -> list[Box]:
     """box_refine.method == "sam_dense": refine every box in `boxes` (all
     on the SAME frame) using ONE shared MobileSAM image encoding, instead
@@ -177,6 +178,13 @@ def refine_boxes_dense(
     see MobileSAMSegmenter.set_frame's docstring for why MobileSAM can't
     literally reuse GeCo2's own features and needs its own encode instead).
 
+    `context_margin` is forwarded to segment_box_cached() to pad the box
+    prompt -- important when the incoming box already UNDERSIZES the real
+    object: without it, SAM has no room to propose anything bigger than
+    (near) the box it was given, and min_iou_with_original=0.0 alone won't
+    fix that (see segment_box_cached's own docstring -- confirmed the
+    bottleneck there is the prompt, not the gate).
+
     Applies the same min_iou_with_original safety gate as refine_box() to
     each box independently. Falls back to returning `boxes` UNCHANGED
     (never raises) if `segmenter` is None or the frame encoding fails.
@@ -186,7 +194,7 @@ def refine_boxes_dense(
 
     refined_boxes: list[Box] = []
     for box in boxes:
-        mask = segmenter.segment_box_cached(box)
+        mask = segmenter.segment_box_cached(box, margin=context_margin)
         if mask is None:
             refined_boxes.append(box)
             continue

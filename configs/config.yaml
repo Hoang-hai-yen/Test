@@ -776,7 +776,12 @@ box_refine:
   #               Meta's public pretrained SAM2 checkpoint. Not yet
   #               benchmarked on this project's dataset the way "sam" was.
   method: sam                # "sam" | "sam_dense" | "grabcut" | "sam2_dense"
-  context_margin: 0.2        # padding kept around the box when cropping to segment (ignored by sam_dense/sam2_dense)
+  # "sam"/"grabcut": padding kept around the box when CROPPING to segment.
+  # "sam_dense": padding added to the box PROMPT itself before querying SAM
+  #   -- without this, an undersized detector box rarely gets expanded back
+  #   out even with min_iou_with_original=0.0 (SAM's decoder stays close to
+  #   whatever box it's given). Ignored by "sam2_dense".
+  context_margin: 0.2
   # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box falls
   # below this -- guards against the segmenter latching onto a sub-part,
   # a nearby confuser, or background clutter within the padded crop

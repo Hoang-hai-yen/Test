@@ -188,11 +188,26 @@ class MobileSAMSegmenter:
             log.warning("MobileSAM set_frame failed (%s).", e)
             return False
 
-    def segment_box_cached(self, box: Box) -> np.ndarray | None:
+    def segment_box_cached(self, box: Box, margin: float = 0.0) -> np.ndarray | None:
         """Refine `box` using the image embedding set_frame() already
         cached for the CURRENT frame -- must be called after set_frame()
         for that frame. `box` is in that frame's own pixel coordinates
         (SamPredictor applies its own internal resize transform).
+
+        `margin`: expand `box` by this fraction of its own width/height on
+        each side BEFORE using it as SAM's box prompt (0.0 = prompt with
+        `box` exactly as given). SAM's box-prompted decoder treats the box
+        fairly literally -- if the incoming box already UNDERSIZES the real
+        object (a common detector failure mode: box covers e.g. only ~60%
+        of the true object), prompting with that same tight box gives SAM
+        no visual room to recognize the object continues past it, so the
+        returned mask tends to stay close to the input box regardless of
+        box_refine.min_iou_with_original (confirmed in practice: relaxing
+        that gate to 0.0 made no difference for such boxes, because the
+        candidate SAM proposed was already nearly identical to the
+        original -- the bottleneck was the prompt, not the gate). A small
+        margin costs nothing extra here (the whole frame is already
+        encoded by set_frame(), unlike segment_box()'s per-call crop).
 
         Unlike segment_box() (which applies area/border-touch plausibility
         gates calibrated for a small CROP), this trusts SAM's own
@@ -209,7 +224,9 @@ class MobileSAMSegmenter:
         if not self._available:
             return None
         try:
-            box_arr = np.array([box.x1, box.y1, box.x2, box.y2])
+            bw, bh = box.x2 - box.x1, box.y2 - box.y1
+            mx, my = bw * margin, bh * margin
+            box_arr = np.array([box.x1 - mx, box.y1 - my, box.x2 + mx, box.y2 + my])
             masks, scores, _ = self._predictor.predict(
                 point_coords=None,
                 point_labels=None,

@@ -64,7 +64,11 @@ srun --unbuffered ./GECO2/slurm_gpu_task.sh "$REQUIRED_VRAM" "$PYTHON" -m aero_e
 --set stage4.verify_interval=0 \
 --set stage4.geco2_redetect_cosine_filter=true \
 --set runtime.save_visualizations=false \
---set box_refine.min_iou_with_original=0.5
+--set box_refine.min_iou_with_original=0.2 \
+--set stage4.geco2_redetect_cosine_filter=true \
+--set stage4.tracker=litetrack \
+--set stage4.litetrack.onnx_path_z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx \
+--set stage4.litetrack.onnx_path_x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx
 
 echo "=== check_stage_prf1_progression (moi sample, tung stage) ==="
 "$PYTHON" -m scripts.check_stage_prf1_progression \
@@ -72,3 +76,9 @@ echo "=== check_stage_prf1_progression (moi sample, tung stage) ==="
     --set data.data_root="$DATA_ROOT" \
     --set data.gt.global_file="$GT_FILE" \
     --set project.work_dir="$WORK_DIR"
+
+echo "=== evaluate (moi sample, tung stage) ==="
+"$PYTHON" python -m aero_eyes.evaluate \
+    --pred "$WORK_DIR/submission_all.json" \
+    --gt "$GT_FILE" \
+    --config configs/config.yaml
