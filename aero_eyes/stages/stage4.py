@@ -220,6 +220,19 @@ def run_stage4(cfg, sample_id: str) -> Path:
         from aero_eyes.utils.motion_drift_check import BoxDriftCheck
         motion_kf = BoxDriftCheck(window_frames=s4.kalman_motion_check.window_frames)
 
+    # ---- keep_tracking_on_missed_keyframe.validate_against_next_keyframe:
+    # dedicated BoxDriftCheck instance (independent of kalman_motion_check
+    # above, which may be disabled) fed the CURRENT track's positions every
+    # tracked frame regardless of kept/not-kept status, so it always holds
+    # the trend since the last trusted anchor -- see
+    # KeepTrackingOnMissedKeyframeConfig's docstring for why this checks
+    # motion plausibility instead of leaning on cosine/appearance. ----
+    kt_cfg = s4.keep_tracking_on_missed_keyframe
+    missed_kf_drift = None
+    if not is_none_tracker and kt_cfg.enabled and kt_cfg.validate_against_next_keyframe:
+        from aero_eyes.utils.motion_drift_check import BoxDriftCheck
+        missed_kf_drift = BoxDriftCheck(window_frames=kt_cfg.window_frames)
+
     # ---- Video writer for visualizations ----
     writer = None
     if cfg.runtime.save_visualizations:
@@ -249,6 +262,48 @@ def run_stage4(cfg, sample_id: str) -> Path:
         if confirm_cfg.enabled else None
     )
 
+    # frame_idx of the first frame in an ONGOING keep_tracking_on_missed_keyframe
+    # segment still awaiting validation (None = no pending segment). Set the
+    # moment a missed keyframe first gets kept-through; resolved (validated
+    # or cleared) the next time an INDEPENDENT box becomes available -- see
+    # _resolve_pending_kept_segment below.
+    kept_segment_start: int | None = None
+
+    def _clear_pending_kept_segment() -> None:
+        """No independent box available to validate a pending segment
+        against (track went fully inactive without a fresh re-init) --
+        leave its already-written frames as-is, just stop treating it as
+        open so a LATER, unrelated segment isn't validated against it."""
+        nonlocal kept_segment_start
+        kept_segment_start = None
+
+    def _resolve_pending_kept_segment(fresh_box: Box) -> None:
+        """Call whenever an INDEPENDENT fresh box becomes available (a real
+        keyframe detection, or a successful re-detect) while a
+        keep_tracking_on_missed_keyframe segment is pending. Checks
+        `fresh_box` for motion-plausibility against the trend fitted from
+        the kept segment's OWN tracked positions; if implausible, every
+        frame in [kept_segment_start, frame_idx) is retroactively marked
+        absent instead of keeping a track that likely drifted onto the
+        wrong object. No-op (just clears the pending marker) if nothing is
+        pending, or if validate_against_next_keyframe is off (missed_kf_drift
+        is None then) -- reproduces "always keep, never check" in that case.
+        """
+        nonlocal kept_segment_start
+        if kept_segment_start is None:
+            return
+        if missed_kf_drift is not None:
+            plausible = missed_kf_drift.check_and_update(fresh_box, kt_cfg.max_dist_ratio)
+            if not plausible:
+                for fi in range(kept_segment_start, frame_idx):
+                    tracks[fi] = None
+                log.debug(
+                    "[Stage4] frame %d: kept-through segment [%d, %d) failed "
+                    "motion-plausibility check against this frame's independent "
+                    "detection -- retroactively marked absent", frame_idx, kept_segment_start, frame_idx,
+                )
+        kept_segment_start = None
+
     try:
         for frame_idx, frame_bgr in frame_iterator(video_path):
             box_out: Box | None = None
@@ -277,31 +332,53 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     box_out = confirmer.offer(raw_box)
                     source = "detect" if box_out is not None else "none"
             else:
-                if frame_idx in kf_set:
+                is_keyframe = frame_idx in kf_set
+                dets = detections[frame_idx] if is_keyframe else None
+                if is_keyframe and dets:
                     # Initialize or re-initialize tracker from detection
-                    dets = detections[frame_idx]
-                    if dets:
-                        candidate = max(dets, key=lambda d: d.similarity).box
-                        confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
-                        if confirmed is not None:
-                            tracker.init(frame_bgr, confirmed)
-                            if motion_kf is not None:
-                                motion_kf.init(confirmed)
-                            tracker_active = True
-                            track_age = 0
-                            frames_since_verify = 0
-                            box_out = confirmed
-                            source = "detect"
-                        else:
-                            tracker_active = False
+                    candidate = max(dets, key=lambda d: d.similarity).box
+                    confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
+                    if confirmed is not None:
+                        # This IS the independent box a pending
+                        # keep_tracking_on_missed_keyframe segment (if any)
+                        # was waiting for -- validate/resolve it BEFORE
+                        # trusting this detection over the tracker's state.
+                        _resolve_pending_kept_segment(confirmed)
+                        tracker.init(frame_bgr, confirmed)
+                        if motion_kf is not None:
+                            motion_kf.init(confirmed)
+                        if missed_kf_drift is not None:
+                            missed_kf_drift.init(confirmed)
+                        tracker_active = True
+                        track_age = 0
+                        frames_since_verify = 0
+                        box_out = confirmed
+                        source = "detect"
                     else:
                         tracker_active = False
-                        if confirmer is not None:
-                            confirmer.reset()
-                elif tracker_active:
+                        _clear_pending_kept_segment()
+                # stage4.keep_tracking_on_missed_keyframe: a keyframe with no
+                # surviving detection falls through to the SAME
+                # tracker.update() path as a non-keyframe, as long as a track
+                # is already active -- see that config field's own docstring
+                # for why (a missed DETECTION at one frame shouldn't override
+                # the tracker's own live state, which every check below still
+                # gets to judge on its own terms).
+                elif tracker_active and (not is_keyframe or kt_cfg.enabled):
+                    if is_keyframe and kept_segment_start is None:
+                        kept_segment_start = frame_idx
                     box, conf = tracker.update(frame_bgr)
                     track_age += 1
                     frames_since_verify += 1
+                    if missed_kf_drift is not None and box is not None:
+                        # Feed the trend continuously (whether or not this
+                        # frame ends up part of a kept-through segment) so
+                        # whenever validation DOES trigger, it has the
+                        # richest history available -- see missed_kf_drift's
+                        # own setup comment. Return value unused here; only
+                        # the check at _resolve_pending_kept_segment's call
+                        # site (against an INDEPENDENT box) matters.
+                        missed_kf_drift.check_and_update(box, kt_cfg.max_dist_ratio)
                     track_ok = (conf >= s4.tracker_conf_threshold
                                 and track_age <= s4.max_track_age
                                 and box is not None)
@@ -425,6 +502,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         source = "none"
                         if confirmer is not None:
                             confirmer.reset()
+                        _clear_pending_kept_segment()
                     else:
                         # Confidence too low, track too old, or failed
                         # re-verification — try re-detect
@@ -471,12 +549,31 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             if box_out is None:
                                 source = "none"
                         if box_out is not None:
+                            # Successful re-detect IS the independent box a
+                            # pending kept-through segment was waiting for.
+                            _resolve_pending_kept_segment(box_out)
                             tracker.init(frame_bgr, box_out)
                             if motion_kf is not None:
                                 motion_kf.init(box_out)
+                            if missed_kf_drift is not None:
+                                missed_kf_drift.init(box_out)
                             tracker_active = True
                             track_age = 0
                             frames_since_verify = 0
+                        else:
+                            # Re-detect also failed -- nothing independent
+                            # to validate a pending segment against; leave
+                            # its frames as-is (see _clear_pending_kept_segment).
+                            _clear_pending_kept_segment()
+                elif is_keyframe:
+                    # Keyframe had no surviving detection, and either no
+                    # track was active to fall back on, or
+                    # keep_tracking_on_missed_keyframe is off -- give up on
+                    # this keyframe exactly like the original logic did.
+                    tracker_active = False
+                    if confirmer is not None:
+                        confirmer.reset()
+                    _clear_pending_kept_segment()
 
             tracks[frame_idx] = box_out
 

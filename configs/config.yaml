@@ -639,6 +639,42 @@ stage4:
     required_hits: 2
     iou_threshold: 0.3
 
+  # A keyframe with ZERO surviving detections (GeCo2/Stage3 found nothing
+  # there -- e.g. a single false-negative frame sandwiched between two
+  # keyframes that BOTH detected the object) unconditionally kills an
+  # already-active track by default: stage4.py never even calls
+  # tracker.update() for that keyframe or any frame up to the NEXT one, so
+  # the whole gap comes back absent even though the tracker's own state
+  # (from the PRECEDING keyframe) might still be tracking correctly.
+  # When enabled, a keyframe with no detection is treated like any other
+  # non-keyframe frame WHENEVER a track is already active -- tracker.update()
+  # runs as usual, still subject to every other check above (conf
+  # threshold, max_track_age, kalman_motion_check, verify_interval +
+  # absence_check), so a genuinely-departed object is still caught by
+  # those; this only stops one missed DETECTION from overriding the
+  # tracker's own live state. No effect when no track is active yet.
+  keep_tracking_on_missed_keyframe:
+    enabled: false
+    # Tolerating a missed keyframe is only safe if the track being
+    # extended through it was actually correct -- without a check, this
+    # also lets an ALREADY-wrong track (locked onto a confuser earlier)
+    # survive a missed keyframe that would otherwise have reset it.
+    # Deliberately NOT cosine/appearance-based (domain gap + dynamic
+    # prototype drift make that unreliable on this project's footage) --
+    # instead, once the kept-through segment reaches the next INDEPENDENT
+    # box (a real keyframe detection or successful re-detect), that box is
+    # checked for motion-plausibility against a linear trend fitted from
+    # the kept segment's OWN tracked positions (same method as
+    # kalman_motion_check below, applied retroactively to one pending
+    # segment). If implausible, the whole kept-through segment is
+    # retroactively marked absent instead of keeping a likely-wrong track.
+    # true (default whenever this feature is enabled) -- the safety net is
+    # what makes tolerating a missed keyframe defensible in the first
+    # place; false reproduces "always keep, never check" for comparison.
+    validate_against_next_keyframe: true
+    window_frames: 10
+    max_dist_ratio: 3.0
+
   # Every verify_interval frames of ACTIVE tracking (builtin/litetrack, not
   # tracker=none), re-embed the currently-tracked crop with DINOv2 and
   # cross-check it against the prototype -- the real correctness check

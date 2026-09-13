@@ -395,6 +395,67 @@ class CoTrackerConfig(BaseModel):
     outlier_trim_pct: float = 10.0
 
 
+class KeepTrackingOnMissedKeyframeConfig(BaseModel):
+    """stage4.keep_tracking_on_missed_keyframe -- without this, a KEYFRAME
+    with zero surviving detections (GeCo2/Stage3 found nothing there, e.g.
+    a single false-negative frame sandwiched between two keyframes that
+    both DID detect the object) unconditionally kills an already-active
+    track: stage4.py never even calls tracker.update() for that keyframe
+    or any frame up to the NEXT one, so the whole gap comes back as absent
+    even though the tracker's own state (from the PRECEDING keyframe)
+    might still be tracking the object correctly. This is different from
+    every other failure mode in this file: those all judge an ACTIVE
+    track's own claim (conf/age/cosine/drift); this one discards a live
+    track purely because a SEPARATE detector call at this one frame came
+    up empty, without ever asking the tracker itself.
+
+    When enabled, a keyframe with no detection is treated like any other
+    non-keyframe frame WHEN a track is already active: tracker.update()
+    runs as usual, still subject to every other check (conf threshold,
+    max_track_age, kalman_motion_check, verify_interval + absence_check).
+    Has no effect when no track is active yet (nothing to fall back on).
+
+    validate_against_next_keyframe: tolerating a missed keyframe is only
+    safe if the track being extended through it was actually correct --
+    without a check, this also lets a track that was ALREADY wrong (locked
+    onto a confuser at some earlier keyframe) survive a missed keyframe
+    that would otherwise have reset it, extending the wrong track instead
+    of a right one. verify_interval's DINOv2 cosine check could catch that,
+    but is deliberately NOT relied on here: on this project's footage,
+    domain gap (reference photos vs. drone frames) and dynamic_prototype
+    drift already make cosine similarity an unreliable signal on its own
+    (see stage3's own adaptive-threshold machinery for how much tuning that
+    needed) -- exactly the failure mode this feature would be most exposed
+    to if it leaned on the same signal.
+
+    Instead, once a kept-through segment reaches the next INDEPENDENT box
+    (a real keyframe detection, or a successful re-detect), that box is
+    checked for motion-plausibility against a linear trend fitted from the
+    kept segment's OWN tracked positions -- same method and config shape as
+    stage4.kalman_motion_check (see aero_eyes/utils/motion_drift_check.py::
+    BoxDriftCheck), just applied retroactively to one pending segment
+    instead of flagging every frame live. If the independent box lands
+    implausibly far from where that trend predicts, every frame in the
+    kept-through segment is retroactively marked absent instead of keeping
+    a track that most likely drifted onto the wrong object. Real fast
+    motion is tolerated (the trend is fit from the object's OWN recent
+    trajectory, not a fixed position), the same way kalman_motion_check
+    tolerates it.
+
+    True (default whenever this feature is enabled) -- the safety net is
+    what makes tolerating a missed keyframe defensible in the first place.
+    Set False to reproduce "always keep the segment, never retroactively
+    check it" for comparison/debugging.
+    """
+    enabled: bool = False
+    validate_against_next_keyframe: bool = True
+    # Same semantics/defaults as stage4.kalman_motion_check's own fields --
+    # see KalmanMotionCheckConfig for what each one means; applied here to
+    # the kept-through segment's trajectory instead of every live frame.
+    window_frames: int = 10
+    max_dist_ratio: float = 3.0
+
+
 class DetectionConfirmationConfig(BaseModel):
     """Guards against a SINGLE spurious detection getting amplified into a
     long false track: a detector "hit" (whether the initial keyframe scan
@@ -504,6 +565,9 @@ class Stage4Config(BaseModel):
     tracker_conf_threshold: float = 0.40
     max_track_age: int = 30
     confirm_detections: DetectionConfirmationConfig = DetectionConfirmationConfig()
+
+    keep_tracking_on_missed_keyframe: KeepTrackingOnMissedKeyframeConfig = KeepTrackingOnMissedKeyframeConfig()
+
     # Every verify_interval frames of ACTIVE tracking (builtin/litetrack,
     # not tracker=none), re-embed the currently-tracked crop with DINOv2 and
     # cross-check it against the prototype -- the real correctness check

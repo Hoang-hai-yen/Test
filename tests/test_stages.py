@@ -612,6 +612,123 @@ def test_stage4_verify_interval_forces_redetect_on_drift(cfg, synth_fixture):
     assert "frames" in data
 
 
+def test_stage4_keep_tracking_on_missed_keyframe(cfg, synth_fixture):
+    """stage4.keep_tracking_on_missed_keyframe: a keyframe with ZERO
+    surviving detections, sandwiched between two keyframes that DID detect
+    the object (the exact scenario the flag exists for), must not silently
+    kill an already-active track for the whole gap up to the next keyframe.
+
+    Bypasses stages 1-3 entirely -- writes detections.json directly so the
+    "missed middle keyframe" case is exact and deterministic, and uses a
+    fake tracker that always reports success (like the real
+    verify_interval test) so this isolates the keyframe-branching logic
+    from actual tracking numerics.
+    """
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box = Box(5, 5, 15, 15, score=1.0)
+    detections = {
+        0: [Detection(frame_idx=0, box=box, similarity=0.9, source="test")],
+        10: [],  # missed middle keyframe -- detector found nothing here
+        20: [Detection(frame_idx=20, box=box, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box, 0.9)  # always "succeeds"
+
+    def _run(keep_tracking: bool) -> dict:
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.keep_tracking_on_missed_keyframe.enabled = keep_tracking
+        # High enough that track_age never expires across the 0-29 frame
+        # range below -- isolates the keyframe-branching logic under test
+        # from max_track_age's own re-detect fallback (which would need a
+        # real/mocked proposal model, irrelevant here).
+        cfg.stage4.max_track_age = 100
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker):
+            from aero_eyes.stages.stage4 import run_stage4
+            tracks_path = run_stage4(cfg, FIXTURE_ID)
+        with open(tracks_path) as f:
+            return json.load(f)["frames"]
+
+    frames_off = _run(False)
+    for fi in range(10, 20):
+        assert frames_off[str(fi)] is None, (
+            f"frame {fi}: flag off should reproduce the original behavior -- "
+            "the whole gap from the missed keyframe to the next one is lost"
+        )
+
+    frames_on = _run(True)
+    for fi in range(10, 20):
+        assert frames_on[str(fi)] is not None, (
+            f"frame {fi}: flag on should keep tracking through the missed "
+            "keyframe instead of discarding the already-active track"
+        )
+
+
+def test_stage4_keep_tracking_validates_against_next_keyframe(cfg, synth_fixture):
+    """keep_tracking_on_missed_keyframe.validate_against_next_keyframe: a
+    kept-through segment that turns out to have been WRONG (the tracker was
+    actually locked onto a stationary confuser the whole time) must be
+    retroactively marked absent once the next keyframe's INDEPENDENT
+    detection lands far from where the kept segment's own trend predicts --
+    not kept as a silently-wrong track. With validation off, the same wrong
+    segment is kept unconditionally (the old, unsafe behavior).
+    """
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    wrong_box = Box(5, 5, 15, 15, score=1.0)  # a stationary confuser
+    real_box = Box(500, 500, 510, 510, score=1.0)  # the actual object, found far away
+    detections = {
+        0: [Detection(frame_idx=0, box=wrong_box, similarity=0.9, source="test")],
+        10: [],  # missed middle keyframe
+        20: [Detection(frame_idx=20, box=real_box, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+
+    # Tracker never moves -- it's locked onto the stationary confuser for
+    # the entire kept-through segment, establishing a flat (zero-velocity)
+    # trend that the real detection at frame 20 grossly violates.
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (wrong_box, 0.9)
+
+    def _run(validate: bool) -> dict:
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.max_track_age = 100
+        cfg.stage4.keep_tracking_on_missed_keyframe.enabled = True
+        cfg.stage4.keep_tracking_on_missed_keyframe.validate_against_next_keyframe = validate
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker):
+            from aero_eyes.stages.stage4 import run_stage4
+            tracks_path = run_stage4(cfg, FIXTURE_ID)
+        with open(tracks_path) as f:
+            return json.load(f)["frames"]
+
+    frames_validated = _run(True)
+    for fi in range(10, 20):
+        assert frames_validated[str(fi)] is None, (
+            f"frame {fi}: the kept-through segment tracked a confuser that never moved, "
+            "while the real object turned up far away at the next keyframe -- validation "
+            "should have retroactively marked it absent"
+        )
+    # The next keyframe's own fresh, correct detection is unaffected.
+    assert frames_validated["20"] == real_box.to_dict()
+
+    frames_unvalidated = _run(False)
+    for fi in range(10, 20):
+        assert frames_unvalidated[str(fi)] is not None, (
+            f"frame {fi}: with validation off, the wrong kept-through segment should be "
+            "kept unconditionally (old, unsafe behavior) -- reproduces the pre-validation flag"
+        )
+
+
 def test_stage4_litetrack_missing_path_raises(cfg):
     """Stage 4 with litetrack + no onnx_path_z/onnx_path_x raises a clear error."""
     from pydantic import ValidationError
