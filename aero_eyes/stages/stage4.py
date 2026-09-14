@@ -690,6 +690,14 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     track_ok = (conf >= s4.tracker_conf_threshold
                                 and track_age <= s4.max_track_age
                                 and box is not None)
+                    if not track_ok:
+                        log.debug(
+                            "[Stage4] frame %d: tracker.update rejected "
+                            "(conf=%.3f threshold=%.3f, track_age=%d max=%d, "
+                            "box_is_none=%s) -- try re-detect",
+                            frame_idx, conf, s4.tracker_conf_threshold,
+                            track_age, s4.max_track_age, box is None,
+                        )
                     # Set below (stage4.absence_check) when verify_interval's
                     # cosine similarity comes back so far below
                     # match_threshold that re-detect is skipped outright

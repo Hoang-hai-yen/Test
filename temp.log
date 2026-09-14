@@ -1,0 +1,588 @@
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Helmet_0: dynamic prototype update round 1/2 -- adaptive threshold=0.150 (percentile=90), 94 candidates, alpha=0.30
+INFO:__main__:[Stage3] Helmet_0: dynamic prototype update round 2/2 -- adaptive threshold=0.815 (percentile=90), 98 candidates, alpha=0.30
+INFO:__main__:[Stage3] Helmet_0: candidate score stats (metric=cosine, higher=more similar) — min=0.118 p50=0.404 mean=0.472 std=0.213 p95=0.895 max=0.960 (n=974)
+INFO:__main__:[Stage3] Helmet_0: adaptive threshold (metric=cosine, stat=mean/std) = 0.472 + 1.3*0.213 = 0.749 (floor=0.050)
+INFO:__main__:[Stage3] Helmet_0: threshold=0.749 → 190 / 974 candidates pass
+INFO:__main__:[Stage3] Helmet_0: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Helmet_0/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Helmet_0 done in 80.0s -> /workspace/runs/geco2_finetune/finetuned_eval/Helmet_0/detections.json (190 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 17 frame(s) [103, 120) before the lock at frame 120
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 4 frame(s) [1548, 1552) before the lock at frame 1552
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 9 frame(s) [2463, 2472) before the lock at frame 2472
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 2 frame(s) [2990, 2992) before the lock at frame 2992
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 11 frame(s) [3181, 3192) before the lock at frame 3192
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 7 frame(s) [3401, 3408) before the lock at frame 3408
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 7 frame(s) [3889, 3896) before the lock at frame 3896
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 16 frame(s) [4040, 4056) before the lock at frame 4056
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 9 frame(s) [4191, 4200) before the lock at frame 4200
+INFO:__main__:[Stage4] Helmet_0: backward_tracking recovered 7 frame(s) [4489, 4496) before the lock at frame 4496
+INFO:__main__:[Stage4] Helmet_0 done in 116.8s -> /workspace/runs/geco2_finetune/finetuned_eval/Helmet_0/tracks.json (1701/4702 frames with box)
+INFO:__main__:[Stage5] Helmet_0: 1701 frames with boxes before smoothing
+INFO:__main__:[Stage5] Helmet_0: 1701 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Helmet_0/submission.json (1701 frames)
+INFO:__main__:[Stage5] Helmet_0 done in 0.2s -> /workspace/runs/geco2_finetune/finetuned_eval/Helmet_0/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Helmet_1: dynamic prototype update round 1/2 -- adaptive threshold=0.189 (percentile=90), 71 candidates, alpha=0.30
+INFO:__main__:[Stage3] Helmet_1: dynamic prototype update round 2/2 -- adaptive threshold=0.855 (percentile=90), 71 candidates, alpha=0.30
+INFO:__main__:[Stage3] Helmet_1: candidate score stats (metric=cosine, higher=more similar) — min=0.095 p50=0.276 mean=0.344 std=0.224 p95=0.914 max=0.954 (n=703)
+INFO:__main__:[Stage3] Helmet_1: adaptive threshold (metric=cosine, stat=mean/std) = 0.344 + 1.3*0.224 = 0.635 (floor=0.050)
+INFO:__main__:[Stage3] Helmet_1: threshold=0.635 → 96 / 703 candidates pass
+INFO:__main__:[Stage3] Helmet_1: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Helmet_1/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Helmet_1 done in 43.6s -> /workspace/runs/geco2_finetune/finetuned_eval/Helmet_1/detections.json (90 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 2 frame(s) [62, 64) before the lock at frame 64
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 6 frame(s) [2818, 2824) before the lock at frame 2824
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 9 frame(s) [3071, 3080) before the lock at frame 3080
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 1 frame(s) [3159, 3160) before the lock at frame 3160
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 8 frame(s) [3400, 3408) before the lock at frame 3408
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 2 frame(s) [4110, 4112) before the lock at frame 4112
+INFO:__main__:[Stage4] Helmet_1: backward_tracking recovered 4 frame(s) [4468, 4472) before the lock at frame 4472
+INFO:__main__:[Stage4] Helmet_1 done in 117.9s -> /workspace/runs/geco2_finetune/finetuned_eval/Helmet_1/tracks.json (736/4784 frames with box)
+INFO:__main__:[Stage5] Helmet_1: 736 frames with boxes before smoothing
+INFO:__main__:[Stage5] Helmet_1: 736 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Helmet_1/submission.json (736 frames)
+INFO:__main__:[Stage5] Helmet_1 done in 0.1s -> /workspace/runs/geco2_finetune/finetuned_eval/Helmet_1/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] IDCard_0: dynamic prototype update round 1/2 -- adaptive threshold=0.219 (percentile=90), 95 candidates, alpha=0.30
+INFO:__main__:[Stage3] IDCard_0: dynamic prototype update round 2/2 -- adaptive threshold=0.711 (percentile=90), 95 candidates, alpha=0.30
+INFO:__main__:[Stage3] IDCard_0: candidate score stats (metric=cosine, higher=more similar) — min=0.225 p50=0.503 mean=0.525 std=0.133 p95=0.795 max=0.874 (n=947)
+INFO:__main__:[Stage3] IDCard_0: adaptive threshold (metric=cosine, stat=mean/std) = 0.525 + 1.3*0.133 = 0.698 (floor=0.050)
+INFO:__main__:[Stage3] IDCard_0: threshold=0.698 → 117 / 947 candidates pass
+INFO:__main__:[Stage3] IDCard_0: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/IDCard_0/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] IDCard_0 done in 58.4s -> /workspace/runs/geco2_finetune/finetuned_eval/IDCard_0/detections.json (116 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 7 frame(s) [857, 864) before the lock at frame 864
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 9 frame(s) [991, 1000) before the lock at frame 1000
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 2 frame(s) [1294, 1296) before the lock at frame 1296
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 11 frame(s) [2101, 2112) before the lock at frame 2112
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 4 frame(s) [2316, 2320) before the lock at frame 2320
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 30 frame(s) [2394, 2424) before the lock at frame 2424
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 13 frame(s) [2491, 2504) before the lock at frame 2504
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 30 frame(s) [2890, 2920) before the lock at frame 2920
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 3 frame(s) [3165, 3168) before the lock at frame 3168
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 3 frame(s) [3565, 3568) before the lock at frame 3568
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 7 frame(s) [3921, 3928) before the lock at frame 3928
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 7 frame(s) [4321, 4328) before the lock at frame 4328
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 15 frame(s) [5217, 5232) before the lock at frame 5232
+INFO:__main__:[Stage4] IDCard_0: backward_tracking recovered 11 frame(s) [5349, 5360) before the lock at frame 5360
+INFO:__main__:[Stage4] IDCard_0 done in 131.6s -> /workspace/runs/geco2_finetune/finetuned_eval/IDCard_0/tracks.json (1374/5590 frames with box)
+INFO:__main__:[Stage5] IDCard_0: 1374 frames with boxes before smoothing
+INFO:__main__:[Stage5] IDCard_0: 1374 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/IDCard_0/submission.json (1374 frames)
+INFO:__main__:[Stage5] IDCard_0 done in 0.1s -> /workspace/runs/geco2_finetune/finetuned_eval/IDCard_0/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] IDCard_1: dynamic prototype update round 1/2 -- adaptive threshold=0.219 (percentile=90), 112 candidates, alpha=0.30
+INFO:__main__:[Stage3] IDCard_1: dynamic prototype update round 2/2 -- adaptive threshold=0.692 (percentile=90), 112 candidates, alpha=0.30
+INFO:__main__:[Stage3] IDCard_1: candidate score stats (metric=cosine, higher=more similar) — min=0.209 p50=0.583 mean=0.582 std=0.106 p95=0.751 max=0.828 (n=1119)
+INFO:__main__:[Stage3] IDCard_1: adaptive threshold (metric=cosine, stat=mean/std) = 0.582 + 1.3*0.106 = 0.720 (floor=0.050)
+INFO:__main__:[Stage3] IDCard_1: threshold=0.720 → 110 / 1119 candidates pass
+INFO:__main__:[Stage3] IDCard_1: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/IDCard_1/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] IDCard_1 done in 42.4s -> /workspace/runs/geco2_finetune/finetuned_eval/IDCard_1/detections.json (83 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [442, 472) before the lock at frame 472
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 3 frame(s) [1173, 1176) before the lock at frame 1176
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 9 frame(s) [1207, 1216) before the lock at frame 1216
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [1386, 1416) before the lock at frame 1416
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 19 frame(s) [1661, 1680) before the lock at frame 1680
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 1 frame(s) [1711, 1712) before the lock at frame 1712
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [1962, 1992) before the lock at frame 1992
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 1 frame(s) [2031, 2032) before the lock at frame 2032
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 9 frame(s) [2215, 2224) before the lock at frame 2224
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [2274, 2304) before the lock at frame 2304
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 18 frame(s) [2366, 2384) before the lock at frame 2384
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 9 frame(s) [2863, 2872) before the lock at frame 2872
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 1 frame(s) [2927, 2928) before the lock at frame 2928
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [3178, 3208) before the lock at frame 3208
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 1 frame(s) [3319, 3320) before the lock at frame 3320
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [3346, 3376) before the lock at frame 3376
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [3514, 3544) before the lock at frame 3544
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 9 frame(s) [3583, 3592) before the lock at frame 3592
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 9 frame(s) [3631, 3640) before the lock at frame 3640
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [3698, 3728) before the lock at frame 3728
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [3962, 3992) before the lock at frame 3992
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 17 frame(s) [4047, 4064) before the lock at frame 4064
+INFO:__main__:[Stage4] IDCard_1: backward_tracking recovered 30 frame(s) [4170, 4200) before the lock at frame 4200
+INFO:__main__:[Stage4] IDCard_1 done in 131.9s -> /workspace/runs/geco2_finetune/finetuned_eval/IDCard_1/tracks.json (1681/4755 frames with box)
+INFO:__main__:[Stage5] IDCard_1: 1681 frames with boxes before smoothing
+INFO:__main__:[Stage5] IDCard_1: 1705 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/IDCard_1/submission.json (1705 frames)
+INFO:__main__:[Stage5] IDCard_1 done in 0.2s -> /workspace/runs/geco2_finetune/finetuned_eval/IDCard_1/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Motorbike_0: dynamic prototype update round 1/2 -- adaptive threshold=0.150 (percentile=90), 54 candidates, alpha=0.30
+INFO:__main__:[Stage3] Motorbike_0: dynamic prototype update round 2/2 -- adaptive threshold=0.439 (percentile=90), 68 candidates, alpha=0.30
+INFO:__main__:[Stage3] Motorbike_0: candidate score stats (metric=cosine, higher=more similar) — min=0.069 p50=0.260 mean=0.330 std=0.200 p95=0.895 max=0.950 (n=673)
+INFO:__main__:[Stage3] Motorbike_0: adaptive threshold (metric=cosine, stat=mean/std) = 0.330 + 1.3*0.200 = 0.590 (floor=0.050)
+INFO:__main__:[Stage3] Motorbike_0: threshold=0.590 → 56 / 673 candidates pass
+INFO:__main__:[Stage3] Motorbike_0: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_0/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Motorbike_0 done in 34.8s -> /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_0/detections.json (55 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 28 frame(s) [1932, 1960) before the lock at frame 1960
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 13 frame(s) [2051, 2064) before the lock at frame 2064
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 15 frame(s) [2577, 2592) before the lock at frame 2592
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 11 frame(s) [3373, 3384) before the lock at frame 3384
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 6 frame(s) [4426, 4432) before the lock at frame 4432
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 19 frame(s) [5301, 5320) before the lock at frame 5320
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 30 frame(s) [5354, 5384) before the lock at frame 5384
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 25 frame(s) [5431, 5456) before the lock at frame 5456
+INFO:__main__:[Stage4] Motorbike_0: backward_tracking recovered 13 frame(s) [5587, 5600) before the lock at frame 5600
+INFO:__main__:[Stage4] Motorbike_0 done in 134.2s -> /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_0/tracks.json (791/5767 frames with box)
+INFO:__main__:[Stage5] Motorbike_0: 791 frames with boxes before smoothing
+INFO:__main__:[Stage5] Motorbike_0: 794 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_0/submission.json (794 frames)
+INFO:__main__:[Stage5] Motorbike_0 done in 0.1s -> /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_0/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Motorbike_1: dynamic prototype update round 1/2 -- adaptive threshold=0.150 (percentile=90), 70 candidates, alpha=0.30
+INFO:__main__:[Stage3] Motorbike_1: dynamic prototype update round 2/2 -- adaptive threshold=0.445 (percentile=90), 147 candidates, alpha=0.30
+INFO:__main__:[Stage3] Motorbike_1: candidate score stats (metric=cosine, higher=more similar) — min=0.077 p50=0.443 mean=0.458 std=0.129 p95=0.694 max=0.903 (n=1462)
+INFO:__main__:[Stage3] Motorbike_1: adaptive threshold (metric=cosine, stat=mean/std) = 0.458 + 1.3*0.129 = 0.625 (floor=0.050)
+INFO:__main__:[Stage3] Motorbike_1: threshold=0.625 → 146 / 1462 candidates pass
+INFO:__main__:[Stage3] Motorbike_1: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_1/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Motorbike_1 done in 69.3s -> /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_1/detections.json (140 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [74, 104) before the lock at frame 104
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 25 frame(s) [183, 208) before the lock at frame 208
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [266, 296) before the lock at frame 296
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 1 frame(s) [351, 352) before the lock at frame 352
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [410, 440) before the lock at frame 440
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 1 frame(s) [559, 560) before the lock at frame 560
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [930, 960) before the lock at frame 960
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [1490, 1520) before the lock at frame 1520
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [1578, 1608) before the lock at frame 1608
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 1 frame(s) [1639, 1640) before the lock at frame 1640
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 9 frame(s) [1671, 1680) before the lock at frame 1680
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 12 frame(s) [1796, 1808) before the lock at frame 1808
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 14 frame(s) [1858, 1872) before the lock at frame 1872
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [2042, 2072) before the lock at frame 2072
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 9 frame(s) [2935, 2944) before the lock at frame 2944
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [3018, 3048) before the lock at frame 3048
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 3 frame(s) [3885, 3888) before the lock at frame 3888
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [4034, 4064) before the lock at frame 4064
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 6 frame(s) [4090, 4096) before the lock at frame 4096
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 5 frame(s) [4179, 4184) before the lock at frame 4184
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [4258, 4288) before the lock at frame 4288
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 17 frame(s) [4383, 4400) before the lock at frame 4400
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [4866, 4896) before the lock at frame 4896
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [4930, 4960) before the lock at frame 4960
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [5026, 5056) before the lock at frame 5056
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 30 frame(s) [5234, 5264) before the lock at frame 5264
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 17 frame(s) [5455, 5472) before the lock at frame 5472
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 1 frame(s) [5503, 5504) before the lock at frame 5504
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 24 frame(s) [5728, 5752) before the lock at frame 5752
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 25 frame(s) [5863, 5888) before the lock at frame 5888
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 9 frame(s) [5919, 5928) before the lock at frame 5928
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 22 frame(s) [5978, 6000) before the lock at frame 6000
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 9 frame(s) [6095, 6104) before the lock at frame 6104
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 4 frame(s) [6124, 6128) before the lock at frame 6128
+INFO:__main__:[Stage4] Motorbike_1: backward_tracking recovered 4 frame(s) [6404, 6408) before the lock at frame 6408
+INFO:__main__:[Stage4] Motorbike_1 done in 214.7s -> /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_1/tracks.json (2765/6624 frames with box)
+INFO:__main__:[Stage5] Motorbike_1: 2765 frames with boxes before smoothing
+INFO:__main__:[Stage5] Motorbike_1: 2800 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_1/submission.json (2800 frames)
+INFO:__main__:[Stage5] Motorbike_1 done in 0.3s -> /workspace/runs/geco2_finetune/finetuned_eval/Motorbike_1/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Person2_0: dynamic prototype update round 1/2 -- adaptive threshold=0.150 (percentile=90), 19 candidates, alpha=0.30
+INFO:__main__:[Stage3] Person2_0: dynamic prototype update round 2/2 -- adaptive threshold=0.705 (percentile=90), 109 candidates, alpha=0.30
+INFO:__main__:[Stage3] Person2_0: candidate score stats (metric=cosine, higher=more similar) — min=0.139 p50=0.440 mean=0.479 std=0.143 p95=0.805 max=0.884 (n=1082)
+INFO:__main__:[Stage3] Person2_0: adaptive threshold (metric=cosine, stat=mean/std) = 0.479 + 1.3*0.143 = 0.665 (floor=0.050)
+INFO:__main__:[Stage3] Person2_0: threshold=0.665 → 162 / 1082 candidates pass
+INFO:__main__:[Stage3] Person2_0: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Person2_0/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Person2_0 done in 85.4s -> /workspace/runs/geco2_finetune/finetuned_eval/Person2_0/detections.json (162 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 8 frame(s) [560, 568) before the lock at frame 568
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 15 frame(s) [1113, 1128) before the lock at frame 1128
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 9 frame(s) [2359, 2368) before the lock at frame 2368
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 5 frame(s) [2451, 2456) before the lock at frame 2456
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 14 frame(s) [3026, 3040) before the lock at frame 3040
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 22 frame(s) [3402, 3424) before the lock at frame 3424
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 13 frame(s) [3795, 3808) before the lock at frame 3808
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 10 frame(s) [4174, 4184) before the lock at frame 4184
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 27 frame(s) [4565, 4592) before the lock at frame 4592
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 8 frame(s) [4816, 4824) before the lock at frame 4824
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 9 frame(s) [4855, 4864) before the lock at frame 4864
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 30 frame(s) [5074, 5104) before the lock at frame 5104
+INFO:__main__:[Stage4] Person2_0: backward_tracking recovered 8 frame(s) [5448, 5456) before the lock at frame 5456
+INFO:__main__:[Stage4] Person2_0 done in 133.0s -> /workspace/runs/geco2_finetune/finetuned_eval/Person2_0/tracks.json (1558/5585 frames with box)
+INFO:__main__:[Stage5] Person2_0: 1558 frames with boxes before smoothing
+INFO:__main__:[Stage5] Person2_0: 1558 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Person2_0/submission.json (1558 frames)
+INFO:__main__:[Stage5] Person2_0 done in 0.2s -> /workspace/runs/geco2_finetune/finetuned_eval/Person2_0/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Person2_1: dynamic prototype update round 1/2 -- adaptive threshold=0.213 (percentile=90), 68 candidates, alpha=0.30
+INFO:__main__:[Stage3] Person2_1: dynamic prototype update round 2/2 -- adaptive threshold=0.727 (percentile=90), 68 candidates, alpha=0.30
+INFO:__main__:[Stage3] Person2_1: candidate score stats (metric=cosine, higher=more similar) — min=0.197 p50=0.442 mean=0.488 std=0.155 p95=0.803 max=0.873 (n=677)
+INFO:__main__:[Stage3] Person2_1: adaptive threshold (metric=cosine, stat=mean/std) = 0.488 + 1.3*0.155 = 0.689 (floor=0.050)
+INFO:__main__:[Stage3] Person2_1: threshold=0.689 → 106 / 677 candidates pass
+INFO:__main__:[Stage3] Person2_1: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Person2_1/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Person2_1 done in 59.9s -> /workspace/runs/geco2_finetune/finetuned_eval/Person2_1/detections.json (103 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 30 frame(s) [1250, 1280) before the lock at frame 1280
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 17 frame(s) [1791, 1808) before the lock at frame 1808
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 30 frame(s) [2794, 2824) before the lock at frame 2824
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 9 frame(s) [3215, 3224) before the lock at frame 3224
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 1 frame(s) [3255, 3256) before the lock at frame 3256
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 1 frame(s) [3679, 3680) before the lock at frame 3680
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 28 frame(s) [3812, 3840) before the lock at frame 3840
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 1 frame(s) [3895, 3896) before the lock at frame 3896
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 11 frame(s) [4533, 4544) before the lock at frame 4544
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 17 frame(s) [4607, 4624) before the lock at frame 4624
+INFO:__main__:[Stage4] Person2_1: backward_tracking recovered 16 frame(s) [4840, 4856) before the lock at frame 4856
+INFO:__main__:[Stage4] Person2_1 done in 125.3s -> /workspace/runs/geco2_finetune/finetuned_eval/Person2_1/tracks.json (1318/4980 frames with box)
+INFO:__main__:[Stage5] Person2_1: 1318 frames with boxes before smoothing
+INFO:__main__:[Stage5] Person2_1: 1318 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Person2_1/submission.json (1318 frames)
+INFO:__main__:[Stage5] Person2_1 done in 0.1s -> /workspace/runs/geco2_finetune/finetuned_eval/Person2_1/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Wallet_0: dynamic prototype update round 1/2 -- adaptive threshold=0.150 (percentile=90), 10 candidates, alpha=0.30
+INFO:__main__:[Stage3] Wallet_0: dynamic prototype update round 2/2 -- adaptive threshold=0.852 (percentile=90), 51 candidates, alpha=0.30
+INFO:__main__:[Stage3] Wallet_0: candidate score stats (metric=cosine, higher=more similar) — min=0.162 p50=0.398 mean=0.515 std=0.280 p95=0.965 max=0.981 (n=507)
+INFO:__main__:[Stage3] Wallet_0: adaptive threshold (metric=cosine, stat=mean/std) = 0.515 + 1.3*0.280 = 0.879 (floor=0.050)
+INFO:__main__:[Stage3] Wallet_0: threshold=0.879 → 139 / 507 candidates pass
+INFO:__main__:[Stage3] Wallet_0: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Wallet_0/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Wallet_0 done in 65.4s -> /workspace/runs/geco2_finetune/finetuned_eval/Wallet_0/detections.json (139 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 5 frame(s) [51, 56) before the lock at frame 56
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 10 frame(s) [1366, 1376) before the lock at frame 1376
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 5 frame(s) [2019, 2024) before the lock at frame 2024
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 11 frame(s) [2517, 2528) before the lock at frame 2528
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 5 frame(s) [3283, 3288) before the lock at frame 3288
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 7 frame(s) [3633, 3640) before the lock at frame 3640
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 4 frame(s) [3828, 3832) before the lock at frame 3832
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 21 frame(s) [4795, 4816) before the lock at frame 4816
+INFO:__main__:[Stage4] Wallet_0: backward_tracking recovered 17 frame(s) [5335, 5352) before the lock at frame 5352
+INFO:__main__:[Stage4] Wallet_0 done in 142.7s -> /workspace/runs/geco2_finetune/finetuned_eval/Wallet_0/tracks.json (1191/5599 frames with box)
+INFO:__main__:[Stage5] Wallet_0: 1191 frames with boxes before smoothing
+INFO:__main__:[Stage5] Wallet_0: 1191 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Wallet_0/submission.json (1191 frames)
+INFO:__main__:[Stage5] Wallet_0 done in 0.2s -> /workspace/runs/geco2_finetune/finetuned_eval/Wallet_0/submission.json
+/venv/main/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/venv/main/lib/python3.12/site-packages/timm/models/registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_5m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_5m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_11m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_11m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_224 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_224. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_384 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_384. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+/venv/main/lib/python3.12/site-packages/mobile_sam/modeling/tiny_vit_sam.py:656: UserWarning: Overwriting tiny_vit_21m_512 in registry with mobile_sam.modeling.tiny_vit_sam.tiny_vit_21m_512. This is because the name being registered conflicts with an existing name. Please check if this is not expected.
+  return register_model(fn_wrapper)
+INFO:aero_eyes.models.segmentation:MobileSAM loaded from /root/.cache/mobile_sam/mobile_sam.pt
+INFO:__main__:[Stage3] Wallet_1: dynamic prototype update round 1/2 -- adaptive threshold=0.163 (percentile=90), 74 candidates, alpha=0.30
+INFO:__main__:[Stage3] Wallet_1: dynamic prototype update round 2/2 -- adaptive threshold=0.948 (percentile=90), 74 candidates, alpha=0.30
+INFO:__main__:[Stage3] Wallet_1: candidate score stats (metric=cosine, higher=more similar) — min=0.041 p50=0.247 mean=0.352 std=0.276 p95=0.969 max=0.984 (n=736)
+INFO:__main__:[Stage3] Wallet_1: adaptive threshold (metric=cosine, stat=mean/std) = 0.352 + 1.3*0.276 = 0.711 (floor=0.050)
+INFO:__main__:[Stage3] Wallet_1: threshold=0.711 → 122 / 736 candidates pass
+INFO:__main__:[Stage3] Wallet_1: box_refine was applied -- pre-refine boxes also saved to /workspace/runs/geco2_finetune/finetuned_eval/Wallet_1/detections_prerefine.json (see scripts/check_box_refine_effect.py)
+INFO:__main__:[Stage3] Wallet_1 done in 61.5s -> /workspace/runs/geco2_finetune/finetuned_eval/Wallet_1/detections.json (122 detection frames)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+INFO:aero_eyes.models.trackers:LiteTrack loaded (z=/workspace/litetrack_B4_cae_center_all_ep300_z.onnx, x=/workspace/litetrack_B4_cae_center_all_ep300_x.onnx)
+Using cache found in /root/.cache/torch/hub/facebookresearch_dinov2_main
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+INFO:dinov2:using MLP layer as FFN
+INFO:aero_eyes.models.features:DINOv2 vitb14 on cuda  (dim=768)
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 6 frame(s) [2994, 3000) before the lock at frame 3000
+/workspace/Test/GECO2/sam2/sam2/modeling/sam/transformer.py:23: UserWarning: Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.
+  OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint missing 149 params (random init for those), grouped by submodule: ['sam_mask']
+WARNING:aero_eyes.models.geco2_detector:GeCo2 checkpoint has 8 unused params not in the model (ignored): ['bbox_embed_aux', 'class_embed_aux']
+INFO:aero_eyes.models.geco2_detector:GeCo2 loaded from /workspace/Test/GECO2/CNTQG_aeroeyes_finetuned.pth on cuda
+/venv/main/lib/python3.12/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 9 frame(s) [3335, 3344) before the lock at frame 3344
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 13 frame(s) [3483, 3496) before the lock at frame 3496
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 9 frame(s) [4135, 4144) before the lock at frame 4144
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 6 frame(s) [4298, 4304) before the lock at frame 4304
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 4 frame(s) [4852, 4856) before the lock at frame 4856
+INFO:__main__:[Stage4] Wallet_1: backward_tracking recovered 11 frame(s) [5133, 5144) before the lock at frame 5144
+INFO:__main__:[Stage4] Wallet_1 done in 124.6s -> /workspace/runs/geco2_finetune/finetuned_eval/Wallet_1/tracks.json (1040/5346 frames with box)
+INFO:__main__:[Stage5] Wallet_1: 1040 frames with boxes before smoothing
+INFO:__main__:[Stage5] Wallet_1: 1040 frames in final tube
+INFO:aero_eyes.utils.io:Wrote submission: /workspace/runs/geco2_finetune/finetuned_eval/Wallet_1/submission.json (1040 frames)
+INFO:__main__:[Stage5] Wallet_1 done in 0.1s -> /workspace/runs/geco2_finetune/finetuned_eval/Wallet_1/submission.json
