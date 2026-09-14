@@ -214,7 +214,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
     from aero_eyes.stages.stage2 import read_candidates_with_features
     from aero_eyes.utils import viz as vizmod
     from aero_eyes.utils.geometry import nms
-    from aero_eyes.utils.io import read_prototype, write_detections
+    from aero_eyes.utils.io import read_prototype, write_detections, write_prototype
     from aero_eyes.utils.video import read_frame, video_info
 
     t0 = time.time()
@@ -323,6 +323,19 @@ def run_stage3(cfg, sample_id: str) -> Path:
         use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
         all_frame_idxs=all_frame_idxs,
     )
+
+    # Persist the dynamic_prototype-adapted state SEPARATELY from
+    # prototype.npz (Stage 1's own, never touched here) -- lets
+    # stage4.backward_tracking.validate_against_boundary.cosine_arbitration
+    # opt into scoring against this adapted state (original refs PLUS
+    # whatever dynamic_prototype appended -- per_ref_features only ever
+    # grows via .append, never loses the original 3) instead of only the
+    # original references, via cosine_arbitration.use_adaptive_prototype.
+    # Written whenever dynamic_prototype is enabled (harmless no-op
+    # duplicate of prototype.npz on the rare run where 0 rounds actually
+    # fired -- e.g. min_support never met).
+    if s3.dynamic_prototype.enabled:
+        write_prototype(prototype, meta, per_ref_features if use_multi_ref else None, work_dir / "prototype_adapted.npz")
 
     # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;
     # already shown to hurt results (see docs/COLAB_KAGGLE_GUIDE.md), kept

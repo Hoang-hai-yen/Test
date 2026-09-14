@@ -438,6 +438,73 @@ class CoTrackerConfig(BaseModel):
     outlier_trim_pct: float = 10.0
 
 
+class CosineArbitrationConfig(BaseModel):
+    """backward_tracking.validate_against_boundary.cosine_arbitration --
+    EXPERIMENTAL, opt-in secondary arbitration for the exact moment
+    validate_against_boundary's motion check already found the backward
+    segment implausible against the boundary box. Without this, that
+    disagreement always means "discard the whole backward segment" (the
+    boundary box is trusted unconditionally, since it's independently
+    detected/tracked, and the backward segment never was). This second-
+    guesses that default: when BOTH objects are re-embedded with DINOv2
+    and scored against the SAME prototype (the same signal
+    stage4.verify_interval uses), the one with the HIGHER cosine similarity
+    is treated as more likely the real target.
+
+    Deliberately experimental/off by default -- this project's own
+    diagnostics repeatedly found cosine similarity poorly separated and
+    domain-gap-sensitive on this footage (see
+    keep_tracking_on_missed_keyframe's own docstring for why THAT feature
+    avoids cosine entirely). This may make backward_tracking's outcomes
+    WORSE, not better, on some videos -- that's exactly why it needs its
+    own config gate instead of always being on, so it can be A/B compared
+    (e.g. via scripts/check_stage_prf1_progression.py) before trusting it.
+
+    enabled: false (default) = current behavior, motion disagreement always
+    discards the backward segment.
+
+    override_boundary_on_win: what happens when the backward segment's
+    score WINS (is higher):
+      false -- keep the backward segment, but leave the boundary box
+        untouched (both survive, side by side -- the disagreement is
+        simply no longer treated as disqualifying for the backward side).
+      true  -- ALSO discard the boundary box itself (tracks[fi] = None),
+        treating the backward segment's win as evidence the boundary was
+        actually the wrong object -- a stronger, riskier claim (overrides
+        an independently-produced box instead of just no longer
+        discarding the backward one).
+    When the backward segment's score does NOT win (lower or equal, or
+    either crop fails to embed), falls back to the same behavior as
+    enabled=false -- discard the backward segment.
+
+    pooling ("mean" default / "max"): how a candidate crop's score is
+    combined across per_ref_features when accuracy.cheap_boosters.
+    multi_reference_embedding is active. "match_stage3" (recommended if
+    you already run Stage 3 with multi_ref_pooling=max) reads
+    accuracy.cheap_boosters.multi_ref_pooling directly, so arbitration
+    scores things the SAME way Stage 3's own matching did; the plain
+    "mean"/"max" values pin it regardless of that setting. Default "mean"
+    reproduces this function's original (pre-arbitration) behavior,
+    unchanged, since stage4.verify_interval already relies on mean and
+    this option must not silently change that.
+
+    use_adaptive_prototype: false (default) scores against ONLY the
+    original 3 reference-photo vectors (prototype.npz, from Stage 1,
+    unaffected by Stage 3). true scores against prototype_adapted.npz
+    instead -- the SAME references PLUS whatever stage3.dynamic_prototype
+    appended while matching this video (per_ref_features only ever grows
+    via .append there, so this is "original 3 + adaptive extras combined",
+    never original-only vs. adaptive-only). Needs
+    stage3.dynamic_prototype.enabled to have actually produced that file;
+    falls back to the original prototype.npz (with a logged warning) if
+    it's missing.
+    """
+    enabled: bool = False
+    override_boundary_on_win: bool = False
+    pooling: Literal["mean", "max", "match_stage3"] = "mean"
+    use_adaptive_prototype: bool = False
+
+
 class BackwardTrackingConfig(BaseModel):
     """stage4.backward_tracking -- recovers frames where the object was
     genuinely present but not yet DETECTED: an object entering the frame is
@@ -473,9 +540,48 @@ class BackwardTrackingConfig(BaseModel):
     run_stage4's `recent_frames`. No effect when stage4.tracker == "none"
     (NoneTracker re-detects every frame independently; there is no
     continuous tracker state to run backward).
+
+    validate_against_boundary: "stops at a frame already covered by a
+    PREVIOUS track segment" above means the backward run never OVERWRITES
+    that frame's box -- but by itself that says nothing about whether the
+    backward segment it silently stitched onto that boundary is actually
+    the SAME object. If the backward tracker drifted onto a confuser
+    partway through (nothing forces it to be right just because it hasn't
+    lost confidence yet), the recovered frames would sit right next to a
+    real, independent box (a real keyframe detection, or the previous
+    segment's own last tracked frame) that may be far away from it --
+    exactly the failure mode this option catches.
+
+    When enabled, a BoxDriftCheck-style linear trend is fit from the
+    backward segment's OWN recovered positions as it goes (same method as
+    stage4.kalman_motion_check and keep_tracking_on_missed_keyframe's own
+    validate_against_next_keyframe -- see aero_eyes/utils/
+    motion_drift_check.py::BoxDriftCheck). The moment backward recovery
+    hits that existing boundary box, it's checked against this trend
+    instead of being trusted blindly; if implausible, the ENTIRE backward-
+    recovered segment from this call is discarded (every frame it filled
+    in reverts to absent) rather than kept as a likely-wrong track stitched
+    onto a real one. Deliberately NOT appearance/cosine-based, same
+    reasoning as keep_tracking_on_missed_keyframe's own validation (domain
+    gap + dynamic_prototype drift make cosine similarity unreliable on its
+    own for this project's footage).
+
+    False (default) = disabled -- a backward-recovered segment is always
+    kept once produced, whatever it lands next to, unchanged from before
+    this option existed.
     """
     enabled: bool = False
     max_backward_frames: int = 30
+    validate_against_boundary: bool = False
+    # Same semantics/defaults as stage4.kalman_motion_check /
+    # keep_tracking_on_missed_keyframe's own fields -- see those for what
+    # each one means; applied here to the backward-recovered segment's own
+    # trajectory instead.
+    window_frames: int = 10
+    max_dist_ratio: float = 3.0
+    # Only consulted when validate_against_boundary's motion check ALREADY
+    # flagged a disagreement -- see CosineArbitrationConfig's own docstring.
+    cosine_arbitration: CosineArbitrationConfig = CosineArbitrationConfig()
 
 
 class KeepTrackingOnMissedKeyframeConfig(BaseModel):

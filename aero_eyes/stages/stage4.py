@@ -227,6 +227,48 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 sample_id, proto_path,
             )
 
+    # backward_tracking.validate_against_boundary.cosine_arbitration needs
+    # the same DINOv2 extractor/prototype as verify_interval above, loaded
+    # here if nothing else already did -- see CosineArbitrationConfig.
+    ca_cfg = s4.backward_tracking.cosine_arbitration
+    if ca_cfg.enabled and extractor is None:
+        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.utils.io import read_prototype
+
+        proto_path = work_dir / cfg.stage1.prototype.cache_name
+        if proto_path.exists():
+            extractor = build_feature_extractor(cfg)
+            prototype, _, per_ref_features = read_prototype(proto_path)
+        else:
+            log.warning(
+                "[Stage4] %s: backward_tracking.cosine_arbitration.enabled=true but no "
+                "prototype.npz found at %s -- arbitration unavailable this run (falls back to "
+                "always discarding the backward segment on disagreement).",
+                sample_id, proto_path,
+            )
+
+    # cosine_arbitration.use_adaptive_prototype: score against
+    # prototype_adapted.npz (stage3.dynamic_prototype's final state --
+    # original refs + whatever it appended, see stage3.py's own write of
+    # this file) instead of the original-only prototype/per_ref_features
+    # above. Loaded into SEPARATE variables so verify_interval/
+    # geco2_redetect_cosine_filter (which share `prototype`/
+    # `per_ref_features`) are never affected by this opt-in choice.
+    ca_prototype, ca_per_ref_features = prototype, per_ref_features
+    if ca_cfg.enabled and ca_cfg.use_adaptive_prototype:
+        from aero_eyes.utils.io import read_prototype
+
+        adapted_path = work_dir / "prototype_adapted.npz"
+        if adapted_path.exists():
+            ca_prototype, _, ca_per_ref_features = read_prototype(adapted_path)
+        else:
+            log.warning(
+                "[Stage4] %s: cosine_arbitration.use_adaptive_prototype=true but no "
+                "prototype_adapted.npz found at %s (needs stage3.dynamic_prototype.enabled to "
+                "have produced one) -- falling back to the original prototype.npz.",
+                sample_id, adapted_path,
+            )
+
     # ---- Kalman motion-plausibility check (active tracker only -- see
     # KalmanMotionCheckConfig for why this doesn't apply to tracker=none,
     # which has no continuous track for motion to be judged against) ----
@@ -290,6 +332,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
         leave its already-written frames as-is, just stop treating it as
         open so a LATER, unrelated segment isn't validated against it."""
         nonlocal kept_segment_start
+        if kept_segment_start is not None:
+            log.info(
+                "[Stage4] %s: keep_tracking_on_missed_keyframe segment starting at frame %d "
+                "ended without a fresh re-detect to validate against -- kept as-is, unvalidated",
+                sample_id, kept_segment_start,
+            )
         kept_segment_start = None
 
     def _resolve_pending_kept_segment(fresh_box: Box) -> None:
@@ -307,17 +355,72 @@ def run_stage4(cfg, sample_id: str) -> Path:
         nonlocal kept_segment_start
         if kept_segment_start is None:
             return
+        segment_len = frame_idx - kept_segment_start
         if missed_kf_drift is not None:
             plausible = missed_kf_drift.check_and_update(fresh_box, kt_cfg.max_dist_ratio)
             if not plausible:
                 for fi in range(kept_segment_start, frame_idx):
                     tracks[fi] = None
-                log.debug(
-                    "[Stage4] frame %d: kept-through segment [%d, %d) failed "
-                    "motion-plausibility check against this frame's independent "
-                    "detection -- retroactively marked absent", frame_idx, kept_segment_start, frame_idx,
+                log.info(
+                    "[Stage4] %s: keep_tracking_on_missed_keyframe segment [%d, %d) failed "
+                    "motion-plausibility check against frame %d's independent detection "
+                    "-- retroactively marked absent", sample_id, kept_segment_start, frame_idx, frame_idx,
                 )
+                kept_segment_start = None
+                return
+        log.info(
+            "[Stage4] %s: keep_tracking_on_missed_keyframe kept %d frame(s) [%d, %d) through a "
+            "missed keyframe, validated at frame %d",
+            sample_id, segment_len, kept_segment_start, frame_idx, frame_idx,
+        )
         kept_segment_start = None
+
+    def _arbitrate_by_cosine(boundary_fi: int, boundary_box: Box, recovered_frames: list[int]) -> bool:
+        """backward_tracking.validate_against_boundary.cosine_arbitration
+        (EXPERIMENTAL, opt-in): called only when the motion check already
+        flagged a disagreement at `boundary_fi`. Re-embeds the LAST
+        backward-recovered box (closest to the disagreement) and
+        `boundary_box` with DINOv2, scores both against the SAME
+        prototype (ca_prototype/ca_per_ref_features -- original-only or
+        dynamic_prototype-adapted, per cosine_arbitration.
+        use_adaptive_prototype), and returns True (keep the backward
+        segment -- the caller skips its normal discard) if the backward
+        side scored higher -- see CosineArbitrationConfig's own docstring
+        for what happens to `boundary_box` itself in that case. False
+        (including when unavailable/inconclusive) means fall back to the
+        normal "discard the backward segment" behavior.
+        """
+        local_ca_cfg = bt_cfg.cosine_arbitration
+        if not local_ca_cfg.enabled or not recovered_frames or extractor is None or ca_prototype is None:
+            return False
+        pooling = (
+            cfg.accuracy.cheap_boosters.multi_ref_pooling
+            if local_ca_cfg.pooling == "match_stage3" else local_ca_cfg.pooling
+        )
+        last_fi = recovered_frames[-1]
+        backward_box = tracks[last_fi]
+        backward_frame = recent_frames.get(last_fi)
+        boundary_frame = recent_frames.get(boundary_fi)
+        if backward_frame is None or boundary_frame is None:
+            return False
+        backward_sim = _track_similarity(
+            backward_frame, backward_box, extractor, ca_prototype, ca_per_ref_features, cfg, pooling=pooling,
+        )
+        boundary_sim = _track_similarity(
+            boundary_frame, boundary_box, extractor, ca_prototype, ca_per_ref_features, cfg, pooling=pooling,
+        )
+        if backward_sim is None or boundary_sim is None or backward_sim <= boundary_sim:
+            return False
+        log.info(
+            "[Stage4] %s: backward_tracking cosine arbitration -- backward segment (sim=%.3f) "
+            "scored higher than the boundary box at frame %d (sim=%.3f) -- keeping backward "
+            "segment%s",
+            sample_id, backward_sim, boundary_fi, boundary_sim,
+            ", discarding the boundary box" if local_ca_cfg.override_boundary_on_win else "",
+        )
+        if local_ca_cfg.override_boundary_on_win:
+            tracks[boundary_fi] = None
+        return True
 
     def _run_backward_recovery(anchor_frame_idx: int, anchor_box: Box) -> None:
         """stage4.backward_tracking: called right after EVERY fresh lock
@@ -332,27 +435,64 @@ def run_stage4(cfg, sample_id: str) -> Path:
         (ran further back than what's been read), or the backward
         tracker's own confidence dropping below tracker_conf_threshold.
         No-op if the feature is off or nothing is buffered yet.
+
+        bt_cfg.validate_against_boundary: "stops at a frame that already
+        has a box" only guarantees the recovered segment never OVERWRITES
+        that boundary -- not that it actually agrees with it (the backward
+        tracker could have drifted onto a confuser the whole way and just
+        happened to run out of frames right next to a real, independent
+        box). When enabled, a BoxDriftCheck trend is fit from the segment's
+        OWN recovered positions as it goes; the boundary box is checked
+        against that trend the moment recovery reaches it, and if
+        implausible, every frame this call recovered is reverted to absent
+        instead of being kept sitting next to a box it disagrees with.
         """
         if backward_tracker is None:
             return
         lo = max(0, anchor_frame_idx - bt_cfg.max_backward_frames)
         backward_tracker.init(recent_frames[anchor_frame_idx], anchor_box)
-        recovered = 0
+
+        boundary_check = None
+        if bt_cfg.validate_against_boundary:
+            from aero_eyes.utils.motion_drift_check import BoxDriftCheck
+            boundary_check = BoxDriftCheck(window_frames=bt_cfg.window_frames)
+            boundary_check.init(anchor_box)
+
+        recovered_frames: list[int] = []
         fi = anchor_frame_idx - 1
         while fi >= lo:
-            if tracks.get(fi) is not None or fi not in recent_frames:
+            existing = tracks.get(fi)
+            if existing is not None:
+                if boundary_check is not None and not boundary_check.check_and_update(
+                    existing, bt_cfg.max_dist_ratio,
+                ):
+                    if not _arbitrate_by_cosine(fi, existing, recovered_frames):
+                        for rf in recovered_frames:
+                            tracks[rf] = None
+                        log.info(
+                            "[Stage4] %s: backward_tracking segment [%d, %d) failed "
+                            "motion-plausibility check against the real box at frame %d "
+                            "-- likely drifted onto a confuser, discarding the whole segment",
+                            sample_id, anchor_frame_idx - len(recovered_frames), anchor_frame_idx, fi,
+                        )
+                    return
+                break
+            if fi not in recent_frames:
                 break
             box, conf = backward_tracker.update(recent_frames[fi])
             if box is None or conf < s4.tracker_conf_threshold:
                 break
             tracks[fi] = box
-            recovered += 1
+            recovered_frames.append(fi)
+            if boundary_check is not None:
+                boundary_check.check_and_update(box, bt_cfg.max_dist_ratio)
             fi -= 1
-        if recovered:
+        if recovered_frames:
             log.info(
                 "[Stage4] %s: backward_tracking recovered %d frame(s) [%d, %d) "
                 "before the lock at frame %d",
-                sample_id, recovered, anchor_frame_idx - recovered, anchor_frame_idx, anchor_frame_idx,
+                sample_id, len(recovered_frames), anchor_frame_idx - len(recovered_frames),
+                anchor_frame_idx, anchor_frame_idx,
             )
 
     try:
@@ -432,6 +572,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 elif tracker_active and (not is_keyframe or kt_cfg.enabled):
                     if is_keyframe and kept_segment_start is None:
                         kept_segment_start = frame_idx
+                        log.info(
+                            "[Stage4] %s: frame %d: keyframe had no surviving detection -- "
+                            "keep_tracking_on_missed_keyframe keeping the active track alive "
+                            "through it", sample_id, frame_idx,
+                        )
                     box, conf = tracker.update(frame_bgr)
                     track_age += 1
                     frames_since_verify += 1
@@ -682,13 +827,18 @@ def _track_similarity(
     prototype,
     per_ref_features: list,
     cfg,
+    pooling: str = "mean",
 ) -> float | None:
     """Re-embed the crop the tracker is CURRENTLY reporting and return its
     cosine similarity to the target, using the same DINOv2 embedding space
     Stage 3 used to decide the original match -- the real correctness check
     BuiltinTracker's own fixed placeholder confidence (see
     aero_eyes/models/trackers.py) cannot provide. Used by
-    stage4.verify_interval's periodic re-check.
+    stage4.verify_interval's periodic re-check (always "mean", its own
+    established behavior, unchanged) and by backward_tracking.
+    validate_against_boundary.cosine_arbitration (which passes
+    accuracy.cheap_boosters.multi_ref_pooling, to match Stage 3's own
+    pooling convention -- see that config field's own docstring).
 
     Returns the raw similarity (not a match/no-match bool) so the caller
     can apply BOTH match_threshold (still the same object?) and, if
@@ -698,6 +848,11 @@ def _track_similarity(
     config docstring for why that distinction matters. None if the crop
     couldn't be embedded at all (e.g. degenerate box) -- not evidence of
     absence, just a failed measurement.
+
+    pooling: "mean" (default, this function's original/only behavior) or
+    "max" across per_ref_features when multi-ref is active -- see
+    aero_eyes.stages.stage3._pool_sims, the same convention Stage 3 itself
+    uses for its OWN matching.
     """
     feats = extractor.extract_crops(
         frame_bgr, [box],
@@ -713,7 +868,8 @@ def _track_similarity(
         and len(per_ref_features) > 0
     )
     if use_multi_ref:
-        return float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
+        sims = [float(feats[0] @ ref_feat) for ref_feat in per_ref_features]
+        return max(sims) if pooling == "max" else float(np.mean(sims))
     return float(feats[0] @ prototype)
 
 

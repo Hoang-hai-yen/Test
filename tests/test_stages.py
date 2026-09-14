@@ -748,6 +748,250 @@ def test_stage4_backward_tracking_respects_max_backward_frames(cfg, synth_fixtur
         assert frames[str(fi)] is not None, f"frame {fi}: within the cap, should be recovered"
 
 
+def test_stage4_backward_tracking_validates_against_boundary(cfg, synth_fixture):
+    """stage4.backward_tracking.validate_against_boundary: a backward-
+    recovered segment that stayed near the REAL object (box_real) the
+    whole way, but then hits an OLDER, unrelated existing box (box_far,
+    from an earlier keyframe) at the boundary, must be discarded entirely
+    when it disagrees with that boundary -- not silently kept sitting next
+    to a box it doesn't match. With validation off, the same segment is
+    kept unconditionally (the old, unsafe behavior).
+
+    Frame 1 is a keyframe with an EMPTY detection list -- this forces
+    tracker_active to False WITHOUT ever calling tracker.update() (see
+    stage4.py's "elif is_keyframe:" branch), so frames 1-19 end up absent
+    ahead of the frame-20 lock without needing a re-detect fallback (which
+    would need a real/mocked proposal model, irrelevant to this test).
+    """
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box_far = Box(500, 500, 510, 510, score=1.0)   # an older, unrelated detection
+    box_real = Box(5, 5, 15, 15, score=1.0)         # the actual object, recovered backward
+
+    detections = {
+        0: [Detection(frame_idx=0, box=box_far, similarity=0.9, source="test")],
+        1: [],  # empty keyframe -- forces tracker_active False without calling update()
+        20: [Detection(frame_idx=20, box=box_real, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box_real, 0.9)  # backward tracking stays near box_real
+
+    def _run(validate: bool) -> dict:
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.backward_tracking.enabled = True
+        cfg.stage4.backward_tracking.max_backward_frames = 30
+        cfg.stage4.backward_tracking.validate_against_boundary = validate
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker):
+            from aero_eyes.stages.stage4 import run_stage4
+            tracks_path = run_stage4(cfg, FIXTURE_ID)
+        with open(tracks_path) as f:
+            return json.load(f)["frames"]
+
+    frames_validated = _run(True)
+    for fi in range(1, 20):
+        assert frames_validated[str(fi)] is None, (
+            f"frame {fi}: backward segment disagreed with the boundary box at frame 0 -- "
+            "should have been discarded entirely"
+        )
+    assert frames_validated["0"] == box_far.to_dict()   # boundary itself untouched
+    assert frames_validated["20"] == box_real.to_dict()  # anchor itself untouched
+
+    frames_unvalidated = _run(False)
+    for fi in range(1, 20):
+        assert frames_unvalidated[str(fi)] is not None, (
+            f"frame {fi}: with validation off, the backward segment should be kept "
+            "unconditionally (old, unsafe behavior)"
+        )
+
+
+def test_stage4_backward_tracking_cosine_arbitration(cfg, synth_fixture):
+    """backward_tracking.validate_against_boundary.cosine_arbitration
+    (EXPERIMENTAL): only consulted once the motion check already flagged a
+    disagreement (same scenario as test_stage4_backward_tracking_validates_
+    against_boundary). When the backward segment's cosine score LOSES, the
+    outcome is unchanged (discard, as if arbitration were off). When it
+    WINS: override_boundary_on_win=False keeps the backward segment and
+    leaves the boundary box untouched; =True also discards the boundary box.
+    """
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections, write_prototype
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box_far = Box(500, 500, 510, 510, score=1.0)   # boundary (older, unrelated detection)
+    box_real = Box(5, 5, 15, 15, score=1.0)         # backward-tracked object
+
+    detections = {
+        0: [Detection(frame_idx=0, box=box_far, similarity=0.9, source="test")],
+        1: [],
+        20: [Detection(frame_idx=20, box=box_real, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+    write_prototype(np.zeros(8, dtype=np.float32), {}, None, work_dir / "prototype.npz")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box_real, 0.9)
+
+    def _run(backward_wins: bool, override: bool) -> dict:
+        def _sim_side_effect(frame_bgr, box, extractor, prototype, per_ref_features, cfg_, pooling="mean"):
+            is_backward_box = (box.x1, box.y1) == (box_real.x1, box_real.y1)
+            if backward_wins:
+                return 0.9 if is_backward_box else 0.1
+            return 0.1 if is_backward_box else 0.9
+
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.backward_tracking.enabled = True
+        cfg.stage4.backward_tracking.max_backward_frames = 30
+        cfg.stage4.backward_tracking.validate_against_boundary = True
+        cfg.stage4.backward_tracking.cosine_arbitration.enabled = True
+        cfg.stage4.backward_tracking.cosine_arbitration.override_boundary_on_win = override
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
+             patch("aero_eyes.models.features.build_feature_extractor", return_value=MagicMock()), \
+             patch("aero_eyes.stages.stage4._track_similarity", side_effect=_sim_side_effect):
+            from aero_eyes.stages.stage4 import run_stage4
+            tracks_path = run_stage4(cfg, FIXTURE_ID)
+        with open(tracks_path) as f:
+            return json.load(f)["frames"]
+
+    # Backward loses -- same outcome as arbitration being off: discard.
+    frames_lose = _run(backward_wins=False, override=False)
+    for fi in range(1, 20):
+        assert frames_lose[str(fi)] is None, f"frame {fi}: backward lost arbitration, should be discarded"
+    assert frames_lose["0"] == box_far.to_dict()
+
+    # Backward wins, no override -- keep backward, leave boundary untouched.
+    frames_win_no_override = _run(backward_wins=True, override=False)
+    for fi in range(1, 20):
+        assert frames_win_no_override[str(fi)] is not None, f"frame {fi}: backward won, should be kept"
+    assert frames_win_no_override["0"] == box_far.to_dict(), "boundary should be untouched when override is off"
+
+    # Backward wins, override -- keep backward AND discard the boundary box.
+    frames_win_override = _run(backward_wins=True, override=True)
+    for fi in range(1, 20):
+        assert frames_win_override[str(fi)] is not None, f"frame {fi}: backward won, should be kept"
+    assert frames_win_override["0"] is None, "boundary should be discarded when override is on"
+
+
+def test_stage4_backward_tracking_cosine_arbitration_pooling_resolution(cfg, synth_fixture):
+    """cosine_arbitration.pooling: "mean"/"max" pin the pooling method
+    outright regardless of Stage 3's own setting; "match_stage3" instead
+    reads accuracy.cheap_boosters.multi_ref_pooling -- confirms
+    _track_similarity is actually called with the resolved value."""
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections, write_prototype
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box_far = Box(500, 500, 510, 510, score=1.0)
+    box_real = Box(5, 5, 15, 15, score=1.0)
+    detections = {
+        0: [Detection(frame_idx=0, box=box_far, similarity=0.9, source="test")],
+        1: [],
+        20: [Detection(frame_idx=20, box=box_real, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+    write_prototype(np.zeros(8, dtype=np.float32), {}, None, work_dir / "prototype.npz")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box_real, 0.9)
+    seen_poolings: list[str] = []
+
+    def _sim_side_effect(frame_bgr, box, extractor, prototype, per_ref_features, cfg_, pooling="mean"):
+        seen_poolings.append(pooling)
+        return 0.5  # tie -- irrelevant to this test, only the pooling arg matters
+
+    def _run(pooling_cfg: str, stage3_pooling: str) -> None:
+        seen_poolings.clear()
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.backward_tracking.enabled = True
+        cfg.stage4.backward_tracking.validate_against_boundary = True
+        cfg.stage4.backward_tracking.cosine_arbitration.enabled = True
+        cfg.stage4.backward_tracking.cosine_arbitration.pooling = pooling_cfg
+        cfg.accuracy.cheap_boosters.multi_ref_pooling = stage3_pooling
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
+             patch("aero_eyes.models.features.build_feature_extractor", return_value=MagicMock()), \
+             patch("aero_eyes.stages.stage4._track_similarity", side_effect=_sim_side_effect):
+            from aero_eyes.stages.stage4 import run_stage4
+            run_stage4(cfg, FIXTURE_ID)
+
+    _run("mean", stage3_pooling="max")
+    assert seen_poolings == ["mean", "mean"], "pooling='mean' should pin mean regardless of Stage 3's own setting"
+
+    _run("max", stage3_pooling="mean")
+    assert seen_poolings == ["max", "max"], "pooling='max' should pin max regardless of Stage 3's own setting"
+
+    _run("match_stage3", stage3_pooling="max")
+    assert seen_poolings == ["max", "max"], "match_stage3 should follow accuracy.cheap_boosters.multi_ref_pooling"
+
+    _run("match_stage3", stage3_pooling="mean")
+    assert seen_poolings == ["mean", "mean"], "match_stage3 should follow accuracy.cheap_boosters.multi_ref_pooling"
+
+
+def test_stage4_backward_tracking_cosine_arbitration_use_adaptive_prototype(cfg, synth_fixture):
+    """cosine_arbitration.use_adaptive_prototype: when true, arbitration
+    scores against prototype_adapted.npz (stage3.dynamic_prototype's final
+    state) instead of the original-only prototype.npz -- confirmed by
+    checking WHICH prototype vector _track_similarity actually receives."""
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections, write_prototype
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box_far = Box(500, 500, 510, 510, score=1.0)
+    box_real = Box(5, 5, 15, 15, score=1.0)
+    detections = {
+        0: [Detection(frame_idx=0, box=box_far, similarity=0.9, source="test")],
+        1: [],
+        20: [Detection(frame_idx=20, box=box_real, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+
+    original_proto = np.array([1.0, 0.0], dtype=np.float32)
+    adapted_proto = np.array([0.0, 1.0], dtype=np.float32)
+    write_prototype(original_proto, {}, None, work_dir / "prototype.npz")
+    write_prototype(adapted_proto, {}, None, work_dir / "prototype_adapted.npz")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box_real, 0.9)
+    seen_prototypes: list[list[float]] = []
+
+    def _sim_side_effect(frame_bgr, box, extractor, prototype, per_ref_features, cfg_, pooling="mean"):
+        seen_prototypes.append(np.asarray(prototype).tolist())
+        return 0.5
+
+    def _run(use_adaptive: bool) -> None:
+        seen_prototypes.clear()
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.backward_tracking.enabled = True
+        cfg.stage4.backward_tracking.validate_against_boundary = True
+        cfg.stage4.backward_tracking.cosine_arbitration.enabled = True
+        cfg.stage4.backward_tracking.cosine_arbitration.use_adaptive_prototype = use_adaptive
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
+             patch("aero_eyes.models.features.build_feature_extractor", return_value=MagicMock()), \
+             patch("aero_eyes.stages.stage4._track_similarity", side_effect=_sim_side_effect):
+            from aero_eyes.stages.stage4 import run_stage4
+            run_stage4(cfg, FIXTURE_ID)
+
+    _run(False)
+    assert seen_prototypes and all(p == original_proto.tolist() for p in seen_prototypes), (
+        "use_adaptive_prototype=false should score against prototype.npz"
+    )
+
+    _run(True)
+    assert seen_prototypes and all(p == adapted_proto.tolist() for p in seen_prototypes), (
+        "use_adaptive_prototype=true should score against prototype_adapted.npz"
+    )
+
+
 def test_stage4_keep_tracking_validates_against_next_keyframe(cfg, synth_fixture):
     """keep_tracking_on_missed_keyframe.validate_against_next_keyframe: a
     kept-through segment that turns out to have been WRONG (the tracker was

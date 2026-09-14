@@ -720,6 +720,66 @@ stage4:
   backward_tracking:
     enabled: false
     max_backward_frames: 30
+    # "stops at a frame already covered by a PREVIOUS track segment" above
+    # means the backward run never OVERWRITES that frame's box -- but says
+    # nothing about whether the backward segment it silently stitched onto
+    # that boundary is actually the SAME object. If the backward tracker
+    # drifted onto a confuser partway through, the recovered frames would
+    # sit right next to a real, independent box (a real keyframe detection,
+    # or the previous segment's own last frame) that may be far away.
+    # When true, a BoxDriftCheck-style linear trend fit from the backward
+    # segment's OWN recovered positions (same method as kalman_motion_check
+    # / keep_tracking_on_missed_keyframe.validate_against_next_keyframe) is
+    # checked against that boundary box the moment recovery reaches it; if
+    # implausible, the ENTIRE backward-recovered segment is discarded
+    # (reverts to absent) instead of being kept next to a real box it
+    # disagrees with. false (default) = a recovered segment is always kept
+    # once produced, unchanged from before this option existed.
+    validate_against_boundary: false
+    window_frames: 10
+    max_dist_ratio: 3.0
+    # EXPERIMENTAL, opt-in -- only consulted at the exact moment
+    # validate_against_boundary's motion check ALREADY flagged a
+    # disagreement (without this, that always means "discard the whole
+    # backward segment"). Re-embeds BOTH the backward-tracked object and
+    # the boundary object with DINOv2 and scores each against the SAME
+    # prototype (the same signal verify_interval uses below); whichever
+    # scores higher is treated as more likely the real target.
+    # Deliberately off by default -- this project's own diagnostics
+    # repeatedly found cosine poorly separated/domain-gap-sensitive on
+    # this footage (see keep_tracking_on_missed_keyframe's own comment for
+    # why THAT feature avoids cosine entirely). May make outcomes WORSE on
+    # some videos -- A/B compare (e.g. via
+    # scripts/check_stage_prf1_progression.py) before trusting it.
+    cosine_arbitration:
+      enabled: false
+      # false: backward segment wins -> keep it, leave the boundary box
+      #   untouched (both survive side by side).
+      # true: backward segment wins -> ALSO discard the boundary box
+      #   itself -- a stronger, riskier claim (overrides an independently-
+      #   produced box, not just stops discarding the backward one).
+      override_boundary_on_win: false
+      # How a crop's score is combined across per_ref_features when
+      # accuracy.cheap_boosters.multi_reference_embedding is active:
+      #   mean         -- this function's original behavior (default,
+      #                    unchanged -- stage4.verify_interval below also
+      #                    relies on mean, so this default must not shift it).
+      #   max          -- force max pooling regardless of Stage 3's own setting.
+      #   match_stage3 -- read accuracy.cheap_boosters.multi_ref_pooling
+      #                    directly, so arbitration scores things the SAME
+      #                    way Stage 3's own matching did (recommended if
+      #                    you run Stage 3 with multi_ref_pooling=max).
+      pooling: mean
+      # false (default): score against ONLY the original 3 reference-photo
+      #   vectors (prototype.npz from Stage 1, unaffected by Stage 3).
+      # true: score against prototype_adapted.npz instead -- the SAME
+      #   references PLUS whatever stage3.dynamic_prototype appended while
+      #   matching this video (per_ref_features only ever grows via
+      #   .append, so this is "original 3 + adaptive extras combined", not
+      #   adaptive-only). Needs stage3.dynamic_prototype.enabled to have
+      #   actually produced that file; falls back to prototype.npz (logged
+      #   warning) if it's missing.
+      use_adaptive_prototype: false
 
   # Every verify_interval frames of ACTIVE tracking (builtin/litetrack, not
   # tracker=none), re-embed the currently-tracked crop with DINOv2 and
