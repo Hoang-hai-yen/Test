@@ -262,7 +262,11 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     if feat_matrix is None or feat_matrix.shape[0] == 0:
         log.warning("[Stage3] No candidate features found — writing empty detections.")
-        write_detections({}, det_path)
+        # Still record every keyframe Stage2 scanned (with an empty box
+        # list) rather than an empty dict -- see the frame_groups fix below
+        # for why stage4.py needs this to tell "keyframe, zero detections"
+        # apart from "not a keyframe at all".
+        write_detections({fi: [] for fi in candidates}, det_path)
         return det_path
 
     # ---- Stage 3 config ----
@@ -291,7 +295,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 all_entries.append((frame_idx, det, feat))
 
     if not all_entries:
-        write_detections({}, det_path)
+        write_detections({fi: [] for fi in candidates}, det_path)
         log.warning("[Stage3] %s: no candidate features found", sample_id)
         return det_path
 
@@ -497,6 +501,23 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 frame_idx, viz_dir,
             )
 
+    n_frames_with_detection = len(detections)
+
+    # frame_groups (built from `selected`, i.e. threshold-passing candidates
+    # only) never gets a key for a keyframe that Stage2/candidate-gen scanned
+    # but where NOTHING passed the threshold -- so without this, such a
+    # keyframe would be entirely absent from detections.json instead of
+    # present with an empty box list. Stage4 tells "keyframe with zero
+    # surviving detections" (stage4.keep_tracking_on_missed_keyframe's own
+    # trigger condition) apart from "not a keyframe at all" purely by key
+    # membership in this dict, so silently omitting these erases that
+    # distinction -- keep_tracking_on_missed_keyframe then never fires for
+    # them; they instead coast through the tracking loop's generic
+    # non-keyframe path with none of its retroactive motion-plausibility
+    # validation applied.
+    for frame_idx in candidates:
+        detections.setdefault(frame_idx, [])
+
     write_detections(detections, det_path, threshold=effective_threshold)
     if pre_refine_detections:
         prerefine_path = work_dir / "detections_prerefine.json"
@@ -504,8 +525,8 @@ def run_stage3(cfg, sample_id: str) -> Path:
         log.info("[Stage3] %s: box_refine was applied -- pre-refine boxes also saved to %s "
                  "(see scripts/check_box_refine_effect.py)", sample_id, prerefine_path)
     elapsed = time.time() - t0
-    log.info("[Stage3] %s done in %.1fs -> %s (%d detection frames)",
-             sample_id, elapsed, det_path, len(detections))
+    log.info("[Stage3] %s done in %.1fs -> %s (%d / %d keyframes with a detection)",
+             sample_id, elapsed, det_path, n_frames_with_detection, len(detections))
     return det_path
 
 
