@@ -338,6 +338,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
     kf_set = set(detections.keys())
     tracks: dict[int, Box | None] = {}
     tracker_active = False
+    # Human-readable reason the LAST tracker_active=False transition
+    # happened -- surfaced by the keep_tracking_on_missed_keyframe give-up
+    # log below so "no active track to fall back on" doesn't hide WHY the
+    # track died (low confidence vs. track_age vs. drift check vs. cosine
+    # re-verification all look identical from that log alone otherwise).
+    track_lost_reason: str | None = None
     track_age = 0
     frames_since_verify = 0
     # Temporary diagnostic counters for box_refine.apply_in_stage4 -- this
@@ -659,6 +665,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 _run_backward_recovery(frame_idx, confirmed)
                     else:
                         tracker_active = False
+                        track_lost_reason = "keyframe detection failed confirmer's consecutive-hit check"
                         _clear_pending_kept_segment()
                 # stage4.keep_tracking_on_missed_keyframe: a keyframe with no
                 # surviving detection falls through to the SAME
@@ -691,6 +698,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 and track_age <= s4.max_track_age
                                 and box is not None)
                     if not track_ok:
+                        if box is None:
+                            track_lost_reason = "tracker.update returned no box"
+                        elif conf < s4.tracker_conf_threshold:
+                            track_lost_reason = f"tracker confidence {conf:.3f} < threshold {s4.tracker_conf_threshold:.3f}"
+                        else:
+                            track_lost_reason = f"track_age {track_age} exceeded max_track_age {s4.max_track_age}"
                         log.debug(
                             "[Stage4] frame %d: tracker.update rejected "
                             "(conf=%.3f threshold=%.3f, track_age=%d max=%d, "
@@ -719,6 +732,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 "(diverged from recent trajectory) -- forcing re-detect", frame_idx,
                             )
                             track_ok = False
+                            track_lost_reason = "kalman_motion_check: diverged from recent trajectory"
 
                     # OpenCV's own tracker confidence is a near-constant
                     # placeholder (BuiltinTracker.update always returns 0.9
@@ -742,6 +756,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             )
                             if sim is not None and sim < match_threshold:
                                 track_ok = False
+                                track_lost_reason = f"verify_interval: re-verification cosine sim {sim:.3f} < match_threshold {match_threshold:.3f}"
                                 ac_cfg = s4.absence_check
                                 if ac_cfg.enabled and sim < match_threshold * ac_cfg.absence_ratio:
                                     # Similarity isn't just borderline-low --
@@ -755,6 +770,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     # giving it a chance to extend the track
                                     # past a real departure.
                                     skip_redetect = True
+                                    track_lost_reason = f"absence_check: sim {sim:.3f} well below absence threshold {match_threshold * ac_cfg.absence_ratio:.3f}, object likely gone"
                                     log.debug(
                                         "[Stage4] frame %d: track failed re-verification "
                                         "(sim=%.3f well below absence threshold %.3f) -- "
@@ -906,6 +922,16 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     # track was active to fall back on, or
                     # keep_tracking_on_missed_keyframe is off -- give up on
                     # this keyframe exactly like the original logic did.
+                    if not tracker_active:
+                        reason = f"no active track to fall back on ({track_lost_reason or 'never locked on'})"
+                    elif not kt_cfg.enabled:
+                        reason = "keep_tracking_on_missed_keyframe is disabled"
+                    else:
+                        reason = "unknown"
+                    log.info(
+                        "[Stage4] %s: frame %d: keyframe had no surviving detection -- "
+                        "giving up on it (%s)", sample_id, frame_idx, reason,
+                    )
                     tracker_active = False
                     if confirmer is not None:
                         confirmer.reset()
