@@ -532,6 +532,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     box_refine_segmenter, frame_bgr, [box],
                                     min_iou_with_original=br_cfg.min_iou_with_original,
                                     context_margin=br_cfg.context_margin,
+                                    adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
                                 )[0]
                             elif br_cfg.method == "sam2_dense":
                                 if geco2_refine_detector is not None:
@@ -545,6 +546,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 box = refine_box(
                                     br_cfg.method, frame_bgr, box, br_cfg.context_margin,
                                     segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
+                                    adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
                                 )
                             if box != box_before_refine:
                                 br_changed += 1

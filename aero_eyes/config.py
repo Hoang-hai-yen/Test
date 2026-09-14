@@ -1175,6 +1175,44 @@ class Stage123Geco2Config(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+class AdaptiveContextMarginConfig(BaseModel):
+    """box_refine.adaptive_context_margin -- box_refine.context_margin is
+    ONE flat value applied to every box regardless of size, but the right
+    amount of margin is size-dependent: a large, well-defined object (e.g.
+    a motorbike) benefits from a generous margin (more room for SAM/GrabCut
+    to find the true boundary), while a tiny/ambiguous object (e.g. a
+    helmet, ~15x12px) is more likely to have that same margin sweep in a
+    nearby confuser or background clutter (see BoxRefineConfig.
+    min_iou_with_original's own docstring for this exact failure mode) --
+    confirmed in practice: context_margin=0.5 helped a motorbike sample a
+    lot but hurt a helmet sample's recall, while context_margin=0.0 was
+    the better choice for the helmet sample specifically.
+
+    When enabled, the EFFECTIVE margin used for a given box is
+    context_margin scaled by how the box's own size (sqrt(w*h), the same
+    geometric-mean-side metric scripts/check_iou_size_sensitivity.py uses)
+    falls between min_size_px and max_size_px:
+      size <= min_size_px  -> effective margin = context_margin * min_ratio
+      size >= max_size_px  -> effective margin = context_margin (unscaled)
+      in between            -> linearly interpolated
+    So a tiny box automatically gets little/no margin (avoiding the
+    confuser-sweep risk) while a large box still gets the full configured
+    margin -- one context_margin value serves both object sizes instead of
+    having to hand-pick a per-sample value.
+
+    Applies to context_margin everywhere it's used: the "sam"/"grabcut"
+    crop margin (refine_box) AND the "sam_dense" prompt-expansion margin
+    (refine_boxes_dense) -- same underlying risk in both.
+
+    False (default) = disabled, context_margin is used as-is for every box
+    regardless of size, unchanged from before this option existed.
+    """
+    enabled: bool = False
+    min_size_px: float = 20.0   # box geometric-mean side (px) at/below which margin -> min_ratio
+    max_size_px: float = 100.0  # box geometric-mean side (px) at/above which margin -> full context_margin
+    min_ratio: float = 0.0      # fraction of context_margin used at/below min_size_px (0.0 = no margin at all)
+
+
 class BoxRefineConfig(BaseModel):
     """Sharpens an imprecise detection/tracking box to tightly fit the
     actual object silhouette, via a lightweight per-box segmentation pass.
@@ -1266,6 +1304,7 @@ class BoxRefineConfig(BaseModel):
     # docstring). Ignored by "sam2_dense" (GeCo2Detector.sam2_refine_boxes
     # has its own prompting, not routed through this field).
     context_margin: float = 0.2
+    adaptive_context_margin: AdaptiveContextMarginConfig = AdaptiveContextMarginConfig()
     apply_in_stage3: bool = True
     apply_in_stage4: bool = False
     # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box

@@ -8,9 +8,11 @@ import pytest
 
 cv2 = pytest.importorskip("cv2", reason="opencv-python not importable", exc_type=ImportError)
 
+from aero_eyes.config import AdaptiveContextMarginConfig
 from aero_eyes.types import Box
 from aero_eyes.utils.box_refine import (
     apply_iou_gate, refine_box, refine_box_with_grabcut, refine_box_with_sam, refine_boxes_dense,
+    scale_context_margin,
 )
 
 
@@ -275,3 +277,72 @@ def test_apply_iou_gate_noop_when_threshold_is_zero():
     refined = [Box(50, 50, 60, 60)]
     original = [Box(0, 0, 10, 10)]
     assert apply_iou_gate(refined, original, min_iou_with_original=0.0) is refined
+
+
+# ---------------------------------------------------------------------------
+# scale_context_margin / box_refine.adaptive_context_margin
+# ---------------------------------------------------------------------------
+
+def test_scale_context_margin_disabled_or_none_is_noop():
+    tiny_box = Box(0, 0, 15, 12)  # geometric-mean side ~13.4px
+    assert scale_context_margin(tiny_box, 0.5, None) == 0.5
+    off_cfg = AdaptiveContextMarginConfig(enabled=False)
+    assert scale_context_margin(tiny_box, 0.5, off_cfg) == 0.5
+
+
+def test_scale_context_margin_tiny_box_gets_min_ratio():
+    """A box at/below min_size_px gets margin scaled to exactly min_ratio
+    (0.0 default = no margin at all) -- the helmet-sized case."""
+    ac_cfg = AdaptiveContextMarginConfig(enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0)
+    tiny_box = Box(0, 0, 15, 12)  # side ~13.4px < min_size_px=20
+    assert scale_context_margin(tiny_box, 0.5, ac_cfg) == pytest.approx(0.0)
+
+
+def test_scale_context_margin_large_box_gets_full_margin():
+    """A box at/above max_size_px gets the FULL configured margin,
+    unscaled -- the motorbike-sized case."""
+    ac_cfg = AdaptiveContextMarginConfig(enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0)
+    large_box = Box(0, 0, 200, 200)  # side 200px > max_size_px=100
+    assert scale_context_margin(large_box, 0.5, ac_cfg) == pytest.approx(0.5)
+
+
+def test_scale_context_margin_interpolates_linearly_between():
+    ac_cfg = AdaptiveContextMarginConfig(enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0)
+    mid_box = Box(0, 0, 60, 60)  # side=60 -> t=(60-20)/(100-20)=0.5
+    assert scale_context_margin(mid_box, 0.5, ac_cfg) == pytest.approx(0.25)
+
+
+def test_scale_context_margin_min_ratio_floor():
+    """A nonzero min_ratio keeps SOME margin even for the smallest boxes,
+    instead of dropping to exactly 0."""
+    ac_cfg = AdaptiveContextMarginConfig(enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.2)
+    tiny_box = Box(0, 0, 5, 5)
+    assert scale_context_margin(tiny_box, 0.5, ac_cfg) == pytest.approx(0.1)  # 0.5 * 0.2
+
+
+def test_refine_boxes_dense_uses_per_box_scaled_margin():
+    """The margin passed to segment_box_cached must be computed PER BOX
+    from its own size, not one shared value for the whole frame -- a tiny
+    box and a large box on the SAME frame get different margins."""
+    frame = _synthetic_frame()
+    tiny_box = Box(0, 0, 15, 12)
+    large_box = Box(0, 0, 200, 200)
+
+    seen_margins = []
+
+    class _RecordingSegmenter:
+        def set_frame(self, frame_bgr):
+            return True
+
+        def segment_box_cached(self, box, margin=0.0):
+            seen_margins.append(margin)
+            return None  # falls back to the original box -- only margin tracking matters here
+
+    ac_cfg = AdaptiveContextMarginConfig(enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0)
+    refine_boxes_dense(
+        _RecordingSegmenter(), frame, [tiny_box, large_box],
+        context_margin=0.5, adaptive_context_margin_cfg=ac_cfg,
+    )
+
+    assert seen_margins[0] == pytest.approx(0.0)   # tiny box -> min_ratio (0.0)
+    assert seen_margins[1] == pytest.approx(0.5)   # large box -> full context_margin
