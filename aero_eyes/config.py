@@ -643,6 +643,20 @@ class KeepTrackingOnMissedKeyframeConfig(BaseModel):
     # the kept-through segment's trajectory instead of every live frame.
     window_frames: int = 10
     max_dist_ratio: float = 3.0
+    # EXPERIMENTAL, opt-in secondary arbitration for the exact moment the
+    # motion check above ALREADY flagged a disagreement -- same mechanism
+    # and same CosineArbitrationConfig as backward_tracking.
+    # validate_against_boundary uses (see that class's own docstring for
+    # the full rationale/caveats: deliberately off by default, this
+    # project's own diagnostics repeatedly found cosine poorly separated
+    # on this footage). Differs in ONE way: here the "boundary" object (the
+    # independent detection at the CURRENT frame) hasn't been written to
+    # tracks[] yet when this runs, so override_boundary_on_win=true means
+    # REJECTING that detection for this one frame (reports absent) rather
+    # than overwriting an already-recorded box -- the kept-through track
+    # itself is left running untouched, and kept_segment_start stays open
+    # for a later independent detection to resolve.
+    cosine_arbitration: CosineArbitrationConfig = CosineArbitrationConfig()
 
 
 class DetectionConfirmationConfig(BaseModel):

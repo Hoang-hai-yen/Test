@@ -992,6 +992,40 @@ def test_stage4_backward_tracking_cosine_arbitration_use_adaptive_prototype(cfg,
     )
 
 
+def test_stage4_cosine_arbitration_enabled_alone_does_not_load_dinov2(cfg, synth_fixture):
+    """cosine_arbitration.enabled=true with validate_against_boundary=false
+    must NOT load a DINOv2 extractor -- _arbitrate_by_cosine is only ever
+    called from inside the validate_against_boundary check, so loading one
+    anyway (keyed off cosine_arbitration.enabled alone) would be pure waste.
+    Regression guard for a real bug: the loading condition originally
+    checked only cosine_arbitration.enabled."""
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections, write_prototype
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box = Box(5, 5, 15, 15, score=1.0)
+    detections = {20: [Detection(frame_idx=20, box=box, similarity=0.9, source="test")]}
+    write_detections(detections, work_dir / "detections.json")
+    write_prototype(np.zeros(8, dtype=np.float32), {}, None, work_dir / "prototype.npz")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box, 0.9)
+
+    cfg.stage4.tracker = "builtin"
+    cfg.stage4.backward_tracking.enabled = True
+    cfg.stage4.backward_tracking.validate_against_boundary = False
+    cfg.stage4.backward_tracking.cosine_arbitration.enabled = True
+
+    with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
+         patch("aero_eyes.models.features.build_feature_extractor") as mock_build_extractor:
+        from aero_eyes.stages.stage4 import run_stage4
+        run_stage4(cfg, FIXTURE_ID)
+
+    mock_build_extractor.assert_not_called()
+
+
 def test_stage4_keep_tracking_validates_against_next_keyframe(cfg, synth_fixture):
     """keep_tracking_on_missed_keyframe.validate_against_next_keyframe: a
     kept-through segment that turns out to have been WRONG (the tracker was
@@ -1049,6 +1083,79 @@ def test_stage4_keep_tracking_validates_against_next_keyframe(cfg, synth_fixture
             f"frame {fi}: with validation off, the wrong kept-through segment should be "
             "kept unconditionally (old, unsafe behavior) -- reproduces the pre-validation flag"
         )
+
+
+def test_stage4_keep_tracking_cosine_arbitration(cfg, synth_fixture):
+    """keep_tracking_on_missed_keyframe.validate_against_next_keyframe.
+    cosine_arbitration (EXPERIMENTAL): only consulted once the motion
+    check already flagged a disagreement (same scenario as
+    test_stage4_keep_tracking_validates_against_next_keyframe). When the
+    kept-through segment's cosine score LOSES, the outcome is unchanged
+    (discard). When it WINS: override_boundary_on_win=False keeps the
+    segment and still lets the fresh detection proceed normally at its own
+    frame; =True ALSO rejects the fresh detection for that one frame
+    (reports absent there instead).
+    """
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections, write_prototype
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box_kept = Box(5, 5, 15, 15, score=1.0)          # the kept-through segment's own object
+    box_fresh = Box(500, 500, 510, 510, score=1.0)    # a confuser detected far away at frame 20
+
+    detections = {
+        0: [Detection(frame_idx=0, box=box_kept, similarity=0.9, source="test")],
+        10: [],
+        20: [Detection(frame_idx=20, box=box_fresh, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+    write_prototype(np.zeros(8, dtype=np.float32), {}, None, work_dir / "prototype.npz")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box_kept, 0.9)  # kept-through segment stays at box_kept
+
+    def _run(kept_wins: bool, override: bool) -> dict:
+        def _sim_side_effect(frame_bgr, box, extractor, prototype, per_ref_features, cfg_, pooling="mean"):
+            is_kept_box = (box.x1, box.y1) == (box_kept.x1, box_kept.y1)
+            if kept_wins:
+                return 0.9 if is_kept_box else 0.1
+            return 0.1 if is_kept_box else 0.9
+
+        cfg.stage4.tracker = "builtin"
+        cfg.stage4.max_track_age = 100
+        cfg.stage4.keep_tracking_on_missed_keyframe.enabled = True
+        cfg.stage4.keep_tracking_on_missed_keyframe.validate_against_next_keyframe = True
+        cfg.stage4.keep_tracking_on_missed_keyframe.cosine_arbitration.enabled = True
+        cfg.stage4.keep_tracking_on_missed_keyframe.cosine_arbitration.override_boundary_on_win = override
+        with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker), \
+             patch("aero_eyes.models.features.build_feature_extractor", return_value=MagicMock()), \
+             patch("aero_eyes.stages.stage4._track_similarity", side_effect=_sim_side_effect):
+            from aero_eyes.stages.stage4 import run_stage4
+            tracks_path = run_stage4(cfg, FIXTURE_ID)
+        with open(tracks_path) as f:
+            return json.load(f)["frames"]
+
+    # Kept segment loses -- same outcome as arbitration off: discard it.
+    frames_lose = _run(kept_wins=False, override=False)
+    for fi in range(10, 20):
+        assert frames_lose[str(fi)] is None, f"frame {fi}: kept segment lost, should be discarded"
+    assert frames_lose["20"] == box_fresh.to_dict()
+
+    # Kept segment wins, no override -- keep it; fresh detection still proceeds normally.
+    frames_win_no_override = _run(kept_wins=True, override=False)
+    for fi in range(10, 20):
+        assert frames_win_no_override[str(fi)] is not None, f"frame {fi}: kept segment won, should survive"
+    assert frames_win_no_override["20"] == box_fresh.to_dict(), (
+        "fresh detection should still proceed normally when override is off"
+    )
+
+    # Kept segment wins, override -- keep it AND reject the fresh detection this frame.
+    frames_win_override = _run(kept_wins=True, override=True)
+    for fi in range(10, 20):
+        assert frames_win_override[str(fi)] is not None, f"frame {fi}: kept segment won, should survive"
+    assert frames_win_override["20"] is None, "fresh detection should be rejected this frame when override is on"
 
 
 def test_stage4_litetrack_missing_path_raises(cfg):

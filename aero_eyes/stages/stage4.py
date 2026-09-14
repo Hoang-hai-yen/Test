@@ -230,8 +230,14 @@ def run_stage4(cfg, sample_id: str) -> Path:
     # backward_tracking.validate_against_boundary.cosine_arbitration needs
     # the same DINOv2 extractor/prototype as verify_interval above, loaded
     # here if nothing else already did -- see CosineArbitrationConfig.
-    ca_cfg = s4.backward_tracking.cosine_arbitration
-    if ca_cfg.enabled and extractor is None:
+    # Gated on validate_against_boundary TOO, not just cosine_arbitration.
+    # enabled -- _arbitrate_by_cosine is only ever CALLED from inside the
+    # validate_against_boundary check (boundary_check is None otherwise),
+    # so cosine_arbitration.enabled alone would load a DINOv2 model that
+    # never actually gets used if that flag is off.
+    bt_ca_cfg = s4.backward_tracking.cosine_arbitration
+    bt_ca_active = bt_ca_cfg.enabled and s4.backward_tracking.validate_against_boundary
+    if bt_ca_active and extractor is None:
         from aero_eyes.models.features import build_feature_extractor
         from aero_eyes.utils.io import read_prototype
 
@@ -247,27 +253,53 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 sample_id, proto_path,
             )
 
-    # cosine_arbitration.use_adaptive_prototype: score against
-    # prototype_adapted.npz (stage3.dynamic_prototype's final state --
-    # original refs + whatever it appended, see stage3.py's own write of
-    # this file) instead of the original-only prototype/per_ref_features
-    # above. Loaded into SEPARATE variables so verify_interval/
-    # geco2_redetect_cosine_filter (which share `prototype`/
-    # `per_ref_features`) are never affected by this opt-in choice.
-    ca_prototype, ca_per_ref_features = prototype, per_ref_features
-    if ca_cfg.enabled and ca_cfg.use_adaptive_prototype:
+    # keep_tracking_on_missed_keyframe.validate_against_next_keyframe.
+    # cosine_arbitration -- same shared model, same gating pattern (needs
+    # ITS OWN trigger flag too, not just cosine_arbitration.enabled -- see
+    # bt_ca_active's comment above for why).
+    kt_ca_cfg = s4.keep_tracking_on_missed_keyframe.cosine_arbitration
+    kt_ca_active = kt_ca_cfg.enabled and s4.keep_tracking_on_missed_keyframe.validate_against_next_keyframe
+    if kt_ca_active and extractor is None:
+        from aero_eyes.models.features import build_feature_extractor
         from aero_eyes.utils.io import read_prototype
 
-        adapted_path = work_dir / "prototype_adapted.npz"
-        if adapted_path.exists():
-            ca_prototype, _, ca_per_ref_features = read_prototype(adapted_path)
+        proto_path = work_dir / cfg.stage1.prototype.cache_name
+        if proto_path.exists():
+            extractor = build_feature_extractor(cfg)
+            prototype, _, per_ref_features = read_prototype(proto_path)
         else:
             log.warning(
-                "[Stage4] %s: cosine_arbitration.use_adaptive_prototype=true but no "
-                "prototype_adapted.npz found at %s (needs stage3.dynamic_prototype.enabled to "
-                "have produced one) -- falling back to the original prototype.npz.",
-                sample_id, adapted_path,
+                "[Stage4] %s: keep_tracking_on_missed_keyframe.cosine_arbitration.enabled=true "
+                "but no prototype.npz found at %s -- arbitration unavailable this run.",
+                sample_id, proto_path,
             )
+
+    def _load_arbitration_prototype(ca_cfg, active: bool) -> tuple:
+        """Shared by both cosine_arbitration instances above:
+        use_adaptive_prototype picks prototype_adapted.npz (stage3.
+        dynamic_prototype's final state -- original refs + whatever it
+        appended) instead of the original-only prototype/per_ref_features.
+        Returns its OWN (prototype, per_ref_features) pair so
+        verify_interval/geco2_redetect_cosine_filter (which share the
+        plain `prototype`/`per_ref_features` above) are never affected."""
+        result_prototype, result_refs = prototype, per_ref_features
+        if active and ca_cfg.use_adaptive_prototype:
+            from aero_eyes.utils.io import read_prototype
+
+            adapted_path = work_dir / "prototype_adapted.npz"
+            if adapted_path.exists():
+                result_prototype, _, result_refs = read_prototype(adapted_path)
+            else:
+                log.warning(
+                    "[Stage4] %s: cosine_arbitration.use_adaptive_prototype=true but no "
+                    "prototype_adapted.npz found at %s (needs stage3.dynamic_prototype.enabled "
+                    "to have produced one) -- falling back to the original prototype.npz.",
+                    sample_id, adapted_path,
+                )
+        return result_prototype, result_refs
+
+    bt_ca_prototype, bt_ca_per_ref_features = _load_arbitration_prototype(bt_ca_cfg, bt_ca_active)
+    kt_ca_prototype, kt_ca_per_ref_features = _load_arbitration_prototype(kt_ca_cfg, kt_ca_active)
 
     # ---- Kalman motion-plausibility check (active tracker only -- see
     # KalmanMotionCheckConfig for why this doesn't apply to tracker=none,
@@ -340,7 +372,49 @@ def run_stage4(cfg, sample_id: str) -> Path:
             )
         kept_segment_start = None
 
-    def _resolve_pending_kept_segment(fresh_box: Box) -> None:
+    def _arbitrate_kept_segment_by_cosine(seg_start: int, fresh_box: Box) -> bool:
+        """keep_tracking_on_missed_keyframe.validate_against_next_keyframe.
+        cosine_arbitration (EXPERIMENTAL, opt-in): called only when the
+        motion check already flagged a disagreement between the kept-
+        through segment and `fresh_box` (the independent detection at the
+        CURRENT frame_idx). Unlike backward_tracking's version, `fresh_box`
+        has NOT been written to tracks[] yet (the caller does that only
+        after this returns) and there is no `recent_frames` buffer to pull
+        an older frame's pixels from here (that buffer only exists when
+        backward_tracking.enabled) -- so both crops are taken from the
+        CURRENT frame_bgr: `fresh_box` as given, and the kept segment's own
+        LAST box (tracks[seg_start's predecessor], i.e. frame_idx - 1)
+        re-used as an approximate hypothesis for this same frame (valid
+        as long as the object hasn't moved far in one frame). Returns True
+        if the kept segment's hypothesis scored higher.
+        """
+        local_kt_ca_cfg = kt_cfg.cosine_arbitration
+        kept_box = tracks.get(frame_idx - 1)
+        if not local_kt_ca_cfg.enabled or extractor is None or kt_ca_prototype is None or kept_box is None:
+            return False
+        pooling = (
+            cfg.accuracy.cheap_boosters.multi_ref_pooling
+            if local_kt_ca_cfg.pooling == "match_stage3" else local_kt_ca_cfg.pooling
+        )
+        kept_sim = _track_similarity(
+            frame_bgr, kept_box, extractor, kt_ca_prototype, kt_ca_per_ref_features, cfg, pooling=pooling,
+        )
+        fresh_sim = _track_similarity(
+            frame_bgr, fresh_box, extractor, kt_ca_prototype, kt_ca_per_ref_features, cfg, pooling=pooling,
+        )
+        if kept_sim is None or fresh_sim is None or kept_sim <= fresh_sim:
+            return False
+        log.info(
+            "[Stage4] %s: keep_tracking_on_missed_keyframe cosine arbitration -- kept-through "
+            "segment (sim=%.3f) scored higher than frame %d's independent detection (sim=%.3f) "
+            "-- keeping the kept-through segment%s",
+            sample_id, kept_sim, frame_idx, fresh_sim,
+            ", overriding (rejecting) the independent detection this frame"
+            if local_kt_ca_cfg.override_boundary_on_win else "",
+        )
+        return True
+
+    def _resolve_pending_kept_segment(fresh_box: Box) -> bool:
         """Call whenever an INDEPENDENT fresh box becomes available (a real
         keyframe detection, or a successful re-detect) while a
         keep_tracking_on_missed_keyframe segment is pending. Checks
@@ -348,17 +422,33 @@ def run_stage4(cfg, sample_id: str) -> Path:
         the kept segment's OWN tracked positions; if implausible, every
         frame in [kept_segment_start, frame_idx) is retroactively marked
         absent instead of keeping a track that likely drifted onto the
-        wrong object. No-op (just clears the pending marker) if nothing is
-        pending, or if validate_against_next_keyframe is off (missed_kf_drift
-        is None then) -- reproduces "always keep, never check" in that case.
+        wrong object -- UNLESS cosine_arbitration is enabled and the kept
+        segment's own score wins (see _arbitrate_kept_segment_by_cosine),
+        in which case the segment is kept instead.
+
+        Returns True if `fresh_box` should be trusted by the caller
+        (proceed with the normal tracker re-init this frame) -- always
+        true when nothing was pending, when the motion check passed, or
+        when arbitration is off/loses. Returns False only when
+        cosine_arbitration.override_boundary_on_win won: the kept-through
+        segment is trusted INSTEAD of `fresh_box` this frame, so the
+        caller should treat this frame as if the detection never
+        happened (kept_segment_start stays open, tracker_active/the
+        tracker's own state are left untouched, so tracking continues
+        from the kept-through segment's state into subsequent frames).
         """
         nonlocal kept_segment_start
         if kept_segment_start is None:
-            return
+            return True
         segment_len = frame_idx - kept_segment_start
         if missed_kf_drift is not None:
             plausible = missed_kf_drift.check_and_update(fresh_box, kt_cfg.max_dist_ratio)
             if not plausible:
+                if _arbitrate_kept_segment_by_cosine(kept_segment_start, fresh_box):
+                    if kt_cfg.cosine_arbitration.override_boundary_on_win:
+                        return False  # kept_segment_start stays open, fresh_box rejected this frame
+                    kept_segment_start = None
+                    return True  # kept segment AND fresh_box both survive, untouched
                 for fi in range(kept_segment_start, frame_idx):
                     tracks[fi] = None
                 log.info(
@@ -367,13 +457,14 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     "-- retroactively marked absent", sample_id, kept_segment_start, frame_idx, frame_idx,
                 )
                 kept_segment_start = None
-                return
+                return True
         log.info(
             "[Stage4] %s: keep_tracking_on_missed_keyframe kept %d frame(s) [%d, %d) through a "
             "missed keyframe, validated at frame %d",
             sample_id, segment_len, kept_segment_start, frame_idx, frame_idx,
         )
         kept_segment_start = None
+        return True
 
     def _arbitrate_by_cosine(boundary_fi: int, boundary_box: Box, recovered_frames: list[int]) -> bool:
         """backward_tracking.validate_against_boundary.cosine_arbitration
@@ -381,8 +472,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
         flagged a disagreement at `boundary_fi`. Re-embeds the LAST
         backward-recovered box (closest to the disagreement) and
         `boundary_box` with DINOv2, scores both against the SAME
-        prototype (ca_prototype/ca_per_ref_features -- original-only or
-        dynamic_prototype-adapted, per cosine_arbitration.
+        prototype (bt_ca_prototype/bt_ca_per_ref_features -- original-only
+        or dynamic_prototype-adapted, per cosine_arbitration.
         use_adaptive_prototype), and returns True (keep the backward
         segment -- the caller skips its normal discard) if the backward
         side scored higher -- see CosineArbitrationConfig's own docstring
@@ -391,7 +482,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
         normal "discard the backward segment" behavior.
         """
         local_ca_cfg = bt_cfg.cosine_arbitration
-        if not local_ca_cfg.enabled or not recovered_frames or extractor is None or ca_prototype is None:
+        if not local_ca_cfg.enabled or not recovered_frames or extractor is None or bt_ca_prototype is None:
             return False
         pooling = (
             cfg.accuracy.cheap_boosters.multi_ref_pooling
@@ -404,10 +495,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
         if backward_frame is None or boundary_frame is None:
             return False
         backward_sim = _track_similarity(
-            backward_frame, backward_box, extractor, ca_prototype, ca_per_ref_features, cfg, pooling=pooling,
+            backward_frame, backward_box, extractor, bt_ca_prototype, bt_ca_per_ref_features, cfg, pooling=pooling,
         )
         boundary_sim = _track_similarity(
-            boundary_frame, boundary_box, extractor, ca_prototype, ca_per_ref_features, cfg, pooling=pooling,
+            boundary_frame, boundary_box, extractor, bt_ca_prototype, bt_ca_per_ref_features, cfg, pooling=pooling,
         )
         if backward_sim is None or boundary_sim is None or backward_sim <= boundary_sim:
             return False
@@ -539,26 +630,33 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         # keep_tracking_on_missed_keyframe segment (if any)
                         # was waiting for -- validate/resolve it BEFORE
                         # trusting this detection over the tracker's state.
-                        _resolve_pending_kept_segment(confirmed)
-                        was_inactive = not tracker_active
-                        tracker.init(frame_bgr, confirmed)
-                        if motion_kf is not None:
-                            motion_kf.init(confirmed)
-                        if missed_kf_drift is not None:
-                            missed_kf_drift.init(confirmed)
-                        tracker_active = True
-                        track_age = 0
-                        frames_since_verify = 0
-                        box_out = confirmed
-                        source = "detect"
-                        # stage4.backward_tracking: this is a FRESH lock
-                        # (no track was active a moment ago) -- recover any
-                        # frames right before it where the object was
-                        # present but not yet detected. A routine keyframe
-                        # re-anchor of an ALREADY-active track skips this
-                        # (was_inactive False) -- nothing to recover there.
-                        if was_inactive:
-                            _run_backward_recovery(frame_idx, confirmed)
+                        # False only means cosine_arbitration overrode it in
+                        # favor of the kept-through segment -- skip the
+                        # reinit below entirely; box_out stays None this
+                        # frame and the existing tracker/kept_segment_start
+                        # are left untouched (see that function's own
+                        # docstring).
+                        if _resolve_pending_kept_segment(confirmed):
+                            was_inactive = not tracker_active
+                            tracker.init(frame_bgr, confirmed)
+                            if motion_kf is not None:
+                                motion_kf.init(confirmed)
+                            if missed_kf_drift is not None:
+                                missed_kf_drift.init(confirmed)
+                            tracker_active = True
+                            track_age = 0
+                            frames_since_verify = 0
+                            box_out = confirmed
+                            source = "detect"
+                            # stage4.backward_tracking: this is a FRESH lock
+                            # (no track was active a moment ago) -- recover
+                            # any frames right before it where the object
+                            # was present but not yet detected. A routine
+                            # keyframe re-anchor of an ALREADY-active track
+                            # skips this (was_inactive False) -- nothing to
+                            # recover there.
+                            if was_inactive:
+                                _run_backward_recovery(frame_idx, confirmed)
                     else:
                         tracker_active = False
                         _clear_pending_kept_segment()
@@ -763,20 +861,33 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         if box_out is not None:
                             # Successful re-detect IS the independent box a
                             # pending kept-through segment was waiting for.
-                            _resolve_pending_kept_segment(box_out)
-                            tracker.init(frame_bgr, box_out)
-                            if motion_kf is not None:
-                                motion_kf.init(box_out)
-                            if missed_kf_drift is not None:
-                                missed_kf_drift.init(box_out)
-                            tracker_active = True
-                            track_age = 0
-                            frames_since_verify = 0
-                            # Always a fresh lock here (tracker_active was
-                            # forced False a few lines up before this
-                            # re-detect attempt) -- recover any frames right
-                            # before it where the object went undetected.
-                            _run_backward_recovery(frame_idx, box_out)
+                            # False here means cosine_arbitration overrode
+                            # it in favor of the kept-through segment --
+                            # reject this re-detect (report absent this
+                            # frame instead) and leave kept_segment_start
+                            # OPEN for a later attempt, rather than clearing
+                            # it -- unlike the keyframe call site above,
+                            # there is no still-running tracker to fall
+                            # back on here (the original track already
+                            # failed before this re-detect was even tried).
+                            if _resolve_pending_kept_segment(box_out):
+                                tracker.init(frame_bgr, box_out)
+                                if motion_kf is not None:
+                                    motion_kf.init(box_out)
+                                if missed_kf_drift is not None:
+                                    missed_kf_drift.init(box_out)
+                                tracker_active = True
+                                track_age = 0
+                                frames_since_verify = 0
+                                # Always a fresh lock here (tracker_active
+                                # was forced False a few lines up before
+                                # this re-detect attempt) -- recover any
+                                # frames right before it where the object
+                                # went undetected.
+                                _run_backward_recovery(frame_idx, box_out)
+                            else:
+                                box_out = None
+                                source = "none"
                         else:
                             # Re-detect also failed -- nothing independent
                             # to validate a pending segment against; leave

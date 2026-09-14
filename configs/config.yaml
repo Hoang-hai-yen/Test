@@ -703,6 +703,21 @@ stage4:
     validate_against_next_keyframe: true
     window_frames: 10
     max_dist_ratio: 3.0
+    # EXPERIMENTAL, opt-in secondary arbitration for the exact moment the
+    # motion check above ALREADY flagged a disagreement -- same mechanism
+    # as backward_tracking.validate_against_boundary.cosine_arbitration
+    # below (see that block's comments for the full rationale/caveats).
+    # Differs in ONE way: here the independent detection at the CURRENT
+    # frame hasn't been written to tracks[] yet, so
+    # override_boundary_on_win=true means REJECTING it for this one frame
+    # (reports absent) instead of overwriting an already-recorded box --
+    # the kept-through track itself keeps running untouched, and
+    # kept_segment_start stays open for a later detection to resolve.
+    cosine_arbitration:
+      enabled: false
+      override_boundary_on_win: false
+      pooling: mean
+      use_adaptive_prototype: false
 
   # Recovers frames where the object was genuinely present but not yet
   # DETECTED -- an object entering the frame is often too degraded (motion
