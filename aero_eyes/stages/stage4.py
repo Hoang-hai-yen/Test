@@ -1137,12 +1137,13 @@ def _detect_on_frame(
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description="Stage 4 — tracking")
     p.add_argument("--config", required=True)
     p.add_argument("--sample", required=True)
     p.add_argument("--set", action="append", default=[])
+    p.add_argument("--debug", action="store_true", help="Verbose per-frame tracker logging")
     args = p.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     from aero_eyes.config import load_config
     cfg = load_config(args.config, args.set)
     run_stage4(cfg, args.sample)
