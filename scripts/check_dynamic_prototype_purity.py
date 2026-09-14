@@ -223,7 +223,7 @@ def check_sample(
     run_dynamic_prototype_rounds(
         sample_id, all_feats, all_sims, prototype, per_ref_features,
         use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
-        on_round=on_round,
+        on_round=on_round, all_frame_idxs=all_frame_idxs,
     )
 
     if rounds_seen == 0:

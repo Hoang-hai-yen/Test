@@ -63,6 +63,57 @@ def _pool_sims(sims_per_ref: list, pooling: str) -> np.ndarray:
     return np.mean(sims_per_ref, axis=0)
 
 
+def compute_adaptive_threshold(
+    all_sims: np.ndarray,
+    all_sims_original_refs: np.ndarray,
+    similarity_metric: str,
+    s3,
+) -> tuple[float, float, float, str]:
+    """stage3.adaptive_threshold's actual threshold computation, factored
+    out of run_stage3 for direct unit testing. Returns (effective_threshold,
+    center, spread, stat_label).
+
+    stats_sims (which distribution gets SUMMARIZED into center/spread) is
+    `all_sims_original_refs` when s3.adaptive_threshold_anchor_to_original_refs
+    is set, else `all_sims` -- independent of which distribution decides
+    ACCEPTANCE (always the caller's own `all_sims`, via its own keep_mask).
+    See Stage3Config.adaptive_threshold_anchor_to_original_refs's docstring
+    for why these are deliberately different arrays: dynamic_prototype can
+    inflate a handful of OTHER candidates' scores via max-pooling once it
+    appends narrow, self-selected reference vectors, dragging mean/std (and
+    so the threshold) up for everyone -- anchoring keeps the threshold
+    computation stable regardless.
+
+    stat_label is "mean/std" or "median/MAD" (s3.adaptive_threshold_robust)
+    -- median/MAD is far less moved by a handful of outlier-high scores,
+    exactly what a narrow dynamic_prototype addition produces.
+    """
+    stats_sims = all_sims_original_refs if s3.adaptive_threshold_anchor_to_original_refs else all_sims
+
+    if s3.adaptive_threshold_robust:
+        center = float(np.median(stats_sims))
+        # 1.4826 = consistency constant that makes MAD comparable to std
+        # under a roughly-normal distribution, so adaptive_z_score means
+        # roughly the same thing in either mode.
+        spread = float(1.4826 * np.median(np.abs(stats_sims - center)))
+        stat_label = "median/MAD"
+    else:
+        center = float(stats_sims.mean())
+        spread = float(stats_sims.std())
+        stat_label = "mean/std"
+
+    raw_threshold = center + s3.adaptive_z_score * spread
+    # adaptive_min_floor is calibrated for cosine's roughly [-1,1] range.
+    # l1/l2 scores are negated distances (unbounded, typically negative),
+    # so the floor has no meaningful interpretation there -- skip it.
+    if similarity_metric == "cosine":
+        effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
+    else:
+        effective_threshold = raw_threshold
+
+    return effective_threshold, center, spread, stat_label
+
+
 def run_dynamic_prototype_rounds(
     sample_id: str,
     all_feats: np.ndarray,
@@ -74,6 +125,7 @@ def run_dynamic_prototype_rounds(
     similarity_metric: str,
     dp,
     on_round=None,
+    all_frame_idxs: list[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list]:
     """stage3.dynamic_prototype's iterative refinement loop (opt-in, no-op
     when dp.enabled is False): a fixed high-confidence cutoff only ever
@@ -96,9 +148,14 @@ def run_dynamic_prototype_rounds(
 
     on_round: optional callback(round_idx, high_conf_mask, threshold),
     invoked once per round that actually ran (rounds skipped by the
-    min_support early-break are NOT reported) -- called BEFORE that
-    round's prototype update, i.e. high_conf_mask indexes all_feats at the
-    state used to SELECT that round's candidates. Return value ignored.
+    min_support/require_diverse_picks early-break are NOT reported) --
+    called BEFORE that round's prototype update, i.e. high_conf_mask
+    indexes all_feats at the state used to SELECT that round's candidates.
+    Return value ignored.
+
+    all_frame_idxs: parallel to all_feats/all_sims (all_frame_idxs[i] is
+    candidate i's frame index) -- required when dp.require_diverse_picks is
+    True (see that field's own docstring); ignored otherwise.
     """
     if not dp.enabled:
         return prototype, all_sims, per_ref_features
@@ -108,6 +165,24 @@ def run_dynamic_prototype_rounds(
         high_conf_mask = all_sims >= adaptive_high_thresh
         if int(high_conf_mask.sum()) < dp.min_support:
             break
+
+        if dp.require_diverse_picks:
+            if all_frame_idxs is None:
+                raise ValueError(
+                    "stage3.dynamic_prototype.require_diverse_picks=true needs all_frame_idxs "
+                    "passed to run_dynamic_prototype_rounds."
+                )
+            picked_frames = [all_frame_idxs[i] for i in np.where(high_conf_mask)[0]]
+            frame_span = max(picked_frames) - min(picked_frames)
+            if frame_span < dp.min_frame_span:
+                log.info(
+                    "[Stage3] %s: dynamic prototype round %d/%d skipped -- %d high-confidence "
+                    "candidates span only %d frame(s) (need >= %d), too narrow/clustered to "
+                    "trust as representative of the target's full appearance",
+                    sample_id, round_idx + 1, dp.rounds, int(high_conf_mask.sum()),
+                    frame_span, dp.min_frame_span,
+                )
+                break
 
         dynamic_feat = all_feats[high_conf_mask].mean(axis=0)
         dynamic_feat = dynamic_feat / (np.linalg.norm(dynamic_feat) + 1e-8)
@@ -232,10 +307,21 @@ def run_stage3(cfg, sample_id: str) -> Path:
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
 
+    # Snapshot BEFORE dynamic_prototype runs -- the similarity distribution
+    # against only the original reference photo(s), untouched by whatever
+    # dynamic_prototype appends/blends later. Used by
+    # adaptive_threshold_anchor_to_original_refs below to keep the
+    # THRESHOLD stable even when dynamic_prototype's own additions skew the
+    # (still used for ACCEPTANCE) all_sims distribution -- see that config
+    # field's own docstring. Identical to all_sims when dynamic_prototype is
+    # disabled, so this is a no-op then.
+    all_sims_original_refs = all_sims.copy()
+
     # ---- Dynamic prototype update (stage3.dynamic_prototype, opt-in) ----
     prototype, all_sims, per_ref_features = run_dynamic_prototype_rounds(
         sample_id, all_feats, all_sims, prototype, per_ref_features,
         use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
+        all_frame_idxs=all_frame_idxs,
     )
 
     # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;
@@ -264,20 +350,14 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     # ---- Compute effective threshold ----
     if s3.adaptive_threshold:
-        sim_mean = float(all_sims.mean())
-        sim_std = float(all_sims.std())
-        raw_threshold = sim_mean + s3.adaptive_z_score * sim_std
-        # adaptive_min_floor is calibrated for cosine's roughly [-1,1] range.
-        # l1/l2 scores are negated distances (unbounded, typically negative),
-        # so the floor has no meaningful interpretation there -- skip it.
-        if s3.similarity == "cosine":
-            effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
-        else:
-            effective_threshold = raw_threshold
+        effective_threshold, center, spread, stat_label = compute_adaptive_threshold(
+            all_sims, all_sims_original_refs, s3.similarity, s3,
+        )
         log.info(
-            "[Stage3] %s: adaptive threshold (metric=%s) = %.3f + %.1f*%.3f = %.3f%s",
-            sample_id, s3.similarity, sim_mean, s3.adaptive_z_score, sim_std,
-            effective_threshold,
+            "[Stage3] %s: adaptive threshold (metric=%s, stat=%s%s) = %.3f + %.1f*%.3f = %.3f%s",
+            sample_id, s3.similarity, stat_label,
+            ", anchored to original refs" if s3.adaptive_threshold_anchor_to_original_refs else "",
+            center, s3.adaptive_z_score, spread, effective_threshold,
             f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else "",
         )
     else:

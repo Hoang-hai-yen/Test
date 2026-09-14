@@ -84,3 +84,53 @@ def test_on_round_reports_selected_candidates_and_purity():
                 n_correct += 1
     assert n_with_gt == 2       # both selected candidates' frames have GT
     assert n_correct == 1       # only frame 0's box actually matches GT -- 50% purity
+
+
+def test_require_diverse_picks_skips_narrow_frame_span():
+    """4 high-confidence candidates that would easily clear min_support are
+    all clustered within a few frames (e.g. 3 consecutive keyframes of the
+    same unmoving pose) -- require_diverse_picks must refuse to trust them
+    (round skipped, on_round never called) since they don't demonstrate the
+    target's appearance actually varies. The SAME candidates spread across
+    a wide frame span DO get trusted."""
+    d = 8
+    rng = np.random.default_rng(1)
+    prototype = _unit(rng.standard_normal(d))
+    # All 4 candidates close to the prototype -- all comfortably clear a
+    # low percentile/floor threshold, isolating the diversity gate itself.
+    feats = np.stack([_unit(prototype + 0.01 * rng.standard_normal(d)) for _ in range(4)], axis=0)
+    all_sims = feats @ prototype
+
+    dp_narrow = DynamicPrototypeConfig(
+        enabled=True, rounds=1, alpha=0.3,
+        high_conf_percentile=0.0, high_conf_abs_floor=-1.0, min_support=3,
+        require_diverse_picks=True, min_frame_span=30,
+    )
+    calls = []
+    run_dynamic_prototype_rounds(
+        "narrow", feats, all_sims.copy(), prototype, [],
+        use_multi_ref=False, multi_ref_pooling="mean", similarity_metric="cosine",
+        dp=dp_narrow, on_round=lambda *a: calls.append(a),
+        all_frame_idxs=[10, 11, 12, 13],  # span=3, well under min_frame_span=30
+    )
+    assert calls == [], "narrow frame span should have skipped the round entirely"
+
+    calls_wide = []
+    run_dynamic_prototype_rounds(
+        "wide", feats, all_sims.copy(), prototype, [],
+        use_multi_ref=False, multi_ref_pooling="mean", similarity_metric="cosine",
+        dp=dp_narrow, on_round=lambda *a: calls_wide.append(a),
+        all_frame_idxs=[0, 100, 200, 300],  # span=300, clears min_frame_span=30
+    )
+    assert len(calls_wide) == 1, "wide frame span should have let the round proceed"
+
+    # require_diverse_picks=False (default) -- narrow span no longer matters.
+    dp_off = dp_narrow.model_copy(update={"require_diverse_picks": False})
+    calls_off = []
+    run_dynamic_prototype_rounds(
+        "narrow-unchecked", feats, all_sims.copy(), prototype, [],
+        use_multi_ref=False, multi_ref_pooling="mean", similarity_metric="cosine",
+        dp=dp_off, on_round=lambda *a: calls_off.append(a),
+        all_frame_idxs=[10, 11, 12, 13],
+    )
+    assert len(calls_off) == 1, "diversity check off should reproduce the old count-only gate"

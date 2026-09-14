@@ -312,6 +312,19 @@ class DynamicPrototypeConfig(BaseModel):
     high_conf_percentile: float = 90.0  # percentile of THIS sample's score distribution
     high_conf_abs_floor: float = 0.15   # absolute floor, so a low-scoring sample doesn't update from noise
     min_support: int = 2  # minimum high-confidence candidates required to update; else stop early
+    # min_support only checks COUNT -- a handful of near-duplicate frames
+    # (e.g. 3 consecutive keyframes of the same unmoving pose) clears it just
+    # as easily as 3 genuinely different views, but only the latter is
+    # actually safe to generalize from. When enabled, a round's high-
+    # confidence picks must ALSO span at least min_frame_span frames
+    # (max(frame_idx) - min(frame_idx) among the picks) before being trusted
+    # -- cheap proxy for "the target's appearance actually varies across
+    # these picks" without needing an embedding-space diversity metric.
+    # Rounds failing this (like the count check) stop the loop early instead
+    # of updating the prototype from an unrepresentative slice. False
+    # (default) = unchanged, count-only gate.
+    require_diverse_picks: bool = False
+    min_frame_span: int = 30
 
 
 class Stage3Config(BaseModel):
@@ -329,6 +342,36 @@ class Stage3Config(BaseModel):
     adaptive_threshold: bool = False
     adaptive_z_score: float = 2.0   # higher = fewer FP, lower = more recall (see configs/config.yaml for the sweep)
     adaptive_min_floor: float = 0.05  # hard floor: never accept sim below this
+    # The mean/std used above are computed on all_sims AS-IS -- when
+    # accuracy.cheap_boosters.multi_reference_embedding pools scores across
+    # per_ref_features (max, typically) and stage3.dynamic_prototype has
+    # APPENDED extra reference vectors derived from a narrow, self-selected
+    # candidate subset, a handful of OTHER candidates that happen to match
+    # those new (narrow) references well get inflated scores via max-pooling
+    # -- which drags mean/std up and raises the threshold for EVERYONE,
+    # including true positives whose own score never changed (they just
+    # don't match the narrow references any better than before). When
+    # enabled, mean/std (or median/MAD, see adaptive_threshold_robust below)
+    # are computed from the similarity distribution BEFORE dynamic_prototype
+    # ran (i.e. against the original per-reference-photo vectors only) --
+    # stable, not draggable by whatever dynamic_prototype appends later --
+    # while candidate ACCEPTANCE still uses the full (original + dynamic)
+    # pooled scores, so dynamic_prototype's recall benefit is kept, just not
+    # its ability to also move the goalpost. No-op when dynamic_prototype is
+    # disabled (the two distributions are identical then). False (default)
+    # = threshold stats computed on the same (possibly dynamic-prototype-
+    # affected) distribution used for acceptance, as before this option
+    # existed.
+    adaptive_threshold_anchor_to_original_refs: bool = False
+    # mean+std is sensitive to a small number of outlier-high scores --
+    # exactly what a narrow dynamic_prototype addition (or any other skew)
+    # produces. median + z_score*MAD (median absolute deviation, scaled by
+    # 1.4826 so it's comparable to std under a roughly normal distribution)
+    # is far less moved by a handful of outliers. Combines with
+    # adaptive_threshold_anchor_to_original_refs above (independent knobs --
+    # anchoring picks WHICH distribution to summarize, this picks HOW to
+    # summarize it). False (default) = mean/std, unchanged.
+    adaptive_threshold_robust: bool = False
     calibrate: CalibrateConfig = CalibrateConfig()
     dynamic_prototype: DynamicPrototypeConfig = DynamicPrototypeConfig()
 
