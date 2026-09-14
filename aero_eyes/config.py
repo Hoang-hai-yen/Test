@@ -395,6 +395,46 @@ class CoTrackerConfig(BaseModel):
     outlier_trim_pct: float = 10.0
 
 
+class BackwardTrackingConfig(BaseModel):
+    """stage4.backward_tracking -- recovers frames where the object was
+    genuinely present but not yet DETECTED: an object entering the frame is
+    often too degraded (motion blur, partial visibility) for the detector
+    to lock onto for the first few keyframes, and the SAME shape of problem
+    can happen mid-video after a track-loss episode (object reappears but
+    isn't re-detected immediately) -- both leave a gap of real presence
+    reported as absent, purely because no track existed yet to report it.
+
+    Unlike stage4.keep_tracking_on_missed_keyframe (which extends an
+    ALREADY-active track through a gap), this recovers frames BEFORE any
+    track existed at all, by running a SEPARATE tracker instance BACKWARD
+    in time from the first confirmed box of each NEW track segment --
+    every False->True transition of the active-tracking state, not just
+    the video's very first lock, since a re-lock after a mid-video
+    track-loss episode has the exact same shape of problem. This project's
+    trackers (builtin/litetrack) have no inherent notion of time
+    direction: template/filter state only depends on the (frame, box) pair
+    given at init() and the immediately preceding reported position, so
+    running them on frames in decreasing index order is mechanically
+    identical to running forward -- see aero_eyes/models/trackers.py.
+
+    Stops recovering backward as soon as it hits whichever comes first: a
+    frame already covered by a PREVIOUS track segment (never overwrites
+    it), frame 0, max_backward_frames frames back, or the backward
+    tracker's own confidence (stage4.tracker_conf_threshold) dropping too
+    low to trust further -- so a genuinely-absent stretch before the
+    object truly entered the frame is not filled in.
+
+    Needs a bounded rolling buffer of recently-read frames (bounded by
+    max_backward_frames) kept in memory during the forward pass to supply
+    the backward tracker with pixels for frames already read past -- see
+    run_stage4's `recent_frames`. No effect when stage4.tracker == "none"
+    (NoneTracker re-detects every frame independently; there is no
+    continuous tracker state to run backward).
+    """
+    enabled: bool = False
+    max_backward_frames: int = 30
+
+
 class KeepTrackingOnMissedKeyframeConfig(BaseModel):
     """stage4.keep_tracking_on_missed_keyframe -- without this, a KEYFRAME
     with zero surviving detections (GeCo2/Stage3 found nothing there, e.g.
@@ -567,6 +607,7 @@ class Stage4Config(BaseModel):
     confirm_detections: DetectionConfirmationConfig = DetectionConfirmationConfig()
 
     keep_tracking_on_missed_keyframe: KeepTrackingOnMissedKeyframeConfig = KeepTrackingOnMissedKeyframeConfig()
+    backward_tracking: BackwardTrackingConfig = BackwardTrackingConfig()
 
     # Every verify_interval frames of ACTIVE tracking (builtin/litetrack,
     # not tracker=none), re-embed the currently-tracked crop with DINOv2 and

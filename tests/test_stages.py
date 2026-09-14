@@ -670,6 +670,84 @@ def test_stage4_keep_tracking_on_missed_keyframe(cfg, synth_fixture):
         )
 
 
+def test_stage4_backward_tracking_recovers_cold_start(cfg, synth_fixture):
+    """stage4.backward_tracking: when the FIRST-EVER detection in the whole
+    video lands several keyframes after the object actually entered the
+    frame (cold start -- too degraded for the detector to lock onto right
+    away), running a separate tracker BACKWARD from that first lock should
+    recover the frames before it instead of leaving them absent forever.
+    """
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box = Box(5, 5, 15, 15, score=1.0)
+    detections = {
+        20: [Detection(frame_idx=20, box=box, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box, 0.9)  # always "succeeds", forward and backward alike
+
+    cfg.stage4.tracker = "builtin"
+    cfg.stage4.max_track_age = 100
+    cfg.stage4.backward_tracking.enabled = True
+    cfg.stage4.backward_tracking.max_backward_frames = 30
+
+    with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker):
+        from aero_eyes.stages.stage4 import run_stage4
+        tracks_path = run_stage4(cfg, FIXTURE_ID)
+    with open(tracks_path) as f:
+        frames = json.load(f)["frames"]
+
+    for fi in range(0, 20):
+        assert frames[str(fi)] is not None, (
+            f"frame {fi}: backward_tracking should have recovered this cold-start frame"
+        )
+    assert frames["20"] == box.to_dict()
+
+
+def test_stage4_backward_tracking_respects_max_backward_frames(cfg, synth_fixture):
+    """stage4.backward_tracking.max_backward_frames caps how far back
+    recovery goes -- frames further back than the cap stay absent, exactly
+    like a genuinely-absent stretch before the object entered the frame
+    would (recovery isn't supposed to run to the start of the video
+    unconditionally)."""
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_detections
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    box = Box(5, 5, 15, 15, score=1.0)
+    detections = {
+        20: [Detection(frame_idx=20, box=box, similarity=0.9, source="test")],
+    }
+    write_detections(detections, work_dir / "detections.json")
+
+    fake_tracker = MagicMock()
+    fake_tracker.update.return_value = (box, 0.9)
+
+    cfg.stage4.tracker = "builtin"
+    cfg.stage4.max_track_age = 100
+    cfg.stage4.backward_tracking.enabled = True
+    cfg.stage4.backward_tracking.max_backward_frames = 5  # only frames 15-19 recoverable
+
+    with patch("aero_eyes.models.trackers.build_tracker", return_value=fake_tracker):
+        from aero_eyes.stages.stage4 import run_stage4
+        tracks_path = run_stage4(cfg, FIXTURE_ID)
+    with open(tracks_path) as f:
+        frames = json.load(f)["frames"]
+
+    for fi in range(0, 15):
+        assert frames[str(fi)] is None, f"frame {fi}: beyond the cap, should stay absent"
+    for fi in range(15, 20):
+        assert frames[str(fi)] is not None, f"frame {fi}: within the cap, should be recovered"
+
+
 def test_stage4_keep_tracking_validates_against_next_keyframe(cfg, synth_fixture):
     """keep_tracking_on_missed_keyframe.validate_against_next_keyframe: a
     kept-through segment that turns out to have been WRONG (the tracker was

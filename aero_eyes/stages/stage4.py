@@ -12,6 +12,10 @@ Flow:  detections.json + video
           drift-plausibility check, forcing a re-detect when the box departs
           from its own recent trajectory in a way verify_interval's cosine
           check wouldn't catch (see aero_eyes/utils/motion_drift_check.py)
+       -> at every fresh lock (opt-in, stage4.backward_tracking): run a
+          SEPARATE tracker instance BACKWARD from that lock to recover
+          frames where the object was present but not yet detected (cold
+          start, or a re-lock after mid-video track loss)
        -> tracks.json
 
 Tracker options: builtin | litetrack | none
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -115,6 +120,16 @@ def run_stage4(cfg, sample_id: str) -> Path:
     is_none_tracker = isinstance(tracker, NoneTracker)
     s4 = cfg.stage4
     use_geco2 = cfg.pipeline.detector == "geco2"
+
+    # ---- stage4.backward_tracking: separate tracker instance + rolling
+    # frame buffer, built only when the feature is actually used (a second
+    # LiteTrack tracker doubles ONNX session memory) -- see
+    # BackwardTrackingConfig's docstring for the recovery/stopping rules. ----
+    bt_cfg = s4.backward_tracking
+    backward_tracker = None
+    recent_frames: "OrderedDict[int, np.ndarray]" = OrderedDict()
+    if bt_cfg.enabled and not is_none_tracker:
+        backward_tracker = build_tracker(cfg)
 
     # box_refine.apply_in_stage4 piggybacks on verify_interval's own cadence
     # (frames_since_verify below) -- needs no DINOv2 prototype, so it's set
@@ -304,10 +319,51 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 )
         kept_segment_start = None
 
+    def _run_backward_recovery(anchor_frame_idx: int, anchor_box: Box) -> None:
+        """stage4.backward_tracking: called right after EVERY fresh lock
+        (tracker_active going False -> True, whether this is the video's
+        first lock or a re-lock after mid-video track loss). Runs
+        `backward_tracker` from `anchor_box` at `anchor_frame_idx`
+        backward through `recent_frames`, filling in tracks[fi] for
+        currently-absent frames immediately before it -- stops at the
+        first frame that already has a box (a previous segment's
+        territory, never overwritten), frame 0,
+        bt_cfg.max_backward_frames back, a frame missing from the buffer
+        (ran further back than what's been read), or the backward
+        tracker's own confidence dropping below tracker_conf_threshold.
+        No-op if the feature is off or nothing is buffered yet.
+        """
+        if backward_tracker is None:
+            return
+        lo = max(0, anchor_frame_idx - bt_cfg.max_backward_frames)
+        backward_tracker.init(recent_frames[anchor_frame_idx], anchor_box)
+        recovered = 0
+        fi = anchor_frame_idx - 1
+        while fi >= lo:
+            if tracks.get(fi) is not None or fi not in recent_frames:
+                break
+            box, conf = backward_tracker.update(recent_frames[fi])
+            if box is None or conf < s4.tracker_conf_threshold:
+                break
+            tracks[fi] = box
+            recovered += 1
+            fi -= 1
+        if recovered:
+            log.info(
+                "[Stage4] %s: backward_tracking recovered %d frame(s) [%d, %d) "
+                "before the lock at frame %d",
+                sample_id, recovered, anchor_frame_idx - recovered, anchor_frame_idx, anchor_frame_idx,
+            )
+
     try:
         for frame_idx, frame_bgr in frame_iterator(video_path):
             box_out: Box | None = None
             source = "none"
+
+            if backward_tracker is not None:
+                recent_frames[frame_idx] = frame_bgr.copy()
+                while len(recent_frames) > bt_cfg.max_backward_frames + 1:
+                    recent_frames.popitem(last=False)
 
             if is_none_tracker:
                 # Re-detect every frame
@@ -344,6 +400,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         # was waiting for -- validate/resolve it BEFORE
                         # trusting this detection over the tracker's state.
                         _resolve_pending_kept_segment(confirmed)
+                        was_inactive = not tracker_active
                         tracker.init(frame_bgr, confirmed)
                         if motion_kf is not None:
                             motion_kf.init(confirmed)
@@ -354,6 +411,14 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         frames_since_verify = 0
                         box_out = confirmed
                         source = "detect"
+                        # stage4.backward_tracking: this is a FRESH lock
+                        # (no track was active a moment ago) -- recover any
+                        # frames right before it where the object was
+                        # present but not yet detected. A routine keyframe
+                        # re-anchor of an ALREADY-active track skips this
+                        # (was_inactive False) -- nothing to recover there.
+                        if was_inactive:
+                            _run_backward_recovery(frame_idx, confirmed)
                     else:
                         tracker_active = False
                         _clear_pending_kept_segment()
@@ -560,6 +625,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             tracker_active = True
                             track_age = 0
                             frames_since_verify = 0
+                            # Always a fresh lock here (tracker_active was
+                            # forced False a few lines up before this
+                            # re-detect attempt) -- recover any frames right
+                            # before it where the object went undetected.
+                            _run_backward_recovery(frame_idx, box_out)
                         else:
                             # Re-detect also failed -- nothing independent
                             # to validate a pending segment against; leave

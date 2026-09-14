@@ -675,6 +675,23 @@ stage4:
     window_frames: 10
     max_dist_ratio: 3.0
 
+  # Recovers frames where the object was genuinely present but not yet
+  # DETECTED -- an object entering the frame is often too degraded (motion
+  # blur, partial visibility) for the detector to lock onto for the first
+  # few keyframes, and the same shape of problem can happen mid-video after
+  # a track-loss episode. Different from keep_tracking_on_missed_keyframe
+  # above (which extends an ALREADY-active track through a gap): this
+  # recovers frames BEFORE any track existed, by running a SEPARATE tracker
+  # instance BACKWARD in time from the first confirmed box of each new
+  # track segment (every re-lock, not just the video's first one). Stops as
+  # soon as it hits whichever comes first: a frame already covered by a
+  # PREVIOUS track segment, frame 0, max_backward_frames frames back, or
+  # the backward tracker's own confidence (tracker_conf_threshold above)
+  # dropping too low. No effect when tracker: none.
+  backward_tracking:
+    enabled: false
+    max_backward_frames: 30
+
   # Every verify_interval frames of ACTIVE tracking (builtin/litetrack, not
   # tracker=none), re-embed the currently-tracked crop with DINOv2 and
   # cross-check it against the prototype -- the real correctness check
