@@ -638,6 +638,20 @@ class KeepTrackingOnMissedKeyframeConfig(BaseModel):
     """
     enabled: bool = False
     validate_against_next_keyframe: bool = True
+    # Caps how many CONSECUTIVE missed keyframes one open segment tolerates
+    # before giving up on it (same "give up" path as kt_cfg.enabled=False)
+    # -- deliberately separate from stage4.max_track_age, which bounds
+    # elapsed FRAMES since the last confirmed re-anchor. track_age is frozen
+    # for the whole time a segment is open (see run_stage4's own comment
+    # next to `consecutive_missed_keyframes`), so max_track_age no longer
+    # has any way to bound this tolerance -- without a dedicated limit here,
+    # an object that's genuinely gone would let the tracker coast on stale
+    # motion forever. The two limits used to overlap by coincidence (a
+    # frame-count ceiling divided by keyframe_interval implicitly capped
+    # consecutive misses too) in a way that shifted with keyframe_interval
+    # and was never a deliberate design choice -- this makes the intended
+    # limit explicit and independent of that config's value.
+    max_consecutive_missed_keyframes: int = 3
     # Same semantics/defaults as stage4.kalman_motion_check's own fields --
     # see KalmanMotionCheckConfig for what each one means; applied here to
     # the kept-through segment's trajectory instead of every live frame.

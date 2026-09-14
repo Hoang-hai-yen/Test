@@ -701,6 +701,11 @@ stage4:
     # what makes tolerating a missed keyframe defensible in the first
     # place; false reproduces "always keep, never check" for comparison.
     validate_against_next_keyframe: true
+    # Max CONSECUTIVE missed keyframes one open segment tolerates before
+    # giving up on it -- deliberately separate from stage4.max_track_age
+    # (track_age is frozen while a segment is open, so max_track_age can no
+    # longer bound this; see KeepTrackingOnMissedKeyframeConfig's docstring).
+    max_consecutive_missed_keyframes: 3
     window_frames: 10
     max_dist_ratio: 3.0
     # EXPERIMENTAL, opt-in secondary arbitration for the exact moment the

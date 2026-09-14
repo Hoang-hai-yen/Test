@@ -363,13 +363,20 @@ def run_stage4(cfg, sample_id: str) -> Path:
     # or cleared) the next time an INDEPENDENT box becomes available -- see
     # _resolve_pending_kept_segment below.
     kept_segment_start: int | None = None
+    # Number of CONSECUTIVE missed keyframes tolerated in the current open
+    # segment (independent of max_track_age -- see
+    # kt_cfg.max_consecutive_missed_keyframes's own docstring for why
+    # max_track_age alone is the wrong tool to bound this). Reset to 0
+    # wherever kept_segment_start is reset to None (both helpers below), so
+    # it always reflects only the CURRENT segment's miss count.
+    consecutive_missed_keyframes = 0
 
     def _clear_pending_kept_segment() -> None:
         """No independent box available to validate a pending segment
         against (track went fully inactive without a fresh re-init) --
         leave its already-written frames as-is, just stop treating it as
         open so a LATER, unrelated segment isn't validated against it."""
-        nonlocal kept_segment_start
+        nonlocal kept_segment_start, consecutive_missed_keyframes
         if kept_segment_start is not None:
             log.info(
                 "[Stage4] %s: keep_tracking_on_missed_keyframe segment starting at frame %d "
@@ -377,6 +384,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 sample_id, kept_segment_start,
             )
         kept_segment_start = None
+        consecutive_missed_keyframes = 0
 
     def _arbitrate_kept_segment_by_cosine(seg_start: int, fresh_box: Box) -> bool:
         """keep_tracking_on_missed_keyframe.validate_against_next_keyframe.
@@ -443,7 +451,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
         tracker's own state are left untouched, so tracking continues
         from the kept-through segment's state into subsequent frames).
         """
-        nonlocal kept_segment_start
+        nonlocal kept_segment_start, consecutive_missed_keyframes
         if kept_segment_start is None:
             return True
         segment_len = frame_idx - kept_segment_start
@@ -454,6 +462,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     if kt_cfg.cosine_arbitration.override_boundary_on_win:
                         return False  # kept_segment_start stays open, fresh_box rejected this frame
                     kept_segment_start = None
+                    consecutive_missed_keyframes = 0
                     return True  # kept segment AND fresh_box both survive, untouched
                 for fi in range(kept_segment_start, frame_idx):
                     tracks[fi] = None
@@ -463,6 +472,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                     "-- retroactively marked absent", sample_id, kept_segment_start, frame_idx, frame_idx,
                 )
                 kept_segment_start = None
+                consecutive_missed_keyframes = 0
                 return True
         log.info(
             "[Stage4] %s: keep_tracking_on_missed_keyframe kept %d frame(s) [%d, %d) through a "
@@ -470,6 +480,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
             sample_id, segment_len, kept_segment_start, frame_idx, frame_idx,
         )
         kept_segment_start = None
+        consecutive_missed_keyframes = 0
         return True
 
     def _arbitrate_by_cosine(boundary_fi: int, boundary_box: Box, recovered_frames: list[int]) -> bool:
@@ -674,16 +685,30 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 # for why (a missed DETECTION at one frame shouldn't override
                 # the tracker's own live state, which every check below still
                 # gets to judge on its own terms).
-                elif tracker_active and (not is_keyframe or kt_cfg.enabled):
-                    if is_keyframe and kept_segment_start is None:
-                        kept_segment_start = frame_idx
+                elif tracker_active and (
+                    not is_keyframe
+                    or (kt_cfg.enabled and consecutive_missed_keyframes < kt_cfg.max_consecutive_missed_keyframes)
+                ):
+                    if is_keyframe:
+                        consecutive_missed_keyframes += 1
+                        if kept_segment_start is None:
+                            kept_segment_start = frame_idx
                         log.info(
                             "[Stage4] %s: frame %d: keyframe had no surviving detection -- "
                             "keep_tracking_on_missed_keyframe keeping the active track alive "
-                            "through it", sample_id, frame_idx,
+                            "through it (%d/%d consecutive miss(es) tolerated)",
+                            sample_id, frame_idx, consecutive_missed_keyframes,
+                            kt_cfg.max_consecutive_missed_keyframes,
                         )
                     box, conf = tracker.update(frame_bgr)
-                    track_age += 1
+                    # track_age is frozen for the whole time a segment is
+                    # open -- max_track_age no longer bounds tolerance for
+                    # missed keyframes at all, that's entirely
+                    # consecutive_missed_keyframes's job now (see
+                    # KeepTrackingOnMissedKeyframeConfig's docstring for why
+                    # these two limits were deliberately decoupled).
+                    if kept_segment_start is None:
+                        track_age += 1
                     frames_since_verify += 1
                     if missed_kf_drift is not None and box is not None:
                         # Feed the trend continuously (whether or not this
@@ -919,13 +944,19 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             _clear_pending_kept_segment()
                 elif is_keyframe:
                     # Keyframe had no surviving detection, and either no
-                    # track was active to fall back on, or
-                    # keep_tracking_on_missed_keyframe is off -- give up on
-                    # this keyframe exactly like the original logic did.
+                    # track was active to fall back on, keep_tracking_on_
+                    # missed_keyframe is off, or its consecutive-miss limit
+                    # was already reached -- give up on this keyframe
+                    # exactly like the original (pre-feature) logic did.
                     if not tracker_active:
                         reason = f"no active track to fall back on ({track_lost_reason or 'never locked on'})"
                     elif not kt_cfg.enabled:
                         reason = "keep_tracking_on_missed_keyframe is disabled"
+                    elif consecutive_missed_keyframes >= kt_cfg.max_consecutive_missed_keyframes:
+                        reason = (
+                            f"max_consecutive_missed_keyframes ({kt_cfg.max_consecutive_missed_keyframes}) "
+                            "reached for this segment"
+                        )
                     else:
                         reason = "unknown"
                     log.info(
