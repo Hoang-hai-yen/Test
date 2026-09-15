@@ -721,7 +721,7 @@ stage4:
     cosine_arbitration:
       enabled: false
       override_boundary_on_win: false
-      pooling: mean
+      pooling: max
       use_adaptive_prototype: false
 
   # Recovers frames where the object was genuinely present but not yet
@@ -789,7 +789,7 @@ stage4:
       #                    directly, so arbitration scores things the SAME
       #                    way Stage 3's own matching did (recommended if
       #                    you run Stage 3 with multi_ref_pooling=max).
-      pooling: mean
+      pooling: max
       # false (default): score against ONLY the original 3 reference-photo
       #   vectors (prototype.npz from Stage 1, unaffected by Stage 3).
       # true: score against prototype_adapted.npz instead -- the SAME
@@ -999,7 +999,7 @@ accuracy:
     # them) gets that good score diluted by the other two weak ones. "max"
     # takes the single best-matching ref's score instead, so a genuinely
     # good match isn't dragged down by refs shot from a different angle.
-    multi_ref_pooling: mean   # "mean" | "max"
+    multi_ref_pooling: max   # "mean" | "max"
 
   max_accuracy:
     synthetic_viewpoint_aug:
