@@ -344,6 +344,69 @@ def test_stage3_produces_detections(cfg, synth_fixture):
     assert "frames" in data
 
 
+def test_stage3_recompute_candidate_features_fixes_stale_dim_mismatch(cfg, synth_fixture):
+    """stage3.recompute_candidate_features: reproduces the real bug -- Stage
+    2's cache check only looks at whether candidates.json exists, with no
+    idea which feature_extractor produced its companion .feats.npz. Switching
+    extractors (here: re-running Stage 1 with a different feat_dim, as if
+    feature_extractor.model changed) without invalidating that cache leaves
+    prototype.npz and candidates.feats.npz at DIFFERENT dimensions, which
+    crashes Stage 3's `feats @ ref` with a shape-mismatch error. With the
+    flag on, Stage 3 re-extracts candidate features with the CURRENT
+    extractor (no box detection re-run) instead of crashing."""
+    old_dim, new_dim = 384, 512
+    mock_extractor_old = _mock_dinov2(old_dim)
+    mock_prop = _mock_proposals()
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor_old), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor_old), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop):
+        from aero_eyes.stages.stage2 import run_stage2
+        run_stage2(cfg, FIXTURE_ID)
+
+    # Simulate switching feature_extractor: re-run Stage 1 (use_cache=False
+    # in this fixture, so it always recomputes) with a DIFFERENT dim --
+    # prototype.npz is now new_dim, but candidates.feats.npz (Stage 2,
+    # untouched) is still old_dim.
+    mock_extractor_new = _mock_dinov2(new_dim)
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor_new), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    from aero_eyes.stages.stage3 import run_stage3
+
+    # Without the flag: reproduces the crash.
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor_new):
+        with pytest.raises(ValueError):
+            run_stage3(cfg, FIXTURE_ID)
+
+    # With the flag: re-extracts candidate features at new_dim instead of crashing.
+    cfg.stage3.recompute_candidate_features = True
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor_new):
+        det_path = run_stage3(cfg, FIXTURE_ID)
+
+    assert det_path.exists()
+
+    from aero_eyes.stages.stage2 import read_candidates_with_features
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    _, feat_matrix = read_candidates_with_features(work_dir / "candidates.json")
+    assert feat_matrix.shape[1] == new_dim, (
+        "candidates.feats.npz on disk should be rewritten at the NEW extractor's "
+        "dimension, not left stale at the old one"
+    )
+
+
 def test_stage3_dynamic_prototype_produces_detections(cfg, synth_fixture):
     """Stage 3 with stage3.dynamic_prototype.enabled=True still runs to
     completion and writes valid detections.json -- covers the 2-pass

@@ -328,6 +328,25 @@ class DynamicPrototypeConfig(BaseModel):
 
 
 class Stage3Config(BaseModel):
+    # Dev/debug convenience: candidates.json's companion candidates.feats.npz
+    # is written by Stage 2 (see aero_eyes/stages/stage2.py::
+    # _write_candidates_with_features) using whatever stage1.feature_extractor
+    # was active THEN -- Stage 2's own cache check only looks at whether
+    # candidates.json exists, with no awareness of which extractor produced
+    # it, so switching feature_extractor.model/variant without also clearing
+    # that cache leaves a STALE, wrong-dimension .feats.npz that crashes
+    # Stage 3's `feats @ ref` with a cryptic shape-mismatch error. The correct
+    # fix is normally to invalidate the cache (project.use_cache=false, or
+    # delete candidates.json so Stage 2 reruns) -- but Stage 2 also reruns
+    # SAHI/proposal-model box detection, which doesn't depend on the
+    # extractor at all and can be the expensive part on a long video. When
+    # true, Stage 3 instead re-extracts features for the EXISTING candidate
+    # boxes (no box detection re-run) using the CURRENT feature_extractor,
+    # then overwrites candidates.json + candidates.feats.npz in place -- so a
+    # later run (with this back off) sees a cache that's actually consistent
+    # with the extractor now configured. False (default) = unchanged, use
+    # whatever features are already cached.
+    recompute_candidate_features: bool = False
     similarity: Literal["cosine", "l1", "l2"] = "cosine"
     match_threshold: float = 0.55
     nms_iou: float = 0.5

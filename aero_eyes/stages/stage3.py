@@ -260,6 +260,50 @@ def run_stage3(cfg, sample_id: str) -> Path:
         )
     candidates, feat_matrix = read_candidates_with_features(cand_path)
 
+    data_root = Path(cfg.data.data_root)
+    video_files = list((data_root / sample_id).glob(cfg.data.video_glob))
+    video_path = video_files[0] if video_files else None
+
+    s3 = cfg.stage3
+    if s3.recompute_candidate_features and video_path is not None:
+        # stage3.recompute_candidate_features: re-extract features for the
+        # EXISTING candidate boxes with the CURRENTLY configured
+        # feature_extractor, instead of trusting whatever candidates.feats.npz
+        # already holds -- see the field's own docstring for why this exists
+        # (Stage 2's cache check can't tell its cached features were built
+        # with a now-stale extractor). Box geometry itself is untouched, only
+        # each Detection's _feature gets overwritten; no SAHI/proposal-model
+        # re-run needed.
+        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.stages.stage2 import _write_candidates_with_features
+
+        recompute_extractor = build_feature_extractor(cfg)
+        n_recomputed = 0
+        for frame_idx, cand_dets in candidates.items():
+            if not cand_dets:
+                continue
+            try:
+                frame_bgr = read_frame(video_path, frame_idx)
+            except Exception:
+                continue
+            feats = recompute_extractor.extract_crops(
+                frame_bgr, [d.box for d in cand_dets],
+                pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+                batch_size=cfg.runtime.batch_size,
+            )
+            for det, feat in zip(cand_dets, feats):
+                det._feature = feat
+            n_recomputed += len(cand_dets)
+        _write_candidates_with_features(candidates, cand_path)
+        log.info(
+            "[Stage3] %s: recompute_candidate_features -- re-extracted %d candidate "
+            "feature(s) across %d keyframe(s), rewrote %s",
+            sample_id, n_recomputed, len(candidates), cand_path,
+        )
+        # Re-read rather than hand-assemble feat_matrix here -- keeps this
+        # path exercising the exact same load code every other run takes.
+        candidates, feat_matrix = read_candidates_with_features(cand_path)
+
     if feat_matrix is None or feat_matrix.shape[0] == 0:
         log.warning("[Stage3] No candidate features found — writing empty detections.")
         # Still record every keyframe Stage2 scanned (with an empty box
@@ -269,8 +313,6 @@ def run_stage3(cfg, sample_id: str) -> Path:
         write_detections({fi: [] for fi in candidates}, det_path)
         return det_path
 
-    # ---- Stage 3 config ----
-    s3 = cfg.stage3
     threshold = s3.match_threshold
     use_multi_ref = (
         cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
@@ -281,9 +323,6 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     # ---- Match: global top-K or per-keyframe threshold ----
     detections: dict[int, list[Detection]] = {}
-    data_root = Path(cfg.data.data_root)
-    video_files = list((data_root / sample_id).glob(cfg.data.video_glob))
-    video_path = video_files[0] if video_files else None
     viz_dir = work_dir / "viz" / "stage3"
 
     # Build flat list of (frame_idx, det, feat) for all candidates
