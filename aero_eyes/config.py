@@ -165,9 +165,54 @@ class ProjectionHeadConfig(BaseModel):
 class FeatureExtractorConfig(BaseModel):
     model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
-    # DINOv3 weights are gated on HuggingFace (facebook/dinov3-*) -- request
-    # access on the model page and set HF_TOKEN before using this.
+    # DINOv2 "with registers" (torch.hub dinov2_{variant}_reg / HF
+    # facebook/dinov2-with-registers-*): Meta found a handful of patch tokens
+    # in the original DINOv2 get repurposed internally as a "scratch pad" for
+    # global information the model needs but has nowhere else to put, which
+    # shows up as high-norm artifact tokens polluting the attention/feature
+    # maps. Adding a few dedicated register tokens (ignored for the CLS
+    # output used here) gives the model that scratch space directly, per
+    # Meta's own ablations producing cleaner features -- same CLS token
+    # output dim as the non-register variant (see DINOv2FeatureExtractor.
+    # _DIMS), so this is a drop-in swap, not a separate model size to
+    # reconfigure downstream. False (default) = original DINOv2, unchanged.
+    dinov2_use_registers: bool = False
+    # DINOv3 architecture size. Weights are gated on HuggingFace
+    # (facebook/dinov3-*) -- request access on the model page and set
+    # HF_TOKEN before using dinov3_source=huggingface below.
     dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
+    # WHICH pretraining run's weights to load, same architecture either way:
+    # "lvd1689m" (default) = Meta's large natural-image corpus. "sat493m" =
+    # a satellite-imagery pretraining run -- likely a better domain match
+    # for aerial/drone footage than the natural-image default. Applies to
+    # BOTH sources below (huggingface builds the repo id from it; for
+    # kaggle, dinov3_kaggle_model_id is a free-form string you supply
+    # yourself, so it's on you to point it at a checkpoint whose own
+    # architecture/dataset matches this + dinov3_variant -- this field is
+    # bookkeeping/logging only in that case, not enforced). Not every
+    # (dinov3_variant, dinov3_pretrain_dataset) combination is necessarily
+    # published on HuggingFace -- an unavailable one 404s straight from
+    # `from_pretrained`.
+    dinov3_pretrain_dataset: Literal["lvd1689m", "sat493m"] = "lvd1689m"
+    # "huggingface" (default): facebook/dinov3-{dinov3_variant}-pretrain-
+    #   {dinov3_pretrain_dataset} via transformers.AutoModel, gated -- see
+    #   dinov3_variant's own comment.
+    # "kaggle": loads a raw Meta DINOv3 checkpoint (a bare .pth/.pt state
+    #   dict from Meta's OWN dinov3 codebase, NOT a transformers-format
+    #   folder) via kagglehub.model_download(dinov3_kaggle_model_id), then
+    #   torch.hub.load("facebookresearch/dinov3", ..., weights=<that file>)
+    #   -- lets you point at a pretraining variant mirrored on Kaggle
+    #   without needing HuggingFace gating (e.g. when a HF repo for it
+    #   isn't published, or you just don't have HF access).
+    #   Needs the `kagglehub` package installed and Kaggle API credentials
+    #   configured (~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY).
+    dinov3_source: Literal["huggingface", "kaggle"] = "huggingface"
+    # Required when dinov3_source == "kaggle", e.g.
+    # "yadavdamodar/dinov3-vitl16-pretrain-sat493m/pyTorch/default" -- its
+    # own architecture/dataset must match dinov3_variant/
+    # dinov3_pretrain_dataset above (this string is the actual weight
+    # source; those two fields aren't validated against it).
+    dinov3_kaggle_model_id: Optional[str] = None
     clip_variant: str = "vit-b/32"   # "vit-b/32" (512-d) or "vit-l/14" (768-d)
     # SigLIP: open access (no gating), vision-only encoder.
     siglip_variant: Literal["base", "large", "so400m"] = "base"

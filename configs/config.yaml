@@ -93,11 +93,39 @@ stage1:
     model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dinov2+clip concat)
     dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
                               # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
-    # dinov3_variant: used only when model=dinov3. Weights are GATED on
-    # HuggingFace (facebook/dinov3-*-pretrain-lvd1689m) -- request access on
-    # the model page with your HF account first, then set HF_TOKEN in the
-    # environment before running, or the download will 401/403.
+    # "With registers" DINOv2 (dinov2_{variant}_reg on torch.hub / HF
+    # facebook/dinov2-with-registers-*): a few dedicated register tokens give
+    # the model scratch space it otherwise repurposes patch tokens for,
+    # producing cleaner features per Meta's own ablations -- same output dim
+    # as the non-register variant above, drop-in swap. false = original DINOv2.
+    dinov2_use_registers: false
+    # dinov3_variant: used only when model=dinov3.
     dinov3_variant: vitb16   # vits16 (384-d) | vitb16 (768-d) | vitl16 (1024-d)
+    # WHICH pretraining run's weights to load, same architecture either way:
+    # lvd1689m (default) = Meta's large natural-image corpus. sat493m =
+    # satellite-imagery pretraining -- likely a better domain match for
+    # aerial/drone footage. Applies to both sources below; for kaggle,
+    # dinov3_kaggle_model_id is what actually decides the weights (this
+    # field is bookkeeping/logging only there). Not every
+    # (dinov3_variant, dinov3_pretrain_dataset) pair is necessarily
+    # published on HuggingFace -- unavailable ones 404 from from_pretrained.
+    dinov3_pretrain_dataset: lvd1689m   # lvd1689m | sat493m
+    # dinov3_source: "huggingface" (default) -- weights GATED on HuggingFace
+    # (facebook/dinov3-{dinov3_variant}-pretrain-{dinov3_pretrain_dataset});
+    # request access on the model page with your HF account first, then set
+    # HF_TOKEN in the environment before running, or the download will
+    # 401/403.
+    # "kaggle" -- loads a raw Meta .pth checkpoint via
+    # kagglehub.model_download(dinov3_kaggle_model_id) instead, no HF gating
+    # needed -- e.g. when a HF repo for the variant/dataset you want isn't
+    # published, or you just don't have HF access. Needs `kagglehub`
+    # installed and Kaggle API credentials configured.
+    dinov3_source: huggingface   # huggingface | kaggle
+    # Required when dinov3_source=kaggle -- its own architecture/dataset
+    # must match dinov3_variant/dinov3_pretrain_dataset above (this string
+    # is the actual weight source; those two fields aren't validated
+    # against it).
+    dinov3_kaggle_model_id: null   # e.g. "yadavdamodar/dinov3-vitl16-pretrain-sat493m/pyTorch/default"
     clip_variant: vit-b/32   # vit-b/32 (512-d) | vit-l/14 (768-d)
     # siglip_variant: used only when model=siglip. Open access on HuggingFace,
     # no token needed. Vision encoder only (no text tower loaded).
