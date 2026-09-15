@@ -106,6 +106,22 @@ def run_stage4(cfg, sample_id: str) -> Path:
     if match_threshold is None:
         match_threshold = cfg.stage3.match_threshold
 
+    # box_refine.adaptive_context_margin.relative_to_sample_median (used
+    # below by box_refine.apply_in_stage4): this sample's own typical box
+    # size across every keyframe detection Stage 3 kept, for the same
+    # "genuinely tiny vs. badly undersized this one time" comparison
+    # stage3.py computes for apply_in_stage3 -- see scale_context_margin's
+    # own docstring. Computed once here from Stage 3's own keyframe
+    # detections (not updated live as tracking finds new boxes) -- same
+    # source and method stage3.py uses for apply_in_stage3, just recomputed
+    # here since apply_in_stage3 may be off while apply_in_stage4 is on.
+    sample_reference_size = None
+    _all_boxes_for_ref = [d.box for dets in detections.values() for d in dets]
+    if _all_boxes_for_ref:
+        sample_reference_size = float(np.median([
+            ((b.x2 - b.x1) * (b.y2 - b.y1)) ** 0.5 for b in _all_boxes_for_ref
+        ]))
+
     # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
     video_files = list((data_root / sample_id).glob(cfg.data.video_glob))
@@ -818,6 +834,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     min_iou_with_original=br_cfg.min_iou_with_original,
                                     context_margin=br_cfg.context_margin,
                                     adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                                    sample_reference_size=sample_reference_size,
                                 )[0]
                             elif br_cfg.method == "sam2_dense":
                                 if geco2_refine_detector is not None:
@@ -832,6 +849,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     br_cfg.method, frame_bgr, box, br_cfg.context_margin,
                                     segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
                                     adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                                    sample_reference_size=sample_reference_size,
                                 )
                             if box != box_before_refine:
                                 br_changed += 1

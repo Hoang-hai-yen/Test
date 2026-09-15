@@ -960,8 +960,19 @@ box_refine:
   adaptive_context_margin:
     enabled: false
     min_size_px: 20.0   # box geometric-mean side (px) at/below which margin -> min_ratio
-    max_size_px: 100.0  # box geometric-mean side (px) at/above which margin -> full context_margin
+    max_size_px: 50.0  # box geometric-mean side (px) at/above which margin -> full context_margin
     min_ratio: 0.0       # fraction of context_margin used at/below min_size_px
+    # min/max_size_px above compare a box against a FIXED absolute pixel
+    # scale -- can't tell "genuinely tiny object" (shrink margin, correct)
+    # apart from "this box badly undersizes an object that's normally
+    # bigger in THIS SAME video" (shrink margin = exactly backwards, SAM
+    # needs MORE room to reach the true boundary). When enabled, compares
+    # each box instead against this sample's own median confident-detection
+    # size for the same video; a box under relative_undersize_ratio of that
+    # gets the FULL, unscaled context_margin instead of the shrink above --
+    # a sample whose typical size is itself small is unaffected.
+    relative_to_sample_median: false
+    relative_undersize_ratio: 0.5
   # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box falls
   # below this -- guards against the segmenter latching onto a sub-part,
   # a nearby confuser, or background clutter within the padded crop

@@ -320,6 +320,55 @@ def test_scale_context_margin_min_ratio_floor():
     assert scale_context_margin(tiny_box, 0.5, ac_cfg) == pytest.approx(0.1)  # 0.5 * 0.2
 
 
+def test_scale_context_margin_relative_undersized_box_gets_full_margin():
+    """A box that's tiny in ABSOLUTE terms (would normally get min_ratio)
+    but is anomalously small relative to this SAME sample's own reference
+    size (e.g. a motorbike video where this one box badly undersizes the
+    object) should get the FULL, unscaled margin instead -- it needs MORE
+    room for SAM to reach the true boundary, not less."""
+    ac_cfg = AdaptiveContextMarginConfig(
+        enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0,
+        relative_to_sample_median=True, relative_undersize_ratio=0.5,
+    )
+    undersized_box = Box(0, 0, 15, 12)  # side ~13.4px -- would get min_ratio=0.0 on its own
+    # Sample's own reference size is 150px -- this box is ~9% of that, well under 0.5.
+    assert scale_context_margin(undersized_box, 0.5, ac_cfg, sample_reference_size=150.0) == pytest.approx(0.5)
+
+
+def test_scale_context_margin_relative_check_leaves_genuinely_small_sample_alone():
+    """A sample whose OWN reference size is itself small (e.g. a helmet
+    video) must be unaffected by the relative check -- its boxes stay
+    close to their own reference size, so the ratio never trips, and the
+    normal absolute min_ratio shrink still applies."""
+    ac_cfg = AdaptiveContextMarginConfig(
+        enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0,
+        relative_to_sample_median=True, relative_undersize_ratio=0.5,
+    )
+    tiny_box = Box(0, 0, 15, 12)  # side ~13.4px
+    # Sample's own reference size is also ~14px -- ratio ~0.96, well above 0.5.
+    assert scale_context_margin(tiny_box, 0.5, ac_cfg, sample_reference_size=14.0) == pytest.approx(0.0)
+
+
+def test_scale_context_margin_relative_check_disabled_by_default():
+    """relative_to_sample_median defaults to False -- passing
+    sample_reference_size has no effect unless explicitly enabled."""
+    ac_cfg = AdaptiveContextMarginConfig(enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0)
+    undersized_box = Box(0, 0, 15, 12)
+    assert scale_context_margin(undersized_box, 0.5, ac_cfg, sample_reference_size=150.0) == pytest.approx(0.0)
+
+
+def test_scale_context_margin_relative_check_no_reference_falls_back_to_absolute():
+    """relative_to_sample_median=True but no sample_reference_size given
+    (e.g. no confident detections yet) -- falls back to the absolute
+    min/max_size_px curve instead of erroring."""
+    ac_cfg = AdaptiveContextMarginConfig(
+        enabled=True, min_size_px=20.0, max_size_px=100.0, min_ratio=0.0,
+        relative_to_sample_median=True,
+    )
+    undersized_box = Box(0, 0, 15, 12)
+    assert scale_context_margin(undersized_box, 0.5, ac_cfg, sample_reference_size=None) == pytest.approx(0.0)
+
+
 def test_refine_boxes_dense_uses_per_box_scaled_margin():
     """The margin passed to segment_box_cached must be computed PER BOX
     from its own size, not one shared value for the whole frame -- a tiny

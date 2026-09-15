@@ -30,7 +30,7 @@ from aero_eyes.utils.geometry import box_iou, mask_bbox
 log = logging.getLogger(__name__)
 
 
-def scale_context_margin(box: Box, base_margin: float, ac_cfg) -> float:
+def scale_context_margin(box: Box, base_margin: float, ac_cfg, sample_reference_size: float | None = None) -> float:
     """box_refine.adaptive_context_margin: scale `base_margin` down for a
     small box, up to the full `base_margin` for a large one -- see
     AdaptiveContextMarginConfig's own docstring for the full rationale
@@ -39,12 +39,34 @@ def scale_context_margin(box: Box, base_margin: float, ac_cfg) -> float:
 
     `ac_cfg` may be None or have enabled=False -- returns `base_margin`
     unchanged then (old behavior, no size dependence).
+
+    `sample_reference_size` (paired with ac_cfg.relative_to_sample_median):
+    the ABSOLUTE min_size_px/max_size_px thresholds below can't tell a
+    genuinely tiny object (small in every frame -- shrinking its margin is
+    correct, avoids sweeping in a confuser) apart from a normally
+    larger object that THIS box just badly undersizes (shrinking its
+    margin is exactly wrong -- SAM needs MORE room to reach the true
+    boundary, not less). When `sample_reference_size` (this sample's own
+    typical box size, e.g. the median across its other confident
+    detections) is given and this box's size falls far enough below it
+    (ratio < ac_cfg.relative_undersize_ratio), that's a same-object,
+    same-video comparison the absolute thresholds have no way to make --
+    skip the shrink and use `base_margin` unscaled instead, regardless of
+    where this box's ABSOLUTE size would otherwise land on the
+    min/max_size_px curve.
     """
     if ac_cfg is None or not ac_cfg.enabled:
         return base_margin
+    size = ((box.x2 - box.x1) * (box.y2 - box.y1)) ** 0.5
+    if (
+        ac_cfg.relative_to_sample_median
+        and sample_reference_size is not None
+        and sample_reference_size > 0
+        and size / sample_reference_size < ac_cfg.relative_undersize_ratio
+    ):
+        return base_margin
     if ac_cfg.max_size_px <= ac_cfg.min_size_px:
         return base_margin  # degenerate range -- no-op rather than divide by ~0
-    size = ((box.x2 - box.x1) * (box.y2 - box.y1)) ** 0.5
     t = (size - ac_cfg.min_size_px) / (ac_cfg.max_size_px - ac_cfg.min_size_px)
     t = max(0.0, min(1.0, t))
     ratio = ac_cfg.min_ratio + t * (1.0 - ac_cfg.min_ratio)
@@ -126,7 +148,7 @@ def refine_box_with_grabcut(frame_bgr, box: Box, context_margin: float = 0.2) ->
 def refine_box(
     method: str, frame_bgr, box: Box, context_margin: float,
     segmenter=None, min_iou_with_original: float = 0.0,
-    adaptive_context_margin_cfg=None,
+    adaptive_context_margin_cfg=None, sample_reference_size: float | None = None,
 ) -> Box:
     """Dispatch to refine_box_with_sam ('sam') or refine_box_with_grabcut
     ('grabcut') per box_refine.method, then a safety gate: if the refined
@@ -152,8 +174,10 @@ def refine_box(
     `adaptive_context_margin_cfg` (box_refine.adaptive_context_margin):
     when given and enabled, scales `context_margin` down for a small `box`
     before using it -- see scale_context_margin's own docstring.
+    `sample_reference_size`: forwarded to scale_context_margin's own
+    relative_to_sample_median check -- see there for what it does.
     """
-    context_margin = scale_context_margin(box, context_margin, adaptive_context_margin_cfg)
+    context_margin = scale_context_margin(box, context_margin, adaptive_context_margin_cfg, sample_reference_size)
     if method == "sam":
         refined = refine_box_with_sam(segmenter, frame_bgr, box, context_margin)
     elif method == "grabcut":
@@ -194,6 +218,7 @@ def apply_iou_gate(
 def refine_boxes_dense(
     segmenter, frame_bgr, boxes: list[Box], min_iou_with_original: float = 0.0,
     context_margin: float = 0.0, adaptive_context_margin_cfg=None,
+    sample_reference_size: float | None = None,
 ) -> list[Box]:
     """box_refine.method == "sam_dense": refine every box in `boxes` (all
     on the SAME frame) using ONE shared MobileSAM image encoding, instead
@@ -220,13 +245,15 @@ def refine_boxes_dense(
     when given and enabled, scales `context_margin` down PER-BOX by its
     own size before using it as that box's prompt margin -- see
     scale_context_margin's own docstring.
+    `sample_reference_size`: forwarded to scale_context_margin's own
+    relative_to_sample_median check -- see there for what it does.
     """
     if segmenter is None or not segmenter.set_frame(frame_bgr):
         return boxes
 
     refined_boxes: list[Box] = []
     for box in boxes:
-        box_margin = scale_context_margin(box, context_margin, adaptive_context_margin_cfg)
+        box_margin = scale_context_margin(box, context_margin, adaptive_context_margin_cfg, sample_reference_size)
         mask = segmenter.segment_box_cached(box, margin=box_margin)
         if mask is None:
             refined_boxes.append(box)

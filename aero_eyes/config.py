@@ -1340,10 +1340,35 @@ class AdaptiveContextMarginConfig(BaseModel):
 
     False (default) = disabled, context_margin is used as-is for every box
     regardless of size, unchanged from before this option existed.
+
+    relative_to_sample_median: min_size_px/max_size_px above compare a box
+    against a FIXED, absolute pixel scale -- they can't tell a genuinely
+    tiny object (small in every frame of its own video -- shrinking its
+    margin is correct) apart from a normally larger object that THIS one
+    box just badly undersizes (e.g. GeCo2 detected only ~40px of a
+    motorbike that measures ~150px everywhere else in the same video --
+    shrinking its margin here is exactly backwards: SAM needs MORE room to
+    reach the true boundary, not less). When enabled, the caller also
+    computes this SAMPLE's own reference size (its median confident-
+    detection size for the same video) and passes it down; if a box's own
+    size falls below reference_size * relative_undersize_ratio, the normal
+    min_size_px/max_size_px shrink is skipped for that box and the FULL,
+    unscaled context_margin is used instead -- regardless of where the
+    box's absolute size would otherwise land on that curve. Only affects a
+    box that's anomalously small RELATIVE TO ITS OWN SAMPLE; a sample whose
+    typical size is itself small (e.g. the helmet case above) is unaffected
+    since its boxes stay close to its own reference size.
+
+    False (default) = disabled -- only the absolute min/max_size_px curve
+    applies, unchanged from before this option existed.
     """
     enabled: bool = False
     min_size_px: float = 20.0   # box geometric-mean side (px) at/below which margin -> min_ratio
     max_size_px: float = 100.0  # box geometric-mean side (px) at/above which margin -> full context_margin
+    relative_to_sample_median: bool = False
+    # Below this fraction of the sample's own reference size, a box is
+    # treated as anomalously undersized rather than genuinely small.
+    relative_undersize_ratio: float = 0.5
     min_ratio: float = 0.0      # fraction of context_margin used at/below min_size_px (0.0 = no margin at all)
 
 

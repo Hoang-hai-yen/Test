@@ -402,6 +402,20 @@ def run_stage3(cfg, sample_id: str) -> Path:
     for fi, det, sim in selected:
         frame_groups[fi].append((det, sim))
 
+    # box_refine.adaptive_context_margin.relative_to_sample_median: this
+    # SAME object's own typical box size across every OTHER threshold-
+    # passing detection in this video -- the reference a box needs to be
+    # compared against to tell "genuinely tiny" apart from "badly
+    # undersized this one time" (see scale_context_margin's own docstring).
+    # Computed once here (before any refinement) so every keyframe's refine
+    # call below can be judged against the SAME, unrefined baseline.
+    sample_reference_size = None
+    if selected:
+        sample_reference_size = float(np.median([
+            ((det.box.x2 - det.box.x1) * (det.box.y2 - det.box.y1)) ** 0.5
+            for _, det, _ in selected
+        ]))
+
     pre_refine_detections: dict[int, list[Detection]] = {}
 
     for frame_idx, det_sim_pairs in frame_groups.items():
@@ -455,6 +469,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                     min_iou_with_original=br_cfg.min_iou_with_original,
                     context_margin=br_cfg.context_margin,
                     adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                    sample_reference_size=sample_reference_size,
                 )
                 result_dets = [
                     Detection(frame_idx=d.frame_idx, box=rb, similarity=d.similarity, source=d.source)
@@ -486,6 +501,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                             br_cfg.method, frame_bgr, d.box, br_cfg.context_margin,
                             segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
                             adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                            sample_reference_size=sample_reference_size,
                         ),
                         similarity=d.similarity, source=d.source,
                     )
