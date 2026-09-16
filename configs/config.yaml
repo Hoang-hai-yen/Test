@@ -381,6 +381,18 @@ stage123_geco2:
   score_threshold_abs: 0.0
   nms_iou: 0.5
   topk_per_keyframe: 5
+  # GeCo2's box regression has no built-in guard against a degenerate,
+  # near-zero-area box -- nothing else here rejects one, and a sliver crop
+  # later chokes feature extractors (ambiguous channel dimension warnings).
+  # This is an AREA floor, not a min-side-length one: surveyed this
+  # project's own GT (14233 boxes, 10 videos) and a real object's thinnest
+  # side can legitimately be ~2px at the frame edge (entering/leaving
+  # frame), but no real GT box has area <= 16 -- so filtering by area
+  # catches degenerate boxes without rejecting real thin-but-long ones.
+  # min_box_area's default (24) matches the smallest real box observed --
+  # validate against your own GT before changing it, don't guess.
+  min_box_area_enabled: false
+  min_box_area: 24
   prototype_cache_name: geco2_prototype.pt   # cached exemplar tokens (torch, not prototype.npz)
 
   # --------------------------------------------------------------------
@@ -1001,6 +1013,20 @@ box_refine:
     # a sample whose typical size is itself small is unaffected.
     relative_to_sample_median: false
     relative_undersize_ratio: 0.5
+  # Only affects method=sam/sam_dense (MobileSAM). Also passes the ORIGINAL
+  # (pre-margin) box's own center to SAM as a positive point prompt,
+  # alongside the (possibly margin-expanded) box prompt -- a bigger
+  # context_margin gives SAM room to reach an undersized box's true
+  # boundary, but also more background/confuser area it could latch onto
+  # instead; the center point pins down which blob in that region is the
+  # target, without needing to shrink the margin. Off by default: this
+  # project's own reference-image segmentation (stage1.segmentation's
+  # use_point_prompt) found a center point unreliable for ring/donut-shaped
+  # objects (hollow center = background) -- only enable if none of your
+  # tracked classes are shaped like that. Not yet benchmarked on this
+  # project's own dataset -- compare with scripts/check_box_refine_effect.py
+  # before trusting it.
+  use_center_point_prompt: false
   # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box falls
   # below this -- guards against the segmenter latching onto a sub-part,
   # a nearby confuser, or background clutter within the padded crop

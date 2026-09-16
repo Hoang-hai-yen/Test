@@ -102,6 +102,8 @@ class GeCo2Detector:
         self.score_threshold_abs = g.score_threshold_abs
         self.nms_iou = g.nms_iou
         self.topk_per_keyframe = g.topk_per_keyframe
+        self.min_box_area_enabled = g.min_box_area_enabled
+        self.min_box_area = g.min_box_area
         self.use_shape_token = g.use_shape_token
         self.emb_dim = g.emb_dim
         self.reduction = g.reduction
@@ -372,8 +374,18 @@ class GeCo2Detector:
         results: list[Box] = []
         for (x1, y1, x2, y2), s in zip(px_boxes, scores):
             box = Box(float(x1), float(y1), float(x2), float(y2), score=float(s)).clip(w_frame, h_frame)
-            if box.area() > 0:
-                results.append(box)
+            if box.area() <= 0:
+                continue
+            # stage123_geco2.min_box_area_enabled: reject a degenerate,
+            # near-zero-area box the regression head produced (nothing else
+            # here guards against one) -- see that field's own docstring for
+            # why this is an AREA floor, not a min-side-length one (a real
+            # object's thinnest side can legitimately be a couple pixels at
+            # the frame edge; area does not shrink that far for any real box
+            # in this project's own GT).
+            if self.min_box_area_enabled and box.area() < self.min_box_area:
+                continue
+            results.append(box)
         return results
 
     @torch.no_grad()

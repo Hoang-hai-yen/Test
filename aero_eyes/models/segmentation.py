@@ -188,7 +188,9 @@ class MobileSAMSegmenter:
             log.warning("MobileSAM set_frame failed (%s).", e)
             return False
 
-    def segment_box_cached(self, box: Box, margin: float = 0.0) -> np.ndarray | None:
+    def segment_box_cached(
+        self, box: Box, margin: float = 0.0, use_center_point: bool = False,
+    ) -> np.ndarray | None:
         """Refine `box` using the image embedding set_frame() already
         cached for the CURRENT frame -- must be called after set_frame()
         for that frame. `box` is in that frame's own pixel coordinates
@@ -209,6 +211,18 @@ class MobileSAMSegmenter:
         margin costs nothing extra here (the whole frame is already
         encoded by set_frame(), unlike segment_box()'s per-call crop).
 
+        `use_center_point` (box_refine.use_center_point_prompt): also pass
+        the ORIGINAL (pre-margin) box's center as a positive point prompt
+        alongside the expanded box. A bigger margin gives SAM room to reach
+        the true boundary but also more background/confuser area it could
+        latch onto instead -- the center point pins down which blob in that
+        wider region is actually the target, without shrinking the margin
+        itself. Off by default: this project's OWN reference-image
+        segmentation (segment()'s use_point_prompt) found a center point
+        unreliable for ring/donut-shaped objects (a hollow center is
+        background, not foreground) -- only enable this if none of your
+        tracked object classes are shaped like that.
+
         Unlike segment_box() (which applies area/border-touch plausibility
         gates calibrated for a small CROP), this trusts SAM's own
         predicted-IoU score directly and relies on the caller's
@@ -227,14 +241,28 @@ class MobileSAMSegmenter:
             bw, bh = box.x2 - box.x1, box.y2 - box.y1
             mx, my = bw * margin, bh * margin
             box_arr = np.array([box.x1 - mx, box.y1 - my, box.x2 + mx, box.y2 + my])
+            if use_center_point:
+                point_coords = np.array([[(box.x1 + box.x2) / 2.0, (box.y1 + box.y2) / 2.0]])
+                point_labels = np.array([1])
+            else:
+                point_coords = None
+                point_labels = None
             masks, scores, _ = self._predictor.predict(
-                point_coords=None,
-                point_labels=None,
+                point_coords=point_coords,
+                point_labels=point_labels,
                 box=box_arr,
                 multimask_output=True,
             )
             best_idx = int(scores.argmax())
             mask = masks[best_idx]
+            if use_center_point:
+                # A full-frame mask is far more likely than a small crop to
+                # contain an unrelated same-colored blob elsewhere in the
+                # scene -- isolate to the component the point actually
+                # anchors, same reasoning as segment()'s own point-prompt
+                # path (see _isolate_component_at_point's docstring).
+                px, py = point_coords[0]
+                mask = self._isolate_component_at_point(mask, int(px), int(py))
             if not mask.any():
                 return None
             return mask
@@ -244,6 +272,7 @@ class MobileSAMSegmenter:
 
     def segment_box(
         self, image_bgr: np.ndarray, box: Box, context_margin: float = 0.2,
+        use_center_point: bool = False,
     ) -> tuple[np.ndarray | None, tuple[int, int] | None]:
         """Refine an approximate `box` (from a detector or tracker) to a
         tight mask, via SAM prompted with the box itself -- used to sharpen
@@ -256,10 +285,12 @@ class MobileSAMSegmenter:
         first -- SAM's own image encoder then only runs on that small crop,
         not the full video frame, so refining many boxes stays cheap. The
         box is already a real (if imprecise) localization, so it's used
-        directly as the prompt -- no oracle guess needed, and no point
-        prompt (a box alone is a reliable enough anchor here, and avoids
-        the same center-pixel pitfall documented in __init__ for
-        ring/donut-shaped objects).
+        directly as the prompt; `use_center_point` (box_refine.
+        use_center_point_prompt, default off) additionally passes `box`'s
+        own center as a positive point -- see segment_box_cached's own
+        docstring for the full rationale/caveat (avoid enabling this for
+        ring/donut-shaped object classes, same pitfall documented in
+        __init__).
 
         Returns (mask, crop_offset) where mask is HxW bool over the
         CROPPED region and crop_offset=(x1,y1) locates that crop within
@@ -292,16 +323,29 @@ class MobileSAMSegmenter:
             box_local = np.array([
                 box.x1 - cx1, box.y1 - cy1, box.x2 - cx1, box.y2 - cy1,
             ])
+            center_local = ((box_local[0] + box_local[2]) / 2.0, (box_local[1] + box_local[3]) / 2.0)
+            if use_center_point:
+                point_coords = np.array([center_local])
+                point_labels = np.array([1])
+            else:
+                point_coords = None
+                point_labels = None
             masks, scores, _ = self._predictor.predict(
-                point_coords=None,
-                point_labels=None,
+                point_coords=point_coords,
+                point_labels=point_labels,
                 box=box_local,
                 multimask_output=True,
             )
-            # No known-foreground point to anchor on (box-only prompt) --
-            # keep each candidate's largest connected component, same as
-            # segment()'s use_point_prompt=False path.
-            cleaned = [self._isolate_largest_component(m) for m in masks]
+            if use_center_point:
+                cleaned = [
+                    self._isolate_component_at_point(m, int(center_local[0]), int(center_local[1]))
+                    for m in masks
+                ]
+            else:
+                # No known-foreground point to anchor on (box-only prompt) --
+                # keep each candidate's largest connected component, same as
+                # segment()'s use_point_prompt=False path.
+                cleaned = [self._isolate_largest_component(m) for m in masks]
             areas = [float(m.mean()) for m in cleaned]
             border_touch = [self._border_touch_frac(m) for m in cleaned]
             plausible = [

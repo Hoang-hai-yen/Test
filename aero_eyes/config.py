@@ -1293,6 +1293,24 @@ class Stage123Geco2Config(BaseModel):
     score_threshold_abs: float = 0.0
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
+    # GeCo2's box regression head has no guarantee against a degenerate,
+    # near-zero-area box (e.g. one edge collapsing to a couple pixels) --
+    # unlike the legacy pipeline's stage2.candidate.min_box_area, nothing
+    # here rejects one, and a tiny/sliver crop later chokes feature
+    # extractors (transformers' image processor logs "channel dimension is
+    # ambiguous" for a near-square tiny shape and has to guess). Surveyed
+    # this project's own GT (annotations_converted.json, 14233 boxes across
+    # 10 videos): smallest real box area is 24px^2, while a real box's
+    # THINNEST SIDE can legitimately be as low as 2px (an object clipped at
+    # the frame edge, entering/leaving frame) -- so filtering by min side
+    # length would reject real objects; filtering by min AREA does not
+    # (confirmed 0 real GT boxes at or below area 16). min_box_area's
+    # default (24) matches that smallest observed real box exactly -- tune
+    # down if your own dataset has smaller real objects, but validate
+    # against your own GT first (see scripts/check_box_size_bias.py-style
+    # analysis) rather than guessing.
+    min_box_area_enabled: bool = False
+    min_box_area: int = 24
     prototype_cache_name: str = "geco2_prototype.pt"
     # Shrink each reference image before encoding it as an exemplar, to
     # narrow the ground-to-aerial domain gap (close-up ref photos are
@@ -1528,6 +1546,23 @@ class BoxRefineConfig(BaseModel):
     # has its own prompting, not routed through this field).
     context_margin: float = 0.2
     adaptive_context_margin: AdaptiveContextMarginConfig = AdaptiveContextMarginConfig()
+    # Only affects method="sam"/"sam_dense" (MobileSAM). Also passes the
+    # ORIGINAL (pre-margin) box's own center to SAM as a positive point
+    # prompt, alongside the (possibly margin-expanded) box prompt -- a
+    # bigger context_margin gives SAM room to reach the true boundary of an
+    # undersized box, but also more background/confuser area it could
+    # latch onto instead; the center point pins down WHICH blob in that
+    # wider region is the target, without needing to shrink the margin.
+    # Off by default: this project's OWN reference-image segmentation
+    # (stage1.segmentation's use_point_prompt) found a center point
+    # unreliable for ring/donut-shaped objects (hollow center = background,
+    # not foreground, biasing SAM toward leaked/confused masks) -- only
+    # enable this if none of your tracked object classes are shaped like
+    # that. Not yet benchmarked on this project's own dataset -- compare
+    # with scripts/check_box_refine_effect.py before trusting it, same as
+    # every other box_refine.method choice (see this class's own IMPORTANT
+    # note above).
+    use_center_point_prompt: bool = False
     apply_in_stage3: bool = True
     apply_in_stage4: bool = False
     # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box

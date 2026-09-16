@@ -73,13 +73,20 @@ def scale_context_margin(box: Box, base_margin: float, ac_cfg, sample_reference_
     return base_margin * ratio
 
 
-def refine_box_with_sam(segmenter, frame_bgr, box: Box, context_margin: float = 0.2) -> Box:
+def refine_box_with_sam(
+    segmenter, frame_bgr, box: Box, context_margin: float = 0.2, use_center_point: bool = False,
+) -> Box:
     """Refine `box` via a MobileSAMSegmenter (see
     MobileSAMSegmenter.segment_box). `segmenter` may be None (e.g. weights
-    unavailable) -- returns `box` unchanged in that case."""
+    unavailable) -- returns `box` unchanged in that case.
+
+    `use_center_point` (box_refine.use_center_point_prompt): see
+    segment_box's own docstring -- off by default, avoid enabling for
+    ring/donut-shaped object classes.
+    """
     if segmenter is None:
         return box
-    mask, offset = segmenter.segment_box(frame_bgr, box, context_margin)
+    mask, offset = segmenter.segment_box(frame_bgr, box, context_margin, use_center_point=use_center_point)
     if mask is None or offset is None:
         return box
     tight = mask_bbox(mask)
@@ -149,6 +156,7 @@ def refine_box(
     method: str, frame_bgr, box: Box, context_margin: float,
     segmenter=None, min_iou_with_original: float = 0.0,
     adaptive_context_margin_cfg=None, sample_reference_size: float | None = None,
+    use_center_point: bool = False,
 ) -> Box:
     """Dispatch to refine_box_with_sam ('sam') or refine_box_with_grabcut
     ('grabcut') per box_refine.method, then a safety gate: if the refined
@@ -176,10 +184,12 @@ def refine_box(
     before using it -- see scale_context_margin's own docstring.
     `sample_reference_size`: forwarded to scale_context_margin's own
     relative_to_sample_median check -- see there for what it does.
+    `use_center_point` (box_refine.use_center_point_prompt): forwarded to
+    refine_box_with_sam ('sam' only -- grabcut has no point-prompt concept).
     """
     context_margin = scale_context_margin(box, context_margin, adaptive_context_margin_cfg, sample_reference_size)
     if method == "sam":
-        refined = refine_box_with_sam(segmenter, frame_bgr, box, context_margin)
+        refined = refine_box_with_sam(segmenter, frame_bgr, box, context_margin, use_center_point=use_center_point)
     elif method == "grabcut":
         refined = refine_box_with_grabcut(frame_bgr, box, context_margin)
     else:
@@ -218,7 +228,7 @@ def apply_iou_gate(
 def refine_boxes_dense(
     segmenter, frame_bgr, boxes: list[Box], min_iou_with_original: float = 0.0,
     context_margin: float = 0.0, adaptive_context_margin_cfg=None,
-    sample_reference_size: float | None = None,
+    sample_reference_size: float | None = None, use_center_point: bool = False,
 ) -> list[Box]:
     """box_refine.method == "sam_dense": refine every box in `boxes` (all
     on the SAME frame) using ONE shared MobileSAM image encoding, instead
@@ -247,6 +257,9 @@ def refine_boxes_dense(
     scale_context_margin's own docstring.
     `sample_reference_size`: forwarded to scale_context_margin's own
     relative_to_sample_median check -- see there for what it does.
+    `use_center_point` (box_refine.use_center_point_prompt): forwarded to
+    segment_box_cached -- see its own docstring for the full rationale/
+    caveat (avoid enabling for ring/donut-shaped object classes).
     """
     if segmenter is None or not segmenter.set_frame(frame_bgr):
         return boxes
@@ -254,7 +267,7 @@ def refine_boxes_dense(
     refined_boxes: list[Box] = []
     for box in boxes:
         box_margin = scale_context_margin(box, context_margin, adaptive_context_margin_cfg, sample_reference_size)
-        mask = segmenter.segment_box_cached(box, margin=box_margin)
+        mask = segmenter.segment_box_cached(box, margin=box_margin, use_center_point=use_center_point)
         if mask is None:
             refined_boxes.append(box)
             continue

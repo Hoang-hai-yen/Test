@@ -509,6 +509,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                     context_margin=br_cfg.context_margin,
                     adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
                     sample_reference_size=sample_reference_size,
+                    use_center_point=br_cfg.use_center_point_prompt,
                 )
                 result_dets = [
                     Detection(frame_idx=d.frame_idx, box=rb, similarity=d.similarity, source=d.source)
@@ -541,6 +542,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                             segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
                             adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
                             sample_reference_size=sample_reference_size,
+                            use_center_point=br_cfg.use_center_point_prompt,
                         ),
                         similarity=d.similarity, source=d.source,
                     )

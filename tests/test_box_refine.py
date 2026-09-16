@@ -79,7 +79,7 @@ def test_refine_box_with_sam_uses_segmenter_mask_and_offset():
     mask[5:15, 5:15] = True
 
     class _FakeSegmenter:
-        def segment_box(self, frame_bgr, box, context_margin):
+        def segment_box(self, frame_bgr, box, context_margin, use_center_point=False):
             return mask, (30, 30)
 
     refined = refine_box_with_sam(_FakeSegmenter(), frame, box, context_margin=0.2)
@@ -102,7 +102,7 @@ def test_refine_box_with_sam_falls_back_when_mask_is_none():
     box = Box(35, 35, 85, 85, score=0.6)
 
     class _FailingSegmenter:
-        def segment_box(self, frame_bgr, box, context_margin):
+        def segment_box(self, frame_bgr, box, context_margin, use_center_point=False):
             return None, None
 
     refined = refine_box_with_sam(_FailingSegmenter(), frame, box, context_margin=0.2)
@@ -116,7 +116,7 @@ def test_refine_box_dispatcher_routes_by_method():
     class _FakeSegmenter:
         called = False
 
-        def segment_box(self, frame_bgr, box, context_margin):
+        def segment_box(self, frame_bgr, box, context_margin, use_center_point=False):
             _FakeSegmenter.called = True
             return None, None  # falls back to unchanged; just checking routing
 
@@ -146,7 +146,7 @@ def test_refine_box_min_iou_gate_rejects_wildly_different_region():
     class _WildSegmenter:
         """Always returns a mask far away from the original box -- e.g. a
         confuser or background clutter elsewhere in the padded crop."""
-        def segment_box(self, frame_bgr, box, context_margin):
+        def segment_box(self, frame_bgr, box, context_margin, use_center_point=False):
             mask = np.zeros((100, 100), dtype=bool)
             mask[0:5, 0:5] = True  # tiny region nowhere near the original box
             return mask, (0, 0)
@@ -173,7 +173,7 @@ def test_refine_box_min_iou_gate_accepts_a_genuine_tightening():
     original = Box(20, 20, 100, 100, score=0.6)
 
     class _TighteningSegmenter:
-        def segment_box(self, frame_bgr, box, context_margin):
+        def segment_box(self, frame_bgr, box, context_margin, use_center_point=False):
             # Mask covers (40,40)-(80,80) within a crop offset at (0, 0) --
             # a real tightening toward the frame's own true square, IoU
             # with `original` is (40*40)/(80*80) = 0.25... let's make it
@@ -204,7 +204,7 @@ class _DenseSegmenter:
         self.set_frame_calls += 1
         return self._set_frame_ok
 
-    def segment_box_cached(self, box, margin=0.0):
+    def segment_box_cached(self, box, margin=0.0, use_center_point=False):
         return self.mask
 
 
@@ -383,7 +383,7 @@ def test_refine_boxes_dense_uses_per_box_scaled_margin():
         def set_frame(self, frame_bgr):
             return True
 
-        def segment_box_cached(self, box, margin=0.0):
+        def segment_box_cached(self, box, margin=0.0, use_center_point=False):
             seen_margins.append(margin)
             return None  # falls back to the original box -- only margin tracking matters here
 
