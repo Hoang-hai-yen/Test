@@ -458,18 +458,40 @@ class GeCo2Detector:
         frame_bgr: np.ndarray,
         prototype: dict[str, torch.Tensor],
         boxes: list[Box],
+        context_margin: float = 0.0,
+        adaptive_context_margin_cfg=None,
+        sample_reference_size: float | None = None,
+        use_center_point: bool = False,
+        select_best_mask: bool = False,
     ) -> list[Box]:
         """box_refine.method == "sam2_dense": refine `boxes` (already-chosen
         boxes on this frame, e.g. Stage 3's cosine-matched detections or a
         Stage 4 tracked box) via GECO2's OWN SAM2-based mask_decoder
         (GECO2/models/sam_mask.py::MaskProcessor, the same submodule
         CNT.forward calls as `self.sam_mask(feats, outputs)` when its own
-        `validate=True` -- see GECO2/models/counter_infer.py) -- prompts it
-        with each box (as SAM2's box-as-2-corner-points convention) against
-        this frame's own dense Hiera features, always takes GECO2's own
-        mask index [2] (matching CNT.forward's own choice, not our
-        highest-score selection used elsewhere), and returns the tight
-        bbox of the resulting mask.
+        `validate=True` -- see GECO2/models/counter_infer.py).
+
+        Legacy path (context_margin==0, use_center_point=False,
+        select_best_mask=False -- the defaults, and the only behavior this
+        method had before these parameters existed): calls
+        MaskProcessor.forward() as-is, unchanged. That vendored code always
+        prompts with the box exactly as given (SAM2's box-as-2-corner-points
+        convention, no margin/point) and always takes GECO2's own hard-coded
+        mask index [2] (`masks[:, 2]` / `iou_predictions_[:, 2]` in
+        GECO2/models/sam_mask.py -- matching CNT.forward's own choice for
+        ITS training task, not necessarily the best choice for refining an
+        arbitrary tracked box on this project's own footage).
+
+        New path (any of the new parameters actually requested): reimplements
+        that same encode/decode flow from OUTSIDE GECO2/ -- calling
+        MaskProcessor's own public submodules (forward_feats,
+        prompt_encoder_sam, mask_decoder) directly instead of its forward()
+        wrapper -- so this project's OWN box_refine knobs (context_margin/
+        adaptive_context_margin, use_center_point_prompt) work here the same
+        way they already do for box_refine.method="sam_dense"
+        (MobileSAMSegmenter.segment_box_cached), WITHOUT modifying a single
+        line inside GECO2/. See _sam2_refine_boxes_custom's own docstring
+        for exactly how.
 
         Unlike the MobileSAM-based "sam"/"sam_dense" box_refine methods,
         this needs a FRESH GeCo2 backbone forward pass on `frame_bgr`
@@ -492,6 +514,17 @@ class GeCo2Detector:
 
         _, _, scale, feats = self._forward_scores(frame_bgr, prototype)
 
+        if context_margin == 0.0 and adaptive_context_margin_cfg is None and not use_center_point and not select_best_mask:
+            return self._sam2_refine_boxes_legacy(frame_bgr, boxes, scale, feats, mask_processor)
+        return self._sam2_refine_boxes_custom(
+            frame_bgr, boxes, scale, feats, mask_processor,
+            context_margin, adaptive_context_margin_cfg, sample_reference_size,
+            use_center_point, select_best_mask,
+        )
+
+    def _sam2_refine_boxes_legacy(self, frame_bgr, boxes, scale, feats, mask_processor) -> list[Box]:
+        """Original box_refine.method=sam2_dense behavior, unchanged --
+        see sam2_refine_boxes's own docstring."""
         norm_boxes = []
         for b in boxes:
             norm_boxes.append([
@@ -518,6 +551,131 @@ class GeCo2Detector:
                 continue
             x1, y1, x2, y2 = (cb / scale).tolist()
             refined = Box(x1, y1, x2, y2, score=b.score).clip(w_frame, h_frame)
+            results.append(refined if refined.area() > 0 else b)
+        return results
+
+    def _sam2_refine_boxes_custom(
+        self, frame_bgr, boxes, scale, feats, mask_processor,
+        context_margin, adaptive_context_margin_cfg, sample_reference_size,
+        use_center_point, select_best_mask,
+    ) -> list[Box]:
+        """Reimplements GECO2/models/sam_mask.py::MaskProcessor.forward()'s
+        encode/decode flow using only its PUBLIC submodules (forward_feats,
+        prompt_encoder_sam, mask_decoder -- standard, un-customized SAM2
+        components, not GECO2-specific logic) called directly from here,
+        instead of going through forward() itself -- so nothing in GECO2/
+        is read differently or modified.
+
+        Differs from the legacy path in 3 independent, each-optional ways
+        (mirrors box_refine.use_center_point_prompt/context_margin/
+        adaptive_context_margin for "sam_dense" -- see
+        MobileSAMSegmenter.segment_box_cached's own docstring for the same
+        rationale applied there):
+          1. context_margin/adaptive_context_margin_cfg: the box PROMPT
+             itself is expanded before encoding (legacy always prompts with
+             the box exactly as given -- no margin concept existed here).
+          2. use_center_point: the ORIGINAL (pre-margin) box's own center is
+             ALSO passed as a positive point (SAM2 label 1) alongside the
+             box's 2 corner points (labels 2/3) in the SAME prompt call --
+             SAM2's prompt encoder natively supports mixing box-corner
+             points with extra foreground points, so this needs no change
+             to how PromptEncoder itself is called, just what's fed to it.
+             The resulting mask is then isolated to the connected component
+             containing that point (aero_eyes.utils.geometry.
+             isolate_component_at_point -- same helper MobileSAMSegmenter
+             uses), discarding an unrelated blob elsewhere in the frame.
+          3. select_best_mask: mask_decoder(multimask_output=True) always
+             produces 4 mask channels (index 0 = single-mask-mode token,
+             1-3 = three multimask ambiguity-resolving hypotheses) with
+             their own predicted-IoU scores (iou_predictions) -- legacy
+             hard-codes index 2 regardless of those scores (a choice tuned
+             for GECO2's OWN counting task, not ours). True picks
+             argmax(iou_predictions[1:4]) + 1 per box instead, the same
+             "trust the model's own confidence" principle
+             segment_box_cached's `best_idx = scores.argmax()` already uses
+             for MobileSAM.
+        """
+        import torch.nn.functional as F
+        from aero_eyes.utils.box_refine import scale_context_margin
+        from aero_eyes.utils.geometry import isolate_component_at_point, mask_bbox
+
+        processed_feats = mask_processor.forward_feats(feats)
+
+        box_corners = []   # canvas-PIXEL [x1,y1,x2,y2], margin-expanded
+        centers = []       # canvas-PIXEL [cx,cy], from the ORIGINAL (pre-margin) box
+        for b in boxes:
+            margin = scale_context_margin(b, context_margin, adaptive_context_margin_cfg, sample_reference_size)
+            bw, bh = b.x2 - b.x1, b.y2 - b.y1
+            mx, my = bw * margin, bh * margin
+            # frame-px -> canvas-PIXEL is just `* scale` (the legacy path's
+            # `* scale / image_size` normalizes, then sam_mask.py's own
+            # forward() immediately multiplies back by image_size -- the
+            # two cancel out; margin is applied here, in frame-px, first).
+            x1 = (b.x1 - mx) * scale
+            y1 = (b.y1 - my) * scale
+            x2 = (b.x2 + mx) * scale
+            y2 = (b.y2 + my) * scale
+            box_corners.append([x1, y1, x2, y2])
+            centers.append([
+                (b.x1 + b.x2) / 2.0 * scale, (b.y1 + b.y2) / 2.0 * scale,
+            ])
+
+        box_t = torch.tensor(box_corners, dtype=torch.float32, device=self.device)
+        box_t = box_t.clamp(0.0, float(self.image_size))
+        box_coords = box_t.reshape(-1, 2, 2)
+        box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=self.device).repeat(box_t.size(0), 1)
+
+        if use_center_point:
+            center_t = torch.tensor(centers, dtype=torch.float32, device=self.device)
+            center_t = center_t.clamp(0.0, float(self.image_size)).unsqueeze(1)  # [N,1,2]
+            point_coords = torch.cat([box_coords, center_t], dim=1)  # [N,3,2]
+            point_labels = torch.cat(
+                [box_labels, torch.ones((box_t.size(0), 1), dtype=torch.int, device=self.device)], dim=1,
+            )
+        else:
+            point_coords, point_labels = box_coords, box_labels
+
+        try:
+            sparse_embeddings, dense_embeddings = mask_processor.prompt_encoder_sam(
+                points=(point_coords, point_labels), boxes=None, masks=None,
+            )
+            low_res_masks, iou_predictions, _, _ = mask_processor.mask_decoder(
+                image_embeddings=processed_feats[-1],
+                image_pe=mask_processor.prompt_encoder_sam.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=True,
+                repeat_image=True,
+                high_res_features=processed_feats[:-1],
+            )
+            masks = F.interpolate(
+                low_res_masks, (int(self.image_size), int(self.image_size)),
+                mode="bilinear", align_corners=False,
+            ) > 0  # [N, 4, image_size, image_size]
+        except Exception:
+            log.warning(
+                "box_refine.method=sam2_dense (custom path): mask_decoder "
+                "forward pass failed -- boxes left unchanged this frame.", exc_info=True,
+            )
+            return boxes
+
+        h_frame, w_frame = frame_bgr.shape[:2]
+        results: list[Box] = []
+        for i, b in enumerate(boxes):
+            if select_best_mask:
+                mask_idx = 1 + int(torch.argmax(iou_predictions[i, 1:4]).item())
+            else:
+                mask_idx = 2
+            mask_np = masks[i, mask_idx].cpu().numpy()
+            if use_center_point:
+                cx, cy = centers[i]
+                mask_np = isolate_component_at_point(mask_np, int(cx), int(cy))
+            tight = mask_bbox(mask_np)
+            if tight is None:
+                results.append(b)
+                continue
+            x1, y1, x2, y2 = tight
+            refined = Box(x1 / scale, y1 / scale, x2 / scale, y2 / scale, score=b.score).clip(w_frame, h_frame)
             results.append(refined if refined.area() > 0 else b)
         return results
 

@@ -842,6 +842,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                     from aero_eyes.utils.box_refine import apply_iou_gate
                                     refined = geco2_refine_detector.sam2_refine_boxes(
                                         frame_bgr, geco2_refine_prototype, [box],
+                                        context_margin=br_cfg.context_margin,
+                                        adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                                        sample_reference_size=sample_reference_size,
+                                        use_center_point=br_cfg.use_center_point_prompt,
+                                        select_best_mask=br_cfg.sam2_dense_select_best_mask,
                                     )[0]
                                     box = apply_iou_gate([refined], [box], br_cfg.min_iou_with_original)[0]
                             else:

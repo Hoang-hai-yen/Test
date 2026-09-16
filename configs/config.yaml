@@ -982,7 +982,9 @@ box_refine:
   # "sam_dense": padding added to the box PROMPT itself before querying SAM
   #   -- without this, an undersized detector box rarely gets expanded back
   #   out even with min_iou_with_original=0.0 (SAM's decoder stays close to
-  #   whatever box it's given). Ignored by "sam2_dense".
+  #   whatever box it's given). Also honored by "sam2_dense" via
+  #   GeCo2Detector.sam2_refine_boxes's own wrapper (see its docstring) --
+  #   0.0 (default) keeps that method's original, unexpanded box prompting.
   context_margin: 0.2
   # context_margin above is ONE flat value for every box -- but a large,
   # well-defined object (e.g. a motorbike) benefits from a generous margin,
@@ -1013,7 +1015,9 @@ box_refine:
     # a sample whose typical size is itself small is unaffected.
     relative_to_sample_median: false
     relative_undersize_ratio: 0.5
-  # Only affects method=sam/sam_dense (MobileSAM). Also passes the ORIGINAL
+  # Affects method=sam/sam_dense (MobileSAM) AND sam2_dense (via
+  # GeCo2Detector.sam2_refine_boxes's own wrapper -- see its docstring;
+  # nothing inside GECO2/ itself is touched). Also passes the ORIGINAL
   # (pre-margin) box's own center to SAM as a positive point prompt,
   # alongside the (possibly margin-expanded) box prompt -- a bigger
   # context_margin gives SAM room to reach an undersized box's true
@@ -1027,6 +1031,17 @@ box_refine:
   # project's own dataset -- compare with scripts/check_box_refine_effect.py
   # before trusting it.
   use_center_point_prompt: false
+  # method=sam2_dense ONLY. GECO2's own MaskProcessor always takes a
+  # HARD-CODED mask candidate (index 2 of the 4 SAM2 mask_decoder produces)
+  # regardless of its own predicted-IoU score -- tuned for GECO2's own
+  # counting-task validation, not necessarily best for refining an
+  # arbitrary tracked box here. When true, picks whichever of the 3
+  # multimask candidates SAM2 itself scored highest per box instead -- same
+  # "trust the model's own confidence" principle sam_dense's own
+  # scores.argmax() already uses. false (default) = GECO2's original
+  # index-2 choice, unchanged. Not yet benchmarked -- compare with
+  # scripts/check_box_refine_effect.py before trusting it.
+  sam2_dense_select_best_mask: false
   # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box falls
   # below this -- guards against the segmenter latching onto a sub-part,
   # a nearby confuser, or background clutter within the padded crop

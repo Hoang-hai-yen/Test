@@ -99,25 +99,11 @@ class MobileSAMSegmenter:
 
     @staticmethod
     def _isolate_component_at_point(mask: np.ndarray, px: int, py: int) -> np.ndarray:
-        """Keep only the connected component touching (px, py) (the point
-        prompt) -- discards any disconnected blob SAM tacked on elsewhere in
-        the frame (e.g. a same-colored patch of background), even if that
-        blob is large enough to pass the area/score gates below. Falls back
-        to the largest component if the point itself isn't foreground in
-        this particular mask.
-        """
-        mask_u8 = mask.astype(np.uint8)
-        num_labels, labels = cv2.connectedComponents(mask_u8, connectivity=8)
-        if num_labels <= 2:  # 0=background + at most 1 foreground component
-            return mask
-        py = min(max(py, 0), mask.shape[0] - 1)
-        px = min(max(px, 0), mask.shape[1] - 1)
-        label_at_point = labels[py, px]
-        if label_at_point == 0:
-            counts = np.bincount(labels.ravel())
-            counts[0] = 0
-            label_at_point = int(np.argmax(counts))
-        return labels == label_at_point
+        """See aero_eyes.utils.geometry.isolate_component_at_point (shared
+        with GeCo2Detector's sam2_refine_boxes wrapper -- same logic
+        regardless of which model produced the mask)."""
+        from aero_eyes.utils.geometry import isolate_component_at_point
+        return isolate_component_at_point(mask, px, py)
 
     @staticmethod
     def _isolate_largest_component(mask: np.ndarray) -> np.ndarray:

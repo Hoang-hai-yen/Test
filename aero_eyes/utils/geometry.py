@@ -187,6 +187,35 @@ def mask_bbox(mask) -> tuple[float, float, float, float] | None:
     return float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)
 
 
+def isolate_component_at_point(mask, px: int, py: int):
+    """Keep only the connected component touching (px, py) (a foreground
+    point prompt) -- discards any disconnected blob SAM/SAM2 tacked on
+    elsewhere in the frame (e.g. a same-colored patch of background), even
+    if that blob is large enough to otherwise pass area/score gates. Falls
+    back to the largest component if the point itself isn't foreground in
+    this particular mask. Shared by MobileSAMSegmenter (box_refine's
+    "sam"/"sam_dense" methods, and its own reference-image
+    use_point_prompt path) and GeCo2Detector's sam2_refine_boxes wrapper
+    (box_refine.method="sam2_dense" with use_center_point) -- same
+    boolean-mask connected-components logic regardless of which model
+    produced the mask.
+    """
+    import cv2
+    import numpy as np
+    mask_u8 = mask.astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(mask_u8, connectivity=8)
+    if num_labels <= 2:  # 0=background + at most 1 foreground component
+        return mask
+    py = min(max(py, 0), mask.shape[0] - 1)
+    px = min(max(px, 0), mask.shape[1] - 1)
+    label_at_point = labels[py, px]
+    if label_at_point == 0:
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        label_at_point = int(np.argmax(counts))
+    return labels == label_at_point
+
+
 def apply_background_mode(img, mask, mode: str, blur_sigma: float = 25.0):
     """Replace (or keep) the non-mask region of `img` per one of 3 modes:
       mean_fill -- flat mean-color fill. Cheapest, but a large flat,

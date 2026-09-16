@@ -1542,27 +1542,45 @@ class BoxRefineConfig(BaseModel):
     # UNDERSIZED detector box (e.g. only ~60% of the true object) rarely
     # gets expanded back out even with min_iou_with_original=0.0 (confirmed
     # in practice -- see MobileSAMSegmenter.segment_box_cached's own
-    # docstring). Ignored by "sam2_dense" (GeCo2Detector.sam2_refine_boxes
-    # has its own prompting, not routed through this field).
+    # docstring). Also honored by "sam2_dense" via GeCo2Detector.
+    # sam2_refine_boxes's own wrapper (see its docstring) -- 0.0 (default)
+    # keeps that method's original, unexpanded box-only prompting.
     context_margin: float = 0.2
     adaptive_context_margin: AdaptiveContextMarginConfig = AdaptiveContextMarginConfig()
-    # Only affects method="sam"/"sam_dense" (MobileSAM). Also passes the
-    # ORIGINAL (pre-margin) box's own center to SAM as a positive point
-    # prompt, alongside the (possibly margin-expanded) box prompt -- a
-    # bigger context_margin gives SAM room to reach the true boundary of an
-    # undersized box, but also more background/confuser area it could
-    # latch onto instead; the center point pins down WHICH blob in that
-    # wider region is the target, without needing to shrink the margin.
-    # Off by default: this project's OWN reference-image segmentation
-    # (stage1.segmentation's use_point_prompt) found a center point
-    # unreliable for ring/donut-shaped objects (hollow center = background,
-    # not foreground, biasing SAM toward leaked/confused masks) -- only
-    # enable this if none of your tracked object classes are shaped like
-    # that. Not yet benchmarked on this project's own dataset -- compare
-    # with scripts/check_box_refine_effect.py before trusting it, same as
-    # every other box_refine.method choice (see this class's own IMPORTANT
-    # note above).
+    # Affects method="sam"/"sam_dense" (MobileSAM) AND "sam2_dense" (via
+    # GeCo2Detector.sam2_refine_boxes's own wrapper around GECO2's
+    # MaskProcessor -- see that method's docstring; nothing inside GECO2/
+    # itself is touched). Also passes the ORIGINAL (pre-margin) box's own
+    # center as a positive point prompt, alongside the (possibly
+    # margin-expanded) box prompt -- a bigger context_margin gives SAM room
+    # to reach the true boundary of an undersized box, but also more
+    # background/confuser area it could latch onto instead; the center
+    # point pins down WHICH blob in that wider region is the target,
+    # without needing to shrink the margin. Off by default: this project's
+    # OWN reference-image segmentation (stage1.segmentation's
+    # use_point_prompt) found a center point unreliable for ring/donut-
+    # shaped objects (hollow center = background, not foreground, biasing
+    # SAM toward leaked/confused masks) -- only enable this if none of your
+    # tracked object classes are shaped like that. Not yet benchmarked on
+    # this project's own dataset -- compare with
+    # scripts/check_box_refine_effect.py before trusting it, same as every
+    # other box_refine.method choice (see this class's own IMPORTANT note
+    # above).
     use_center_point_prompt: bool = False
+    # method="sam2_dense" ONLY. GECO2's own MaskProcessor (GECO2/models/
+    # sam_mask.py) always takes a HARD-CODED mask candidate (index 2 of the
+    # 4 SAM2 mask_decoder produces when multimask_output=True) regardless
+    # of that candidate's own predicted-IoU score -- a choice tuned for
+    # GECO2's own counting-task validation path, not necessarily the best
+    # one for refining an arbitrary tracked box on this project's own
+    # footage. When true, GeCo2Detector.sam2_refine_boxes's wrapper instead
+    # picks whichever of the 3 multimask candidates SAM2 itself scored
+    # highest per box -- same "trust the model's own confidence" principle
+    # MobileSAMSegmenter.segment_box_cached's own `scores.argmax()` already
+    # uses for "sam_dense". False (default) = GECO2's original index-2
+    # choice, unchanged. Not yet benchmarked -- compare with
+    # scripts/check_box_refine_effect.py before trusting it.
+    sam2_dense_select_best_mask: bool = False
     apply_in_stage3: bool = True
     apply_in_stage4: bool = False
     # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box
