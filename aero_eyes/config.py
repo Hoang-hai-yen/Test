@@ -392,6 +392,27 @@ class Stage3Config(BaseModel):
     # with the extractor now configured. False (default) = unchanged, use
     # whatever features are already cached.
     recompute_candidate_features: bool = False
+    # Rejects a degenerate, near-zero-AREA candidate box (from
+    # candidates.json, whichever pipeline produced it) before it can
+    # occupy one of THIS stage's own topk_per_keyframe slots below -- same
+    # AREA-not-min-side-length rationale as
+    # stage123_geco2.min_box_area_enabled (see that field's own docstring:
+    # this project's own GT survey found a real object's thinnest side can
+    # legitimately be ~2px at the frame edge, but no real GT box has area
+    # <= 16px^2). Reads candidates.json as already written -- no
+    # candidate-generation stage needs rerunning to retune this threshold,
+    # unlike stage123_geco2's own version.
+    #
+    # Deliberately does NOT replace stage123_geco2.min_box_area_enabled:
+    # that one runs BEFORE stage123_geco2.cosine_rescore.
+    # candidate_topk_per_keyframe caps the RAW candidate pool -- a
+    # degenerate box surviving that cap crowds out a real candidate
+    # PERMANENTLY (it never reaches candidates.json at all), which this
+    # later filter cannot recover. Running both is the safe choice; this
+    # one alone only protects this stage's own topk_per_keyframe cap, not
+    # the earlier candidate-generation one.
+    min_box_area_enabled: bool = False
+    min_box_area: int = 24
     similarity: Literal["cosine", "l1", "l2"] = "cosine"
     match_threshold: float = 0.55
     nms_iou: float = 0.5

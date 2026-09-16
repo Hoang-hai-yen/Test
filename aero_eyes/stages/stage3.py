@@ -333,11 +333,39 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
     # Build flat list of (frame_idx, det, feat) for all candidates
     all_entries: list[tuple[int, Detection, np.ndarray]] = []
+    n_dropped_min_area = 0
     for frame_idx, cand_dets in candidates.items():
         for det in cand_dets:
+            # stage3.min_box_area_enabled: reject a degenerate, near-zero-
+            # area candidate box BEFORE it can occupy one of this stage's
+            # own topk_per_keyframe slots (applied after NMS/topk below) --
+            # same AREA-not-min-side-length rationale as
+            # stage123_geco2.min_box_area_enabled (see that field's own
+            # docstring: this project's own GT survey found a real object's
+            # thinnest side can legitimately be ~2px at the frame edge, but
+            # no real GT box has area <= 16px^2). Reads candidates.json
+            # already on disk -- no candidate-generation stage needs
+            # rerunning to retune this threshold.
+            #
+            # Deliberately does NOT replace stage123_geco2's own
+            # min_box_area_enabled (geco2_detector.py): that one runs
+            # BEFORE stage123_geco2.cosine_rescore.candidate_topk_per_keyframe
+            # caps the raw candidate pool -- a degenerate box surviving
+            # that cap crowds out a real candidate PERMANENTLY (it never
+            # reaches candidates.json at all), which this later filter
+            # cannot recover. Running both is the safe choice; this one
+            # alone only protects THIS stage's own topk_per_keyframe cap.
+            if s3.min_box_area_enabled and det.box.area() < s3.min_box_area:
+                n_dropped_min_area += 1
+                continue
             feat = getattr(det, "_feature", None)
             if feat is not None:
                 all_entries.append((frame_idx, det, feat))
+    if n_dropped_min_area > 0:
+        log.info(
+            "[Stage3] %s: min_box_area=%d dropped %d degenerate candidate(s) before matching",
+            sample_id, s3.min_box_area, n_dropped_min_area,
+        )
 
     if not all_entries:
         write_detections({fi: [] for fi in candidates}, det_path)

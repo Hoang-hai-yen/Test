@@ -208,6 +208,39 @@ stage2:
 # STAGE 3 — Cross-domain matching
 # ----------------------------------------------------------------------------
 stage3:
+  # Dev/debug convenience: candidates.json's companion candidates.feats.npz
+  # is written by Stage 2 using whatever stage1.feature_extractor was
+  # active THEN -- Stage 2's own cache check only looks at whether
+  # candidates.json exists, with no awareness of which extractor produced
+  # it, so switching feature_extractor.model/variant without clearing that
+  # cache leaves a STALE, wrong-dimension .feats.npz that crashes Stage 3's
+  # `feats @ ref` with a cryptic shape-mismatch error. The normal fix is to
+  # invalidate the cache (project.use_cache=false, or delete
+  # candidates.json so Stage 2 reruns) -- but Stage 2 also reruns
+  # SAHI/proposal-model box detection, which doesn't depend on the
+  # extractor and can be the expensive part on a long video. When true,
+  # Stage 3 instead re-extracts features for the EXISTING candidate boxes
+  # (no box detection re-run) using the CURRENT feature_extractor, then
+  # overwrites candidates.json + candidates.feats.npz in place. false
+  # (default) = unchanged, use whatever features are already cached.
+  recompute_candidate_features: false
+  # Rejects a degenerate, near-zero-AREA candidate box (from
+  # candidates.json, whichever pipeline produced it) before it can occupy
+  # one of THIS stage's own topk_per_keyframe slots below -- an AREA
+  # floor, not a min-side-length one (this project's own GT survey found a
+  # real object's thinnest side can legitimately be ~2px at the frame
+  # edge, but no real GT box has area <= 16px^2). Reads candidates.json as
+  # already written -- no candidate-generation stage needs rerunning to
+  # retune this threshold, unlike stage123_geco2.min_box_area_enabled's
+  # own version. Does NOT replace that one: it runs BEFORE
+  # stage123_geco2.cosine_rescore.candidate_topk_per_keyframe caps the RAW
+  # candidate pool, so a degenerate box surviving THAT cap crowds out a
+  # real candidate PERMANENTLY (never reaches candidates.json at all),
+  # which this later filter can't recover -- running both is the safe
+  # choice; this one alone only protects this stage's own
+  # topk_per_keyframe cap.
+  min_box_area_enabled: false
+  min_box_area: 24
   similarity: cosine         # cosine | l1 | l2  (l1/l2 = negated distance, higher still = more similar)
   match_threshold: 0.55      # calibratable; candidates below are dropped (used unless adaptive_threshold below)
   nms_iou: 0.5               # NMS across overlapping SAHI tiles

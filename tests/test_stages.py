@@ -344,6 +344,49 @@ def test_stage3_produces_detections(cfg, synth_fixture):
     assert "frames" in data
 
 
+def test_stage3_min_box_area_rejects_degenerate_candidate(cfg, synth_fixture):
+    """stage3.min_box_area_enabled: a degenerate, near-zero-area candidate
+    box must be dropped BEFORE matching -- even though its feature is
+    identical to the prototype (similarity=1.0, would otherwise easily
+    clear match_threshold) -- while a normal-sized candidate with the same
+    feature survives. Bypasses Stages 1-2 entirely -- writes
+    candidates.json + prototype.npz directly so candidate box sizes are
+    exact and deterministic."""
+    from aero_eyes.stages.stage2 import _write_candidates_with_features
+    from aero_eyes.types import Box, Detection
+    from aero_eyes.utils.io import write_prototype
+
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    feat = np.ones(8, dtype=np.float32) / np.sqrt(8)  # L2-normalized, matches prototype exactly
+    write_prototype(feat, {}, None, work_dir / "prototype.npz")
+
+    tiny_det = Detection(frame_idx=0, box=Box(0, 0, 2, 2), similarity=0.0, source="candidate")
+    tiny_det._feature = feat
+    normal_det = Detection(frame_idx=0, box=Box(10, 10, 30, 30), similarity=0.0, source="candidate")
+    normal_det._feature = feat
+    _write_candidates_with_features({0: [tiny_det, normal_det]}, work_dir / "candidates.json")
+
+    def _run(min_box_area_enabled: bool) -> dict:
+        cfg.stage3.min_box_area_enabled = min_box_area_enabled
+        cfg.stage3.min_box_area = 24
+        from aero_eyes.stages.stage3 import run_stage3
+        det_path = run_stage3(cfg, FIXTURE_ID)
+        with open(det_path) as f:
+            return json.load(f)["frames"]
+
+    frames_off = _run(False)
+    boxes_off = [(d["box"]["x1"], d["box"]["y1"]) for d in frames_off["0"]]
+    assert (0.0, 0.0) in boxes_off, "with the filter off, the tiny (area=4) box should survive"
+    assert (10.0, 10.0) in boxes_off, "the normal-sized box should always survive"
+
+    frames_on = _run(True)
+    boxes_on = [(d["box"]["x1"], d["box"]["y1"]) for d in frames_on["0"]]
+    assert (0.0, 0.0) not in boxes_on, "tiny box (area=4 < min_box_area=24) must be dropped"
+    assert (10.0, 10.0) in boxes_on, "normal box (area=400 >= 24) must survive"
+
+
 def test_stage3_recompute_candidate_features_fixes_stale_dim_mismatch(cfg, synth_fixture):
     """stage3.recompute_candidate_features: reproduces the real bug -- Stage
     2's cache check only looks at whether candidates.json exists, with no
