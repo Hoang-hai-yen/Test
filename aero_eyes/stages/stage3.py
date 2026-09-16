@@ -234,6 +234,12 @@ def run_stage3(cfg, sample_id: str) -> Path:
         if br_cfg.method in ("sam", "sam_dense"):
             from aero_eyes.models.segmentation import MobileSAMSegmenter
             box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+        elif br_cfg.method == "fastsam_dense":
+            from aero_eyes.models.segmentation import FastSAMSegmenter
+            fs_cfg = cfg.stage2.fastsam_s
+            box_refine_segmenter = FastSAMSegmenter(
+                weights=fs_cfg.weights, conf=fs_cfg.conf, iou=fs_cfg.iou, imgsz=fs_cfg.imgsz,
+            )
         elif br_cfg.method == "sam2_dense":
             from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
             geco2_refine_detector, geco2_refine_prototype = load_geco2_detector_and_prototype(cfg, work_dir)
@@ -498,10 +504,15 @@ def run_stage3(cfg, sample_id: str) -> Path:
             # diagnostic run would silently refine an already-refined box
             # a second time instead of comparing against the true original.
             pre_refine_detections[frame_idx] = result_dets
-            if br_cfg.method == "sam_dense":
-                # One shared MobileSAM frame encoding for every surviving
-                # box on this keyframe, instead of a crop+re-encode per box
-                # -- see refine_boxes_dense's docstring.
+            if br_cfg.method in ("sam_dense", "fastsam_dense"):
+                # One shared frame "encode" (MobileSAM's own embedding, or
+                # FastSAM's segment-everything pass) for every surviving box
+                # on this keyframe, instead of a crop+re-encode per box --
+                # see refine_boxes_dense's docstring. Same dispatch for both
+                # methods: box_refine_segmenter (built above) already
+                # implements the set_frame()/segment_box_cached() interface
+                # this function drives generically, regardless of which
+                # concrete segmenter it is.
                 from aero_eyes.utils.box_refine import refine_boxes_dense
                 refined_boxes = refine_boxes_dense(
                     box_refine_segmenter, frame_bgr, [d.box for d in result_dets],

@@ -1505,6 +1505,21 @@ class BoxRefineConfig(BaseModel):
                     way "sam"/"grabcut" were (see the IMPORTANT note
                     below) -- compare with scripts/check_box_refine_effect.py
                     and check_box_size_bias.py before trusting it.
+      fastsam_dense -- FastSAM-s (stage2.fastsam_s weights) "segment
+                    everything" run ONCE per frame, then whichever
+                    already-produced instance mask best matches a given
+                    box (by IoU, or by point-containment when
+                    use_center_point_prompt is on) is picked afterward --
+                    see aero_eyes.models.segmentation.FastSAMSegmenter's
+                    own docstring. Unlike sam/sam_dense/sam2_dense's
+                    promptable decoders, FastSAM CANNOT generate a new mask
+                    conditioned on the box -- it can only select among
+                    whatever the everything-pass already segmented, so it
+                    hits a ceiling those methods don't when the true
+                    object wasn't cleanly its own instance there (merged
+                    with a neighbor, or missed outright -- a known weak
+                    point on small objects). Not yet benchmarked -- compare
+                    with scripts/check_box_refine_effect.py before trusting it.
 
     IMPORTANT (measured on this dataset, not just theoretical): whether
     ANY of these methods helps or hurts ST-IoU is highly dependent on
@@ -1531,7 +1546,7 @@ class BoxRefineConfig(BaseModel):
     produced them, unchanged.
     """
     enabled: bool = False
-    method: Literal["sam", "sam_dense", "grabcut", "sam2_dense"] = "sam"
+    method: Literal["sam", "sam_dense", "grabcut", "sam2_dense", "fastsam_dense"] = "sam"
     # Padding kept around the original box, as a fraction of the box's own
     # width/height. For "sam"/"grabcut": how much extra context to include
     # when CROPPING the region that gets segmented, so the segmenter isn't

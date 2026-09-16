@@ -162,6 +162,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
     if box_refine_active and br_cfg.method in ("sam", "sam_dense"):
         from aero_eyes.models.segmentation import MobileSAMSegmenter
         box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
+    elif box_refine_active and br_cfg.method == "fastsam_dense":
+        from aero_eyes.models.segmentation import FastSAMSegmenter
+        fs_cfg = cfg.stage2.fastsam_s
+        box_refine_segmenter = FastSAMSegmenter(
+            weights=fs_cfg.weights, conf=fs_cfg.conf, iou=fs_cfg.iou, imgsz=fs_cfg.imgsz,
+        )
     elif box_refine_active and br_cfg.method == "sam2_dense":
         from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
         geco2_refine_detector, geco2_refine_prototype = load_geco2_detector_and_prototype(cfg, work_dir)
@@ -827,7 +833,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         if track_ok and box_refine_active:
                             br_attempts += 1
                             box_before_refine = box
-                            if br_cfg.method == "sam_dense":
+                            if br_cfg.method in ("sam_dense", "fastsam_dense"):
                                 from aero_eyes.utils.box_refine import refine_boxes_dense
                                 box = refine_boxes_dense(
                                     box_refine_segmenter, frame_bgr, [box],

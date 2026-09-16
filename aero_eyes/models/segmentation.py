@@ -463,3 +463,124 @@ class MobileSAMSegmenter:
         except Exception as e:
             log.warning("MobileSAM inference failed (%s), using passthrough mask.", e)
             return np.ones((h, w), dtype=bool)
+
+
+class FastSAMSegmenter:
+    """box_refine.method == "fastsam_dense": reuses FastSAM-s (already
+    loaded as stage2.proposal_model=fastsam_s's box-proposal engine --
+    aero_eyes.models.proposals.FastSamSProposals -- but that wrapper
+    discards the per-instance MASKS it already computes, keeping only
+    boxes) as a box-conditioned refiner.
+
+    Unlike SAM/SAM2's promptable decoder (segment_box_cached above,
+    GeCo2Detector.sam2_refine_boxes), FastSAM has NO prompt-conditioned
+    mask generation at all -- Ultralytics' own box/point prompting for it
+    works exactly the way this class does: run "segment everything" ONCE
+    per frame, then pick whichever ALREADY-PRODUCED instance mask best
+    matches a given box afterward. set_frame()/segment_box_cached() mirror
+    MobileSAMSegmenter's own two-call shape (one shared "encode", reused
+    per box) so aero_eyes.utils.box_refine.refine_boxes_dense drives either
+    segmenter identically -- FastSAM's "everything" pass just IS the encode
+    step here, there's no separate prompt-conditioned decode after it.
+
+    Ceiling this hits that the SAM/SAM2-based methods don't: it can only
+    SELECT among masks the everything-pass already produced for this frame
+    -- if the true object wasn't cleanly segmented as its own instance
+    there (merged with a neighbor, or missed outright -- a known FastSAM
+    weak point on small objects, and this project's own GT survey found
+    real objects as thin as a 2px side), no amount of matching recovers
+    it, unlike a promptable decoder that generates a NEW mask conditioned
+    on exactly where it's prompted. Not yet benchmarked on this project's
+    own dataset -- compare with scripts/check_box_refine_effect.py before
+    trusting it, same as every other box_refine.method choice.
+    """
+
+    def __init__(self, weights: str, conf: float = 0.2, iou: float = 0.7, imgsz: int = 640):
+        self.conf = conf
+        self.iou = iou
+        self.imgsz = imgsz
+        self._model = None
+        try:
+            from ultralytics import FastSAM  # type: ignore
+            self._model = FastSAM(weights)
+            log.info("FastSAM-s loaded for box_refine.method=fastsam_dense: %s", weights)
+        except Exception as e:
+            log.warning(
+                "FastSAM load failed (%s) -- box_refine.method=fastsam_dense unavailable "
+                "this run, boxes left unchanged.", e,
+            )
+        self._cached_masks: list[np.ndarray] = []  # each HxW bool, full-frame-sized
+        self._cached_boxes: list[Box] = []
+
+    def set_frame(self, frame_bgr: np.ndarray) -> bool:
+        """Run FastSAM's segment-everything pass ONCE for this frame,
+        caching every instance's (mask, box) for segment_box_cached() to
+        match prompts against. Returns False (segment_box_cached then
+        always returns None) if FastSAM is unavailable, inference fails,
+        or finds no instances at all."""
+        self._cached_masks = []
+        self._cached_boxes = []
+        if self._model is None:
+            return False
+        try:
+            results = self._model(
+                frame_bgr, conf=self.conf, iou=self.iou, imgsz=self.imgsz,
+                verbose=False, retina_masks=True,
+            )
+        except Exception as e:
+            log.warning("FastSAM segment-everything pass failed (%s).", e)
+            return False
+        for r in results:
+            if r.masks is None or r.boxes is None:
+                continue
+            masks_np = r.masks.data.cpu().numpy() > 0.5  # [K, H, W], full-frame-sized (retina_masks=True)
+            boxes_np = r.boxes.xyxy.cpu().numpy()
+            for m, b in zip(masks_np, boxes_np):
+                self._cached_masks.append(m)
+                self._cached_boxes.append(Box(float(b[0]), float(b[1]), float(b[2]), float(b[3])))
+        return len(self._cached_masks) > 0
+
+    def segment_box_cached(
+        self, box: Box, margin: float = 0.0, use_center_point: bool = False,
+    ) -> np.ndarray | None:
+        """Match `box` (expanded by `margin`, same semantics as
+        MobileSAMSegmenter.segment_box_cached's own prompt-box expansion)
+        against the instances set_frame() cached for the CURRENT frame --
+        must be called after set_frame(). Returns whichever cached mask
+        matches best, or None if nothing was cached or nothing plausibly
+        overlaps (caller then leaves the box unchanged, same fallback
+        every box_refine method uses).
+
+        `use_center_point` (box_refine.use_center_point_prompt): among
+        cached instances whose mask actually CONTAINS the ORIGINAL
+        (pre-margin) box's own center point, picks the one with the best
+        box-IoU against the (margin-expanded) prompt box -- more robust
+        than plain IoU alone when a larger neighboring instance's box
+        happens to overlap the prompt box well without actually containing
+        its center. Falls back to plain box-IoU matching (ignoring the
+        point) if no cached instance's mask contains it.
+        """
+        if not self._cached_masks:
+            return None
+        from aero_eyes.utils.geometry import box_iou
+
+        bw, bh = box.x2 - box.x1, box.y2 - box.y1
+        mx, my = bw * margin, bh * margin
+        expanded = Box(box.x1 - mx, box.y1 - my, box.x2 + mx, box.y2 + my)
+
+        candidates = range(len(self._cached_masks))
+        if use_center_point:
+            cx, cy = int((box.x1 + box.x2) / 2), int((box.y1 + box.y2) / 2)
+            containing = [
+                i for i in candidates
+                if 0 <= cy < self._cached_masks[i].shape[0]
+                and 0 <= cx < self._cached_masks[i].shape[1]
+                and self._cached_masks[i][cy, cx]
+            ]
+            if containing:
+                candidates = containing
+
+        best_i = max(candidates, key=lambda i: box_iou(self._cached_boxes[i], expanded))
+        if box_iou(self._cached_boxes[best_i], expanded) <= 0.0:
+            return None
+        return self._cached_masks[best_i]
