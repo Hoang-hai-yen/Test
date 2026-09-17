@@ -4,7 +4,8 @@ Supported models:
   dinov2   — DINOv2 ViT-S/14 or ViT-B/14, CLS token (384 or 768-d)
   dinov3   — DINOv3 ViT-S/16, ViT-B/16 or ViT-L/16, CLS token (384/768/1024-d).
              Weights are gated on HuggingFace -- request access and set
-             HF_TOKEN before use.
+             HF_TOKEN before use. Can also be loaded from a local Kaggle
+             checkpoint via dinov3_source="kaggle".
   clip     — CLIP ViT-B/32, visual encoder (512-d)
   siglip   — SigLIP vision encoder (base/large/so400m), pooled output
              (768/1024/1152-d). Open access, no gating.
@@ -15,7 +16,7 @@ All extractors return L2-normalized float32 feature vectors.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -45,6 +46,13 @@ def _preprocess_dino(img_bgr: np.ndarray, image_size: int = 224) -> torch.Tensor
     arr  = np.array(img_pil, dtype=np.float32) / 255.0
     arr  = (arr - mean) / std
     return torch.from_numpy(arr.transpose(2, 0, 1).copy())
+
+
+# Alias used by DINOv3FeatureExtractor.extract() below. Kept as a thin
+# wrapper (rather than renaming call sites) so ImageNet-style preprocessing
+# stays in one place.
+def _preprocess(img_bgr: np.ndarray, image_size: int = 224) -> torch.Tensor:
+    return _preprocess_dino(img_bgr, image_size)
 
 
 def _bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
@@ -115,59 +123,98 @@ class DINOv2FeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
-# DINOv3
+# DINOv3 (HuggingFace or local Kaggle checkpoint)
 # ---------------------------------------------------------------------------
 
 class DINOv3FeatureExtractor:
-    """DINOv3 ViT-S/16, ViT-B/16 or ViT-L/16, returns L2-normalized CLS tokens.
+    """DINOv3 feature extractor, loaded either from HuggingFace or Kaggle.
 
-    Weights are gated on HuggingFace (facebook/dinov3-*-pretrain-lvd1689m):
+    Weights are gated on HuggingFace (facebook/dinov3-*-pretrain-*):
     request access on the model page, then set HF_TOKEN before running, or
-    `from_pretrained` will fail with a 401/403.
+    `from_pretrained` will fail with a 401/403. Alternatively, pass
+    source="kaggle" with a kaggle_model_id to load a local checkpoint.
     """
 
-    _VARIANT_MAP = {
-        "vits16": "facebook/dinov3-vits16-pretrain-lvd1689m",
-        "vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-        "vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m",
-    }
     _DIMS = {"vits16": 384, "vitb16": 768, "vitl16": 1024}
 
-    def __init__(self, variant: str = "vitb16", device: str = "auto"):
-        if variant not in self._VARIANT_MAP:
-            raise ValueError(f"Unknown DINOv3 variant '{variant}'. Must be one of {list(self._VARIANT_MAP)}.")
-        self.variant = variant
-        self.device  = _resolve_device(device)
-        self.model, self.processor = self._load(variant)
+    def __init__(
+        self,
+        variant: str = "vitb16",
+        pretrain_dataset: str = "sat493m",
+        source: str = "huggingface",
+        kaggle_model_id: Optional[str] = None,
+        device: str = "auto",
+        image_size: int = 224,
+    ):
+        self.variant     = variant
+        self.image_size  = image_size
+        self.device      = _resolve_device(device)
+        self.model       = self._load_model(variant, pretrain_dataset, source, kaggle_model_id)
         self.model.eval().to(self.device)
-        log.info("DINOv3 %s on %s  (dim=%d)", variant, self.device, self._dim())
+        log.info("DINOv3 %s (%s) loaded on %s  (dim=%d)",
+                 variant, pretrain_dataset, self.device, self._dim())
 
-    def _load(self, variant: str):
-        from transformers import AutoImageProcessor, AutoModel
-        hf_name = self._VARIANT_MAP[variant]
-        processor = AutoImageProcessor.from_pretrained(hf_name)
-        model     = AutoModel.from_pretrained(hf_name)
-        return model, processor
+    def _load_model(self, variant: str, dataset: str, source: str, kaggle_id: Optional[str]):
+        if source == "kaggle":
+            import os
+            import kagglehub
+            if not kaggle_id:
+                raise ValueError("dinov3_source='kaggle' yêu cầu cấu hình dinov3_kaggle_model_id.")
+            path = kagglehub.model_download(kaggle_id)
+            pth_files = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".pth")]
+            ckpt_path = pth_files[0] if pth_files else path
+            model = torch.load(ckpt_path, map_location="cpu")
+            return model
+
+        # Default: load via Hugging Face
+        hf_repo = f"facebook/dinov3-{variant}-pretrain-{dataset}"
+        try:
+            import os
+            from transformers import AutoModel
+            token = os.environ.get("HF_TOKEN", None)
+            model = AutoModel.from_pretrained(hf_repo, token=token)
+            return model
+        except Exception as e:
+            raise RuntimeError(
+                f"Không thể tải DINOv3 từ Hugging Face ({hf_repo}). Lỗi: {e}. "
+                "Lưu ý: DINOv3 là model gated, cần accept license trên HF và set biến môi trường: "
+                "export HF_TOKEN='your_token'"
+            ) from e
 
     @torch.no_grad()
     def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        pil_imgs = [_bgr_to_pil(im) for im in images]
-        out: list[np.ndarray] = []
-        for i in range(0, len(pil_imgs), batch_size):
-            batch_pil = pil_imgs[i:i+batch_size]
-            inputs = self.processor(images=batch_pil, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            pooled = self.model(**inputs).pooler_output
-            out.append(F.normalize(pooled, dim=-1).cpu().numpy())
-        return np.concatenate(out, axis=0).astype(np.float32)
 
-    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
-                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        tensors = [_preprocess(img, self.image_size) for img in images]
+        all_feats: list[np.ndarray] = []
+
+        for i in range(0, len(tensors), batch_size):
+            batch = torch.stack(tensors[i:i + batch_size]).to(self.device).float()
+            out = self.model(pixel_values=batch)
+
+            # Lấy CLS token (index 0)
+            if hasattr(out, "last_hidden_state"):
+                feats = out.last_hidden_state[:, 0]
+            else:
+                feats = out[0] if isinstance(out, (tuple, list)) else out
+
+            feats = F.normalize(feats, dim=-1)
+            all_feats.append(feats.cpu().numpy())
+
+        return np.concatenate(all_feats, axis=0).astype(np.float32)
+
+    def extract_crops(
+        self,
+        frame_bgr: np.ndarray,
+        boxes: list[Box],
+        pad_ratio: float = 0.10,
+        batch_size: int = 16,
+    ) -> np.ndarray:
         if not boxes:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+        crops = [crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes]
+        return self.extract(crops, batch_size=batch_size)
 
     def _dim(self) -> int:
         return self._DIMS.get(self.variant, 768)
@@ -341,10 +388,22 @@ class EnsembleFeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtractor | CLIPFeatureExtractor | SiglipFeatureExtractor | EnsembleFeatureExtractor:
+def build_feature_extractor(
+    cfg,
+) -> DINOv2FeatureExtractor | DINOv3FeatureExtractor | CLIPFeatureExtractor | SiglipFeatureExtractor | EnsembleFeatureExtractor:
     """Build the feature extractor specified by cfg.stage1.feature_extractor."""
     fe  = cfg.stage1.feature_extractor
     dev = cfg.device()
@@ -357,8 +416,12 @@ def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtrac
         )
     if fe.model == "dinov3":
         return DINOv3FeatureExtractor(
-            variant = fe.dinov3_variant,
-            device  = dev,
+            variant          = fe.dinov3_variant,
+            pretrain_dataset = getattr(fe, "dinov3_pretrain_dataset", "sat493m"),
+            source           = getattr(fe, "dinov3_source", "huggingface"),
+            kaggle_model_id  = getattr(fe, "dinov3_kaggle_model_id", None),
+            device           = dev,
+            image_size       = fe.image_size,
         )
     if fe.model == "clip":
         return CLIPFeatureExtractor(
@@ -381,13 +444,3 @@ def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtrac
         f"Unknown feature extractor model '{fe.model}'. "
         "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
     )
-
-
-# ---------------------------------------------------------------------------
-# Internal helper
-# ---------------------------------------------------------------------------
-
-def _resolve_device(device: str) -> str:
-    if device != "auto":
-        return device
-    return "cuda" if torch.cuda.is_available() else "cpu"

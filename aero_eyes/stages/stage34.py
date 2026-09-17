@@ -104,7 +104,7 @@ def _run_matching(cfg, sample_id: str) -> Path:
     # --- LƯỢT 1: So khớp cơ bản ---
     if use_multi_ref:
         sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-        all_sims = np.mean(sims_per_ref, axis=0)
+        all_sims = np.max(sims_per_ref, axis=0)
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
 
@@ -149,7 +149,7 @@ def _run_matching(cfg, sample_id: str) -> Path:
             if use_multi_ref:
                 per_ref_features.append(dynamic_feat)
                 sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-                all_sims = np.mean(sims_per_ref, axis=0)
+                all_sims = np.max(sims_per_ref, axis=0)
             else:
                 prototype = (1 - dyn_alpha) * prototype + dyn_alpha * dynamic_feat
                 prototype /= (np.linalg.norm(prototype) + 1e-8)
@@ -296,7 +296,7 @@ def _track_still_matches(
         and len(per_ref_features) > 0
     )
     if use_multi_ref:
-        sim = float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
+        sim = float(np.max([feats[0] @ ref_feat for ref_feat in per_ref_features]))
     else:
         sim = float(feats[0] @ prototype)
 
@@ -354,7 +354,7 @@ def _detect_on_frame(
     )
     if use_multi_ref:
         sims_per_ref = [feats @ ref_feat for ref_feat in per_ref_features]
-        sims = np.mean(sims_per_ref, axis=0)
+        sims = np.max(sims_per_ref, axis=0)
     else:
         sims = feats @ prototype
 

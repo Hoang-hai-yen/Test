@@ -72,11 +72,12 @@ class SegmentationConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
+    model: str = "dinov3"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
-    clip_variant: str = "vit-b/32"
-    siglip_variant: Literal["base", "large", "so400m"] = "base"
+    dinov3_pretrain_dataset: Literal["lvd1689m", "sat493m"] = "sat493m"
+    dinov3_source: Literal["huggingface", "kaggle"] = "huggingface"
+    dinov3_kaggle_model_id: Optional[str] = None
     weights: Optional[str] = None
     image_size: int = 224
 
@@ -175,7 +176,11 @@ class BuiltinTrackerConfig(BaseModel):
 class LiteTrackConfig(BaseModel):
     onnx_path: Optional[str] = None
     input_size: int = 256
-
+    onnx_path_z: Optional[str] = None        # Đường dẫn file _z.onnx
+    onnx_path_x: Optional[str] = None        # Đường dẫn file _x.onnx
+    template_size: int = 127                 # Kích thước crop template z
+    search_size: int = 255                   # Kích thước crop search x
+    score_threshold: float = 0.40
 
 class DetectionConfirmationConfig(BaseModel):
     enabled: bool = False
@@ -332,11 +337,13 @@ class AeroEyesConfig(BaseModel):
     @model_validator(mode="after")
     def check_litetrack_path(self) -> "AeroEyesConfig":
         if self.stage4.tracker == "litetrack":
-            if not self.stage4.litetrack.onnx_path:
+            lt = self.stage4.litetrack
+            has_pair = bool(lt.onnx_path_z and lt.onnx_path_x)
+            has_single = bool(lt.onnx_path)
+            if not (has_pair or has_single):
                 raise ValueError(
-                    "stage4.tracker is 'litetrack' but stage4.litetrack.onnx_path is not set. "
-                    "Download the LiteTrack-B4 ONNX weights and set "
-                    "stage4.litetrack.onnx_path=/path/to/litetrack.onnx in your config."
+                    "stage4.tracker='litetrack' nhưng chưa cấu hình đường dẫn weights ONNX. "
+                    "Vui lòng thiết lập stage4.litetrack.onnx_path_z và stage4.litetrack.onnx_path_x."
                 )
         return self
 
