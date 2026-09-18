@@ -1280,6 +1280,147 @@ class GlobalAdaptiveThresholdConfig(BaseModel):
     abs_floor: float = 0.15
 
 
+class Geco2DynamicPrototypeTopKFusionConfig(BaseModel):
+    """stage123_geco2.dynamic_prototype.topk_fusion -- ONLY wired into
+    run_stage12_geco2_candidates (stage123_geco2.cosine_rescore.enabled=true)
+    -- see this field's own placement docstring for why the plain
+    run_stage123_geco2 path and cross_check_source="hiera" are deliberately
+    excluded.
+
+    Problem this addresses: dynamic_prototype normally offers ONLY
+    boxes[0] (GeCo2's own highest-scoring candidate) per keyframe to the
+    consecutive-hit confirmer -- if a confuser happens to outscore the
+    real target THAT keyframe, the real target (even if present at rank
+    2/3/...) is never even looked at, so a persistently-confusable scene
+    can starve the confirmer of real hits indefinitely.
+
+    When enabled, every keyframe considers ALL of GeCo2's surviving
+    candidates (however many cosine_rescore.candidate_topk_per_keyframe
+    kept -- no separate K parameter here) instead of just boxes[0]:
+    computes a fused_score for each (see below), and offers the box with
+    the HIGHEST fused_score to the confirmer -- so a real target can still
+    win selection even when GeCo2's own raw score alone would have picked
+    a confuser instead.
+
+    fused_score_i = cosine_weight * cosine_z_i + (1 - cosine_weight) * geco2_z_i
+
+    Both cosine_z_i (feature_extractor cosine to the reference prototype,
+    same pooling as cross_check_threshold's own check) and geco2_z_i
+    (GeCo2's own raw per-box score) are Z-SCORED against a RUNNING window
+    of this SAME sample's own past chosen-candidate values (running_window
+    keyframes), not compared to any fixed absolute number -- this is what
+    makes the mechanism self-calibrating to a given reference-photo-set's
+    OWN domain gap instead of needing a hand-tuned absolute cosine cutoff
+    per video (the exact problem that forced cross_check_threshold down to
+    an unreliable ~0.2 on some footage). Once a candidate is confirmed by
+    the consecutive-hit gate, it's accepted if fused_score_i >=
+    acceptance_z_threshold (0.0 = "at or above this sample's own running
+    average"), REPLACING cross_check_threshold's plain absolute-cosine gate
+    for the confirmed candidate's acceptance decision.
+
+    Cold start: the Z-score has no meaning until running_window has
+    accumulated at least min_window_for_zscore samples -- until then,
+    offer_topk() falls back to exactly today's boxes[0]-only, plain
+    cross_check_threshold behavior (still recording raw cosine/score into
+    the running window so it warms up), so a run isn't left doing nothing
+    for its first min_window_for_zscore keyframes.
+
+    Why NOT wired into run_stage123_geco2 or cross_check_source="hiera":
+    fused_score needs EVERY surviving candidate's cosine BEFORE knowing
+    which one will be selected (selection itself depends on it) -- unlike
+    today's design, which only ever embeds/cross-checks the ALREADY-
+    confirmed single candidate (rare, event-driven). run_stage12_geco2_
+    candidates already embeds every surviving candidate anyway (for
+    candidates.json), so this costs nothing extra there; run_stage123_geco2
+    embeds nothing today and would need K new feature_extractor calls per
+    keyframe (not just on confirmation) to support this. cross_check_
+    source="hiera" would need K encode_exemplars() GeCo2 backbone passes
+    per keyframe instead of the current design's 1-per-confirmation --
+    defeats the entire "keep this infrequent" premise the class's own
+    docstring establishes. Both are silently ignored (topk_fusion has no
+    effect) rather than erroring, with a one-time warning, if enabled
+    together with either.
+    """
+    enabled: bool = False
+    # w in the formula above; GeCo2's own weight is implicitly (1 - this).
+    cosine_weight: float = 0.5
+    # How many past keyframes' CHOSEN-candidate raw cosine/geco2 values to
+    # keep for the running Z-score baseline (a simple deque, oldest evicted
+    # once exceeded) -- larger is a more stable baseline but slower to
+    # adapt if the object's own appearance/domain gap shifts partway
+    # through the video (e.g. lighting change).
+    running_window: int = 50
+    # Cold-start guard: below this many accumulated samples, the Z-score
+    # baseline is too noisy to trust (a window of 1-2 points has an
+    # arbitrary std) -- offer_topk() behaves like plain offer() on boxes[0]
+    # until the window warms up past this.
+    min_window_for_zscore: int = 5
+    # fused_score threshold to ACCEPT a confirmed candidate (0.0 = at or
+    # above this sample's own running average of past chosen candidates).
+    acceptance_z_threshold: float = 0.0
+    # --------------------------------------------------------------------
+    # The 3 knobs below each guard against the SAME failure mode: the
+    # running_window baseline above is built from THIS SAME mechanism's own
+    # past picks, so a persistently-confusable scene can get its confuser's
+    # cosine/geco2 values baked into the baseline as "normal", which then
+    # makes that SAME confuser (or a similar one) easily clear
+    # acceptance_z_threshold on every later frame -- the baseline
+    # rationalizes the confuser instead of catching it. Each is independent
+    # and defaults to off (today's behavior unchanged) so they can be A/B
+    # tested one at a time.
+    # --------------------------------------------------------------------
+    # false (default): Z-score baseline is the temporal running_window
+    # history described above (unchanged behavior).
+    # true: for a keyframe with >= intra_frame_min_boxes surviving
+    # candidates, compute cosine_mean/std and geco2_mean/std from THIS
+    # FRAME's OWN candidates instead of the temporal history -- every box
+    # in one frame shares the same domain (same lighting/scale/moment), so
+    # comparing a candidate against its own frame's siblings cancels out
+    # domain gap entirely without needing any accumulated history, and
+    # can't be poisoned by a confuser chosen in a PAST frame. Falls back to
+    # the temporal history baseline (old behavior) for a frame with fewer
+    # than intra_frame_min_boxes candidates, since 1-2 points can't
+    # estimate a meaningful std either way.
+    intra_frame_baseline: bool = False
+    # Minimum surviving candidates a keyframe must have for
+    # intra_frame_baseline's per-frame stats to be trusted -- below this,
+    # falls back to the temporal running_window baseline for that frame
+    # only (does not disable intra_frame_baseline for later frames).
+    intra_frame_min_boxes: int = 3
+    # false (default): the temporal running_window history (used as
+    # intra_frame_baseline's fallback, and as the sole baseline when
+    # intra_frame_baseline is off) records the CHOSEN candidate's raw
+    # cosine/geco2 values on EVERY offer_topk() call, whether or not that
+    # candidate ever passes consecutive-hit confirmation or the acceptance
+    # gate -- so a repeatedly-argmax-winning confuser that never actually
+    # gets appended still shapes the baseline.
+    # true: only record a candidate's raw values once it's actually been
+    # appended to the dynamic prototype -- a stricter, slower-to-warm-up
+    # history that only ever reflects candidates this same mechanism has
+    # already trusted, instead of everything it merely glanced at.
+    history_update_on_append_only: bool = False
+    # false (default): no absolute floor -- a candidate can be accepted
+    # via fused_score alone even if its raw cosine is effectively noise
+    # (e.g. the baseline itself has drifted down with it).
+    # true: additionally require the candidate's raw (pre-Z-score) cosine
+    # to be >= min_absolute_cosine_floor, regardless of how favorably it
+    # Z-scores against the (possibly drifted) baseline -- same backstop
+    # role as stage3.dynamic_prototype's own adaptive_min_floor.
+    min_absolute_cosine_floor_enabled: bool = False
+    min_absolute_cosine_floor: float = 0.05
+    # Opt-in, only takes effect when min_absolute_cosine_floor_enabled is
+    # also true (and per-ref vectors are available -- same requirement and
+    # fallback as dynamic_prototype.cross_check_threshold_self_calibrate,
+    # which this shares its ref-vs-ref self-similarity ceiling with).
+    # Replaces the hand-set min_absolute_cosine_floor above with
+    # ref_self_sim * min_absolute_cosine_floor_self_calibrate_ratio. Use a
+    # LOWER ratio than cross_check_threshold_self_calibrate_ratio's --
+    # this floor is meant as a sanity backstop under fused_score
+    # acceptance, not the acceptance bar itself.
+    min_absolute_cosine_floor_self_calibrate: bool = False
+    min_absolute_cosine_floor_self_calibrate_ratio: float = 0.3
+
+
 class Geco2DynamicPrototypeConfig(BaseModel):
     """stage123_geco2.dynamic_prototype -- ONLINE/incremental analog of
     stage3.dynamic_prototype for GeCo2's OWN exemplar tokens, for exactly
@@ -1329,6 +1470,30 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     # itself added. Cross-attention cost scales with total token count, so
     # this also bounds the extra compute dynamic_prototype adds per frame.
     max_tokens: int = 5
+    # IMPORTANT: "consecutive" here means consecutive PROCESSED KEYFRAMES,
+    # not consecutive video frames -- GeCo2's own detect_frame() only ever
+    # runs at stage123_geco2.keyframe_interval spacing (default 8), and
+    # this tracker is fed exactly those same keyframes' best boxes, so two
+    # "consecutive" hits are actually keyframe_interval RAW FRAMES apart
+    # (e.g. ~0.27s at 30fps with the default interval=8). That's enough
+    # time for a small/rotating object (a handheld ID card, not a car or
+    # person) to move/turn far more than adjacent-frame tracking would,
+    # so consecutive_hits_iou is a STRICTER bar than its number suggests --
+    # confirmed in practice: a run can sit at n_confirmed==0 in
+    # log_summary() indefinitely even with a perfectly good detector, if
+    # the target rotates/moves enough between keyframes to keep missing
+    # this threshold. Lower consecutive_hits_iou (or keyframe_interval
+    # itself, at the cost of more GeCo2 forward passes per video) if
+    # log_summary() shows offers >> confirmed.
+    #
+    # Confusingly similar-sounding but NOT the same cadence as
+    # stage4.confirm_detections' own DetectionConfirmer instance, which
+    # this shares its CODE with (aero_eyes.utils.detection_confirm) but not
+    # its calling cadence -- that one runs on EVERY video frame when
+    # stage4.tracker=none (genuine adjacent-frame comparisons), and only at
+    # keyframes otherwise. This tracker has no non-keyframe granularity to
+    # fall back to at all, since stage123_geco2.py never runs GeCo2 between
+    # keyframes.
     min_consecutive_hits: int = 2
     consecutive_hits_iou: float = 0.5
     # "feature_extractor" (default, RECOMMENDED): embeds the candidate crop
@@ -1351,6 +1516,26 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     #   assume it works as well as "feature_extractor" without checking.
     cross_check_source: Literal["feature_extractor", "hiera"] = "feature_extractor"
     cross_check_threshold: float = 0.5
+    # Opt-in, only takes effect when cross_check_source="feature_extractor"
+    # and Stage 1 saved per-ref vectors (accuracy.cheap_boosters.
+    # multi_reference_embedding=true) -- silently falls back to the plain
+    # cross_check_threshold above (one-time warning) otherwise. Instead of
+    # a hand-tuned absolute cosine cutoff (has to be re-tuned per video's
+    # own domain gap -- the exact problem that forces it down to an
+    # unreliable ~0.2 on some footage), computes the MIN pairwise cosine
+    # among the 3 reference images' OWN embeddings (an empirical ceiling on
+    # "how similar do two genuinely-matching crops of THIS domain look",
+    # measured once per sample from data already on hand) and uses
+    # ref_self_sim * cross_check_threshold_self_calibrate_ratio as the
+    # EFFECTIVE threshold in its place. If the domain gap is severe enough
+    # that even the 3 refs don't look alike to feature_extractor, the
+    # threshold drops right along with them -- no manual per-video retune.
+    # Governs offer()'s own gate AND offer_topk()'s cold-start/fallback
+    # gate (topk_fusion's own warmed-up fused_score/acceptance_z_threshold
+    # gate is unaffected -- see min_absolute_cosine_floor_self_calibrate on
+    # topk_fusion for the equivalent there).
+    cross_check_threshold_self_calibrate: bool = False
+    cross_check_threshold_self_calibrate_ratio: float = 0.7
     # Opt-in second full sweep over the video after pass 1 finishes: pass 1
     # runs exactly as described above (online accumulation via offer()),
     # and if it accepted at least one dynamic token, pass 2 re-detects
@@ -1369,6 +1554,7 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     # (skipped, pass 1's result stands) when pass 1 accepted zero dynamic
     # tokens, since pass 2 would then be identical to pass 1.
     second_pass: bool = False
+    topk_fusion: Geco2DynamicPrototypeTopKFusionConfig = Geco2DynamicPrototypeTopKFusionConfig()
 
 
 class Stage123Geco2Config(BaseModel):

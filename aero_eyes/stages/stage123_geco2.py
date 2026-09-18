@@ -917,12 +917,13 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
 
     def _offer_best(frame_idx, frame_bgr, boxes, feats):
         if dyn_proto_tracker is not None and boxes:
-            # boxes[0] is the highest-scoring surviving candidate (NMS/
-            # top-K both preserve score-descending order -- see
-            # filter_boxes_by_threshold) -- feats[0] is its embedding,
-            # already computed for candidates.json, reused here to skip a
-            # redundant re-embed inside the cross-check.
-            dyn_proto_tracker.offer(frame_bgr, boxes[0], precomputed_feature=feats[0])
+            # offer_topk() considers EVERY surviving candidate (not just
+            # boxes[0]) when dynamic_prototype.topk_fusion.enabled -- see
+            # its own docstring -- and transparently falls back to plain
+            # offer(boxes[0], ...) (today's behavior) otherwise. feats[i]
+            # is already computed for candidates.json regardless, reused
+            # here at no extra cost.
+            dyn_proto_tracker.offer_topk(frame_bgr, boxes, feats)
 
     get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
     candidates = _run_geco2_candidate_pass(

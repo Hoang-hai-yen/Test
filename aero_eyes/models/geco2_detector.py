@@ -840,6 +840,11 @@ class GeCo2DynamicPrototypeTracker:
         self._cross_per_ref_features = cross_check_per_ref_features
         self._cross_prototype_path = work_dir / cfg.stage1.prototype.cache_name
         self._warned_cross_unavailable = False
+        # cross_check_threshold_self_calibrate / topk_fusion.
+        # min_absolute_cosine_floor_self_calibrate (opt-in, share this same
+        # cached value) -- see _ref_self_sim()'s own docstring.
+        self._ref_self_sim: float | None = None
+        self._warned_ref_self_sim_unavailable = False
         # Diagnostic counters ONLY (never read by offer()/effective_prototype()
         # themselves) -- log_summary() reports these at end of run so a run
         # producing ZERO dynamic tokens has a way to tell WHERE it stalled
@@ -855,11 +860,37 @@ class GeCo2DynamicPrototypeTracker:
         self._n_cross_check_unavailable = 0
         self._n_cross_check_rejected = 0
         self._n_appended = 0
+        # dynamic_prototype.topk_fusion (opt-in, offer_topk() only -- see
+        # that method's own docstring): running Z-score baselines + its own
+        # diagnostic counters, separate from the generic ones above so
+        # log_summary() can report how often fusion actually changed the
+        # selected candidate vs. just replayed boxes[0].
+        from collections import deque
+        tk_cfg = dp_cfg.topk_fusion
+        self._topk_cosine_history: deque = deque(maxlen=tk_cfg.running_window)
+        self._topk_geco2_history: deque = deque(maxlen=tk_cfg.running_window)
+        self._n_topk_offers = 0
+        self._n_topk_warmup = 0
+        self._n_topk_fused_selected_non_top1 = 0
+        self._n_topk_intra_frame_baseline = 0
+        self._n_topk_floor_rejected = 0
+        self._warned_topk_fusion_unsupported = False
+        if tk_cfg.enabled and dp_cfg.cross_check_source != "feature_extractor":
+            log.warning(
+                "[Stage123-GeCo2] %s: dynamic_prototype.topk_fusion.enabled=true but "
+                "cross_check_source=%s -- topk_fusion needs 'feature_extractor' (K "
+                "encode_exemplars() GeCo2 backbone passes per keyframe for 'hiera' would "
+                "defeat the whole 'keep this infrequent' premise) -- offer_topk() will fall "
+                "back to plain boxes[0] selection for the rest of this run.",
+                sample_id, dp_cfg.cross_check_source,
+            )
+            self._warned_topk_fusion_unsupported = True
         log.info(
             "[Stage123-GeCo2] %s: dynamic_prototype tracker built (max_tokens=%d, "
             "min_consecutive_hits=%d, consecutive_hits_iou=%.2f, cross_check_source=%s, "
-            "cross_check_threshold=%.2f)", sample_id, dp_cfg.max_tokens, dp_cfg.min_consecutive_hits,
-            dp_cfg.consecutive_hits_iou, dp_cfg.cross_check_source, dp_cfg.cross_check_threshold,
+            "cross_check_threshold=%.2f, topk_fusion.enabled=%s)", sample_id, dp_cfg.max_tokens,
+            dp_cfg.min_consecutive_hits, dp_cfg.consecutive_hits_iou, dp_cfg.cross_check_source,
+            dp_cfg.cross_check_threshold, tk_cfg.enabled,
         )
 
     def dynamic_token_count(self) -> int:
@@ -917,13 +948,14 @@ class GeCo2DynamicPrototypeTracker:
         if sim is None:
             self._n_cross_check_unavailable += 1
             return  # cross-check unavailable this run -- refuse to add rather than trust GeCo2 alone
-        if sim < self.dp_cfg.cross_check_threshold:
+        threshold = self._effective_cross_check_threshold()
+        if sim < threshold:
             self._n_cross_check_rejected += 1
             log.debug(
                 "[Stage123-GeCo2] %s: dynamic_prototype candidate at frame region "
                 "(%.0f,%.0f,%.0f,%.0f) rejected (cross_check sim=%.3f < %.3f)",
                 self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
-                sim, self.dp_cfg.cross_check_threshold,
+                sim, threshold,
             )
             return
 
@@ -935,6 +967,157 @@ class GeCo2DynamicPrototypeTracker:
             "[Stage123-GeCo2] %s: dynamic_prototype appended a token (cross_check sim=%.3f, "
             "source=%s) -- %d/%d dynamic token(s) active",
             self.sample_id, sim, self.dp_cfg.cross_check_source,
+            len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+        )
+
+    def offer_topk(self, frame_bgr: np.ndarray, boxes: list[Box], feats: np.ndarray) -> None:
+        """stage123_geco2.dynamic_prototype.topk_fusion (opt-in) -- ONLY
+        wired into run_stage12_geco2_candidates. Considers EVERY box in
+        `boxes` (GeCo2's own score-descending surviving candidates this
+        keyframe -- boxes[0] is what plain offer() would use) with its
+        ALREADY-EMBEDDED feature_extractor vector `feats[i]`, instead of
+        just boxes[0], so a confuser that happens to outscore the real
+        target THIS keyframe doesn't starve the confirmer of real hits --
+        see Geco2DynamicPrototypeTopKFusionConfig's own docstring for the
+        full fused_score rationale, cold-start behavior, and why this
+        needs cross_check_source="feature_extractor" specifically.
+
+        Three independent opt-in guards against the baseline
+        self-poisoning failure mode (a confuser that keeps winning argmax
+        bakes itself into the baseline as "normal" -- see
+        Geco2DynamicPrototypeTopKFusionConfig's docstring):
+          - intra_frame_baseline: Z-score against THIS FRAME's own
+            candidates instead of/before the temporal history.
+          - history_update_on_append_only: temporal history only records
+            candidates that were actually appended, not every argmax pick.
+          - min_absolute_cosine_floor_enabled: hard floor under fused_score
+            acceptance, same role as stage3.dynamic_prototype's
+            adaptive_min_floor.
+        All default False/off -- behavior is unchanged from before these
+        existed unless explicitly turned on.
+
+        Falls back to plain offer(boxes[0], precomputed_feature=feats[0])
+        (updating the SAME generic counters log_summary() reports) when
+        topk_fusion is disabled, cross_check_source isn't
+        "feature_extractor", `boxes` is empty, or prototype.npz isn't
+        available -- callers can call this unconditionally whenever
+        dynamic_prototype.enabled, regardless of topk_fusion's own setting.
+        """
+        if not self.dp_cfg.enabled or not boxes:
+            return
+        tk_cfg = self.dp_cfg.topk_fusion
+        if not tk_cfg.enabled or self.dp_cfg.cross_check_source != "feature_extractor" or self._cross_prototype is None:
+            self.offer(frame_bgr, boxes[0], precomputed_feature=feats[0])
+            return
+
+        self._n_offers += 1
+        self._n_topk_offers += 1
+        cosines = np.array([self._cosine_from_feature(feats[i]) for i in range(len(boxes))])
+        geco2_scores = np.array([b.score for b in boxes], dtype=np.float64)
+
+        # Baseline priority: intra_frame_baseline (this frame's OWN
+        # candidates -- same domain, no accumulated history needed, immune
+        # to a past frame's confuser poisoning it) when enabled and this
+        # frame has enough candidates to trust a std estimate from; else
+        # the temporal running_window history (today's original behavior);
+        # else cold start (baseline stays None).
+        baseline = None
+        if tk_cfg.intra_frame_baseline and len(boxes) >= tk_cfg.intra_frame_min_boxes:
+            baseline = (
+                float(np.mean(cosines)), float(np.std(cosines)) + 1e-8,
+                float(np.mean(geco2_scores)), float(np.std(geco2_scores)) + 1e-8,
+            )
+            self._n_topk_intra_frame_baseline += 1
+        elif len(self._topk_cosine_history) >= tk_cfg.min_window_for_zscore:
+            baseline = (
+                float(np.mean(self._topk_cosine_history)), float(np.std(self._topk_cosine_history)) + 1e-8,
+                float(np.mean(self._topk_geco2_history)), float(np.std(self._topk_geco2_history)) + 1e-8,
+            )
+
+        fused_chosen: float | None = None
+        if baseline is None:
+            self._n_topk_warmup += 1
+            chosen_idx = 0
+        else:
+            cosine_mean, cosine_std, geco2_mean, geco2_std = baseline
+            cosine_z = (cosines - cosine_mean) / cosine_std
+            geco2_z = (geco2_scores - geco2_mean) / geco2_std
+            fused = tk_cfg.cosine_weight * cosine_z + (1.0 - tk_cfg.cosine_weight) * geco2_z
+            chosen_idx = int(np.argmax(fused))
+            fused_chosen = float(fused[chosen_idx])
+            if chosen_idx != 0:
+                self._n_topk_fused_selected_non_top1 += 1
+
+        # Temporal history update (feeds the running_window fallback baseline
+        # above, and IS the sole baseline when intra_frame_baseline is off):
+        # false (default) records the CHOSEN candidate's raw values on EVERY
+        # offer -- unchanged original behavior. true defers this until the
+        # candidate is actually appended (see the accept branch below), so a
+        # repeatedly-argmax-winning confuser that never gets confirmed/
+        # accepted can't shape the baseline.
+        if not tk_cfg.history_update_on_append_only:
+            self._topk_cosine_history.append(float(cosines[chosen_idx]))
+            self._topk_geco2_history.append(float(geco2_scores[chosen_idx]))
+
+        chosen_box = boxes[chosen_idx]
+        confirmed = self._confirmer.offer(chosen_box)
+        if confirmed is None:
+            return  # not yet min_consecutive_hits in a row on the CHOSEN candidate
+        self._n_confirmed += 1
+
+        new_tokens = self.detector.encode_exemplars(
+            [frame_bgr], [(confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2)],
+        )
+
+        if fused_chosen is None:
+            # Cold start: no Z-score baseline yet -- fall back to the same
+            # plain absolute-cosine gate offer() itself uses (self-calibrated
+            # or hand-set, per cross_check_threshold_self_calibrate).
+            sim, gate_name, gate_value = float(cosines[chosen_idx]), "cosine", self._effective_cross_check_threshold()
+        else:
+            sim, gate_name, gate_value = fused_chosen, "fused_score", tk_cfg.acceptance_z_threshold
+        if sim < gate_value:
+            self._n_cross_check_rejected += 1
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype (topk_fusion) candidate at frame "
+                "region (%.0f,%.0f,%.0f,%.0f) [chosen_idx=%d/%d] rejected (%s=%.3f < %.3f)",
+                self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
+                chosen_idx, len(boxes), gate_name, sim, gate_value,
+            )
+            return
+
+        # Absolute backstop (opt-in): a candidate can still clear fused_score
+        # acceptance purely because the baseline itself drifted down with a
+        # run of poor picks -- this floor refuses to trust fused_score alone
+        # once raw cosine drops below a hand-set sanity minimum, same role
+        # as stage3.dynamic_prototype's adaptive_min_floor.
+        if tk_cfg.min_absolute_cosine_floor_enabled:
+            floor = self._effective_min_absolute_cosine_floor()
+            if cosines[chosen_idx] < floor:
+                self._n_topk_floor_rejected += 1
+                self._n_cross_check_rejected += 1
+                log.debug(
+                    "[Stage123-GeCo2] %s: dynamic_prototype (topk_fusion) candidate at frame "
+                    "region (%.0f,%.0f,%.0f,%.0f) [chosen_idx=%d/%d] rejected by absolute floor "
+                    "(cosine=%.3f < %.3f, despite %s=%.3f >= %.3f)",
+                    self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
+                    chosen_idx, len(boxes), cosines[chosen_idx], floor,
+                    gate_name, sim, gate_value,
+                )
+                return
+
+        if tk_cfg.history_update_on_append_only:
+            self._topk_cosine_history.append(float(cosines[chosen_idx]))
+            self._topk_geco2_history.append(float(geco2_scores[chosen_idx]))
+
+        self._n_appended += 1
+        self._dynamic_tokens.append(new_tokens)
+        if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
+            self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype (topk_fusion) appended a token "
+            "(chosen_idx=%d/%d, %s=%.3f) -- %d/%d dynamic token(s) active",
+            self.sample_id, chosen_idx, len(boxes), gate_name, sim,
             len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
 
@@ -957,6 +1140,87 @@ class GeCo2DynamicPrototypeTracker:
             self.sample_id, self._n_offers, self._n_confirmed, self._n_cross_check_unavailable,
             self._n_cross_check_rejected, self._n_appended, len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
+        if self.dp_cfg.topk_fusion.enabled and self._n_topk_offers > 0:
+            log.info(
+                "[Stage123-GeCo2] %s: dynamic_prototype topk_fusion summary -- %d offer_topk() "
+                "call(s) (%d still in cold-start warm-up, %d used intra_frame_baseline), %d chose "
+                "a candidate OTHER than boxes[0] (GeCo2's own top pick), %d rejected by the "
+                "absolute cosine floor", self.sample_id, self._n_topk_offers,
+                self._n_topk_warmup, self._n_topk_intra_frame_baseline,
+                self._n_topk_fused_selected_non_top1, self._n_topk_floor_rejected,
+            )
+
+    def _get_ref_self_sim(self) -> float | None:
+        """Cached MIN pairwise feature_extractor-space cosine among the 3
+        ORIGINAL reference images' own per-ref embeddings -- an empirical,
+        per-sample ceiling on "how similar do two genuinely-matching crops
+        of THIS reference-photo-set's domain even look", used by
+        cross_check_threshold_self_calibrate and topk_fusion.
+        min_absolute_cosine_floor_self_calibrate in place of a hand-tuned
+        absolute cosine number. MIN (not mean) is used deliberately: it's
+        the worst-agreeing pair, so a threshold derived from it doesn't
+        end up optimistic relative to how loosely this domain's own refs
+        agree with EACH OTHER.
+
+        Returns None (callers fall back to their own hand-set absolute
+        value, logged once here) when fewer than 2 per-ref vectors are on
+        hand -- needs accuracy.cheap_boosters.multi_reference_embedding=
+        true at Stage 1 time to have saved them into prototype.npz at all.
+        """
+        if self._ref_self_sim is not None:
+            return self._ref_self_sim
+        per_ref = self._cross_per_ref_features
+        if not per_ref and self._cross_prototype_path.exists():
+            from aero_eyes.utils.io import read_prototype
+            _, _, per_ref = read_prototype(self._cross_prototype_path)
+        if not per_ref or len(per_ref) < 2:
+            if not self._warned_ref_self_sim_unavailable:
+                log.warning(
+                    "[Stage123-GeCo2] %s: dynamic_prototype self-calibration needs >=2 "
+                    "per-ref feature_extractor vectors (accuracy.cheap_boosters."
+                    "multi_reference_embedding=true at Stage 1 time) -- none found, "
+                    "falling back to the hand-set absolute threshold/floor value(s).",
+                    self.sample_id,
+                )
+                self._warned_ref_self_sim_unavailable = True
+            return None
+        sims = [
+            float(per_ref[i] @ per_ref[j])
+            for i in range(len(per_ref)) for j in range(i + 1, len(per_ref))
+        ]
+        self._ref_self_sim = min(sims)
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype self-calibration ref-vs-ref "
+            "self-similarity ceiling = %.3f (min of %d pair(s))",
+            self.sample_id, self._ref_self_sim, len(sims),
+        )
+        return self._ref_self_sim
+
+    def _effective_cross_check_threshold(self) -> float:
+        """The cross_check_threshold to actually gate on -- self-calibrated
+        (ref_self_sim * cross_check_threshold_self_calibrate_ratio) when
+        dp_cfg.cross_check_threshold_self_calibrate is on, source is
+        "feature_extractor" (ref_self_sim lives in THAT embedding space,
+        not Hiera's), and per-ref vectors are available; the plain hand-set
+        dp_cfg.cross_check_threshold otherwise."""
+        if self.dp_cfg.cross_check_threshold_self_calibrate and self.dp_cfg.cross_check_source == "feature_extractor":
+            ref_sim = self._get_ref_self_sim()
+            if ref_sim is not None:
+                return ref_sim * self.dp_cfg.cross_check_threshold_self_calibrate_ratio
+        return self.dp_cfg.cross_check_threshold
+
+    def _effective_min_absolute_cosine_floor(self) -> float:
+        """Same self-calibration idea as _effective_cross_check_threshold(),
+        for topk_fusion's min_absolute_cosine_floor instead -- only called
+        when min_absolute_cosine_floor_enabled is already true (offer_topk()
+        guards that itself); cross_check_source is always "feature_extractor"
+        here since topk_fusion falls back to plain offer() otherwise."""
+        tk_cfg = self.dp_cfg.topk_fusion
+        if tk_cfg.min_absolute_cosine_floor_self_calibrate:
+            ref_sim = self._get_ref_self_sim()
+            if ref_sim is not None:
+                return ref_sim * tk_cfg.min_absolute_cosine_floor_self_calibrate_ratio
+        return tk_cfg.min_absolute_cosine_floor
 
     def _cross_check_similarity(
         self, frame_bgr: np.ndarray, box: Box, new_tokens: dict, precomputed_feature: np.ndarray | None = None,
@@ -1031,7 +1295,14 @@ class GeCo2DynamicPrototypeTracker:
                 batch_size=self.cfg.runtime.batch_size,
             )[0]
         )
+        return self._cosine_from_feature(feat)
 
+    def _cosine_from_feature(self, feat: np.ndarray) -> float:
+        """Raw feature_extractor-space cosine of an ALREADY-embedded crop
+        against the reference prototype -- the multi-ref-pooling-aware part
+        of _feature_extractor_similarity, factored out so offer_topk can
+        score EVERY surviving candidate's precomputed feature the same way
+        without duplicating the mean/max pooling logic."""
         use_multi_ref = (
             self.cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
             and self.cfg.accuracy.cheap_boosters.multi_reference_embedding

@@ -588,6 +588,15 @@ stage123_geco2:
   dynamic_prototype:
     enabled: false
     max_tokens: 5              # sliding-window cap on APPENDED token-sets (FIFO); original ref tokens never evicted
+    # IMPORTANT: "consecutive" = consecutive PROCESSED KEYFRAMES (spaced
+    # keyframe_interval RAW FRAMES apart, default 8 -- ~0.27s at 30fps),
+    # NOT consecutive video frames -- GeCo2 never runs between keyframes in
+    # this stage. That gap is enough for a small/rotating object (e.g. a
+    # handheld ID card) to move more than adjacent-frame tracking would, so
+    # consecutive_hits_iou is a stricter bar than its number suggests. If
+    # the run's dynamic_prototype summary log shows offers >> confirmed,
+    # lower this (or keyframe_interval itself, at the cost of more GeCo2
+    # forward passes per video).
     min_consecutive_hits: 2
     consecutive_hits_iou: 0.5
     # "feature_extractor" (default, RECOMMENDED): embeds the candidate crop
@@ -606,6 +615,20 @@ stage123_geco2:
     #   without checking.
     cross_check_source: feature_extractor   # feature_extractor | hiera
     cross_check_threshold: 0.5
+    # Opt-in: instead of the hand-set cross_check_threshold above, compute
+    # the MIN pairwise cosine among the 3 reference images' OWN embeddings
+    # (an empirical per-sample ceiling on how similar this domain's genuine
+    # matches even look) and use ref_self_sim * ratio as the effective
+    # threshold -- self-drops with the domain gap instead of needing manual
+    # per-video retuning. Needs cross_check_source=feature_extractor and
+    # accuracy.cheap_boosters.multi_reference_embedding=true (falls back to
+    # the plain cross_check_threshold above, with a warning, otherwise).
+    # Governs offer()'s gate and offer_topk()'s cold-start/fallback gate --
+    # NOT topk_fusion's own warmed-up fused_score/acceptance_z_threshold
+    # gate (see topk_fusion.min_absolute_cosine_floor_self_calibrate below
+    # for the equivalent there).
+    cross_check_threshold_self_calibrate: false
+    cross_check_threshold_self_calibrate_ratio: 0.7
     # Opt-in second full sweep over the video after pass 1 finishes. Pass 1
     # runs as described above; if it accepted >=1 dynamic token, pass 2
     # re-detects every keyframe from frame 1 again using that FINAL
@@ -619,6 +642,48 @@ stage123_geco2:
     # merge). Costs ~2x the per-video GeCo2 forward-pass time. No-op if
     # pass 1 accepted zero dynamic tokens (pass 2 would be identical).
     second_pass: false
+    # Opt-in, ONLY has an effect in the cosine_rescore path
+    # (run_stage12_geco2_candidates, i.e. stage123_geco2.cosine_rescore.
+    # enabled=true) -- no-op in the plain path, and no-op if
+    # cross_check_source is "hiera" instead of "feature_extractor" (both
+    # would need K embeddings/backbone-passes per keyframe instead of the
+    # current 1-per-confirmation design; only cosine_rescore already pays
+    # that cost anyway, for candidates.json). Considers EVERY surviving
+    # GeCo2 candidate this keyframe (not just the single highest-scoring
+    # one) -- fixes the case where a confuser outscores the real target
+    # that keyframe and the real target never even gets looked at.
+    # fused_score_i = cosine_weight*cosine_z_i + (1-cosine_weight)*geco2_z_i,
+    # both Z-scored against a running window of this SAME sample's own past
+    # chosen-candidate values (self-calibrating to this reference-photo
+    # set's own domain gap, instead of a hand-tuned absolute cosine cutoff
+    # per video). The box with the highest fused_score is what's offered to
+    # the consecutive-hit confirmer; once confirmed, accepted if
+    # fused_score >= acceptance_z_threshold -- REPLACES cross_check_
+    # threshold's plain cutoff for topk_fusion's own acceptance decision.
+    topk_fusion:
+      enabled: false
+      cosine_weight: 0.5          # feature_extractor cosine's weight; GeCo2's own score gets (1 - this)
+      running_window: 50          # keyframes of history kept for the Z-score baseline
+      min_window_for_zscore: 10    # cold-start: falls back to plain boxes[0]+cross_check_threshold below this
+      acceptance_z_threshold: 0.0 # 0.0 = at/above this sample's own running-average candidate quality
+      # 3 independent opt-in guards against the running_window baseline being
+      # self-poisoned by a persistently-confusable scene (a confuser that
+      # keeps winning argmax bakes itself into the baseline as "normal" --
+      # see Geco2DynamicPrototypeTopKFusionConfig's docstring). All default
+      # off (unchanged behavior); recommended to A/B one at a time.
+      intra_frame_baseline: false      # true: Z-score against THIS FRAME's own candidates (no history needed, immune to past-frame poisoning) instead of running_window, when the frame has >= intra_frame_min_boxes candidates
+      intra_frame_min_boxes: 3         # min candidates this keyframe needs for intra_frame_baseline's own stats to be trusted; falls back to running_window history below this
+      history_update_on_append_only: false  # true: running_window only records a candidate once it's actually appended to the dynamic prototype, not every argmax pick that was merely offered
+      min_absolute_cosine_floor_enabled: false  # true: also require raw cosine >= min_absolute_cosine_floor to accept, regardless of fused_score -- same role as stage3.dynamic_prototype.adaptive_min_floor
+      min_absolute_cosine_floor: 0.05
+      # Opt-in, only matters when min_absolute_cosine_floor_enabled is also
+      # true: same ref-vs-ref self-similarity ceiling as dynamic_prototype.
+      # cross_check_threshold_self_calibrate above, but with a LOWER ratio
+      # -- this floor is a sanity backstop under fused_score acceptance,
+      # not the acceptance bar itself. Replaces min_absolute_cosine_floor
+      # with ref_self_sim * ratio.
+      min_absolute_cosine_floor_self_calibrate: false
+      min_absolute_cosine_floor_self_calibrate_ratio: 0.3
 
   # --------------------------------------------------------------------
   # DIAGNOSTIC/ABLATION: box size feeds the exemplar prototype through TWO
