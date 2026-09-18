@@ -130,13 +130,19 @@ def loocv_estimate_by_object(
     the held-out category's videos. Averaging the held-out scores across
     all 7 folds gives an unbiased estimate of what the naive "best on all
     14 videos" pick actually buys you on an unseen object.
-    Returns (mean_held_out_score, per_video_held_out_score, per_video_chosen_weight).
+    Returns (mean_held_out_score, per_video_held_out_score,
+    per_video_chosen_weight, per_category_chosen_weight) -- the last one is
+    the same information as per_video_chosen_weight but deduplicated to one
+    entry per object (both '_0'/'_1' videos of a held-out category always
+    get the SAME chosen weight, since they're held out together), meant for
+    a stability check across the 7 independent fold picks.
     """
     from aero_eyes.models.geco2_finetune_data import video_category
 
     categories = sorted({video_category(s) for s in sample_ids})
     held_out_scores: dict[str, float] = {}
     chosen_weight_per_video: dict[str, float] = {}
+    chosen_weight_per_category: dict[str, float] = {}
 
     for held_out_cat in categories:
         held_out_videos = [s for s in sample_ids if video_category(s) == held_out_cat]
@@ -147,12 +153,13 @@ def loocv_estimate_by_object(
             if mean_on_others > best_mean:
                 best_mean = mean_on_others
                 best_w = w
+        chosen_weight_per_category[held_out_cat] = best_w
         for sid in held_out_videos:
             held_out_scores[sid] = results[best_w][sid]
             chosen_weight_per_video[sid] = best_w
 
     mean_held_out = sum(held_out_scores.values()) / len(held_out_scores)
-    return mean_held_out, held_out_scores, chosen_weight_per_video
+    return mean_held_out, held_out_scores, chosen_weight_per_video, chosen_weight_per_category
 
 
 def main():
@@ -204,7 +211,9 @@ def main():
             naive_best_mean = m
             naive_best_w = w
 
-    mean_held_out, held_out_scores, chosen_w_per_video = loocv_estimate_by_object(results, sample_ids)
+    mean_held_out, held_out_scores, chosen_w_per_video, chosen_w_per_category = loocv_estimate_by_object(
+        results, sample_ids,
+    )
 
     print("\n" + "=" * 60)
     print(f"NAIVE (tuned on all {len(sample_ids)} videos): best cosine_weight={naive_best_w} -> Mean ST-IoU={naive_best_mean:.4f}")
@@ -212,6 +221,46 @@ def main():
     print("Per-video held-out score (weight chosen from the OTHER 6 objects' videos):")
     for sid in sample_ids:
         print(f"  {sid} ({video_category(sid)}): cosine_weight={chosen_w_per_video[sid]}  ST-IoU={held_out_scores[sid]:.4f}")
+
+    # Stability check: does the naive all-data pick actually agree with what
+    # INDEPENDENT folds would have picked on their own, or did it just fit
+    # noise in these particular 14 videos? Exact-value comparison is valid
+    # here (not a floating-point tolerance issue) -- every chosen weight
+    # comes from the same discrete cosine_weights list swept above.
+    from statistics import median
+    fold_weights = sorted(chosen_w_per_category.values())
+    agreement = sum(1 for w in fold_weights if w == naive_best_w)
+    median_fold_weight = median(fold_weights)
+    agreement_fraction = agreement / len(categories)
+
+    print(f"\nPer-object fold picks: {chosen_w_per_category}")
+    print(
+        f"{agreement}/{len(categories)} object-folds independently picked the SAME weight "
+        f"as the naive all-data pick ({naive_best_w})."
+    )
+
+    STABLE_AGREEMENT_FRACTION = 0.5
+    if agreement_fraction >= STABLE_AGREEMENT_FRACTION:
+        recommended_w = naive_best_w
+        print(
+            f"\n>>> RECOMMENDED cosine_weight = {recommended_w} (agrees with "
+            f"{agreement}/{len(categories)} object-folds; expected held-out "
+            f"ST-IoU ~= {mean_held_out:.4f})."
+        )
+    else:
+        recommended_w = median_fold_weight
+        print(
+            f"\n>>> WARNING: naive best cosine_weight={naive_best_w} agreed with only "
+            f"{agreement}/{len(categories)} object-folds ({fold_weights}) -- likely fit to "
+            f"noise in these 14 videos rather than a genuinely better weight."
+        )
+        print(
+            f">>> RECOMMENDED cosine_weight = {recommended_w} (median of the 7 independent "
+            f"per-object-fold picks, more robust than the naive all-data pick given the "
+            f"disagreement above -- NOTE this exact value was not itself scored by the LOOCV "
+            f"loop above, only each fold's own pick was; re-run with it as the sole value in "
+            f"--cosine-weights to confirm before deploying)."
+        )
     print("=" * 60)
 
     out_path = Path(args.out) if args.out else Path(cfg.project.work_dir) / "topk_fusion_cosine_weight_loocv_report.json"
@@ -223,6 +272,11 @@ def main():
         "loocv_mean_held_out": mean_held_out,
         "loocv_held_out_scores": held_out_scores,
         "loocv_chosen_cosine_weight_per_video": chosen_w_per_video,
+        "loocv_chosen_cosine_weight_per_category": chosen_w_per_category,
+        "fold_agreement_count": agreement,
+        "fold_agreement_fraction": agreement_fraction,
+        "median_fold_cosine_weight": median_fold_weight,
+        "recommended_cosine_weight": recommended_w,
     }, indent=2))
     print(f"\nWrote report: {out_path}")
 
