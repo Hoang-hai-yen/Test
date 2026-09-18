@@ -545,6 +545,37 @@ def _finalize_keyframe_detections(
     return result_dets
 
 
+def _run_geco2_default_pass(
+    detector, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg,
+    color_stats: list | None, viz_dir: Path, save_viz: bool, on_result=None,
+) -> dict[int, list[Detection]]:
+    """One full sweep over the video's keyframes, detecting against
+    whatever get_prototype() currently returns -- shared by
+    run_stage123_geco2's pass 1 (online dynamic_prototype, if enabled) and
+    optional pass 2 (dynamic_prototype.second_pass: same sweep again with
+    pass 1's final prototype frozen) so the two passes can't silently
+    diverge in behavior. on_result(frame_idx, frame_bgr, result_dets), when
+    given, runs after each keyframe's detections are finalized -- pass 1
+    uses it to feed dyn_proto_tracker.offer(); pass 2 passes None since the
+    prototype is frozen by then.
+    """
+    from aero_eyes.utils.video import frame_iterator
+
+    detections: dict[int, list[Detection]] = {}
+    for frame_idx, frame_bgr in frame_iterator(video_path):
+        if frame_idx not in kf_indices:
+            continue
+        boxes = detector.detect_frame(frame_bgr, get_prototype())
+        result_dets = _finalize_keyframe_detections(
+            frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
+        )
+        detections[frame_idx] = result_dets
+        log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
+        if on_result is not None:
+            on_result(frame_idx, frame_bgr, result_dets)
+    return detections
+
+
 def run_stage123_geco2(cfg, sample_id: str) -> Path:
     """Run the merged GeCo2 stage for one sample. Returns path to detections.json."""
     from aero_eyes.models.geco2_detector import GeCo2Detector
@@ -562,6 +593,26 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
     detector = GeCo2Detector(cfg)
     prototype = build_exemplar_prototype(cfg, sample_id, detector, work_dir)
+
+    # stage123_geco2.dynamic_prototype (opt-in): online/incremental analog
+    # of stage3.dynamic_prototype for GeCo2's own exemplar tokens -- see
+    # GeCo2DynamicPrototypeTracker's own docstring. Only wired into the
+    # "Default" (non-global_adaptive_threshold) branch below -- that path's
+    # own 2-pass score-pooling would need the prototype held FIXED across
+    # both passes to stay comparable, which this online update can't
+    # guarantee.
+    dyn_proto_tracker = None
+    if cfg.stage123_geco2.dynamic_prototype.enabled:
+        if cfg.stage123_geco2.global_adaptive_threshold.enabled:
+            log.warning(
+                "[Stage123-GeCo2] %s: dynamic_prototype.enabled=true has no effect while "
+                "global_adaptive_threshold.enabled=true (that path's own 2-pass score "
+                "pooling needs a fixed prototype across both passes) -- disable one of the two.",
+                sample_id,
+            )
+        else:
+            from aero_eyes.models.geco2_detector import GeCo2DynamicPrototypeTracker
+            dyn_proto_tracker = GeCo2DynamicPrototypeTracker(cfg, detector, prototype, work_dir, sample_id)
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
     color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
@@ -649,16 +700,52 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             detections[frame_idx] = result_dets
             log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
     else:
-        # ---- Default: GeCo2's own per-frame-relative decision, unchanged. ----
-        for frame_idx, frame_bgr in frame_iterator(video_path):
-            if frame_idx not in kf_indices:
-                continue
-            boxes = detector.detect_frame(frame_bgr, prototype)
-            result_dets = _finalize_keyframe_detections(
-                frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
-            )
-            detections[frame_idx] = result_dets
-            log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
+        # ---- Default: GeCo2's own per-frame-relative decision, unchanged
+        # (+ optional dynamic_prototype online update -- see tracker built
+        # above). ----
+        def _offer_best(frame_idx, frame_bgr, result_dets):
+            if dyn_proto_tracker is not None and result_dets:
+                # Highest-scoring surviving box this keyframe -- the SAME
+                # one _finalize_keyframe_detections already picked as the
+                # frame's best (see its own NMS/top-K ordering).
+                dyn_proto_tracker.offer(frame_bgr, result_dets[0].box)
+
+        get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
+        detections = _run_geco2_default_pass(
+            detector, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
+            on_result=_offer_best,
+        )
+
+        # dynamic_prototype.second_pass (opt-in): pass 1 above only ever
+        # saw a GROWING prototype, so early frames judged against just the
+        # 3 original refs may have missed a target whose on-video look
+        # differs from them -- re-run the whole video once more with pass
+        # 1's FINAL (now frozen) prototype available from frame 1, and use
+        # THIS pass's detections/viz as the answer instead. No-op if pass 1
+        # accepted no dynamic tokens (would be identical to pass 1).
+        dp_cfg = cfg.stage123_geco2.dynamic_prototype
+        if dyn_proto_tracker is not None and dp_cfg.second_pass:
+            n_dynamic = dyn_proto_tracker.dynamic_token_count()
+            if n_dynamic == 0:
+                log.info(
+                    "[Stage123-GeCo2] %s: dynamic_prototype.second_pass=true but pass 1 "
+                    "accepted no dynamic tokens -- skipping (pass 2 would be identical).",
+                    sample_id,
+                )
+            else:
+                log.info(
+                    "[Stage123-GeCo2] %s: dynamic_prototype.second_pass -- re-running the "
+                    "whole video with pass 1's final prototype (%d dynamic token(s)) frozen "
+                    "from frame 1, replacing pass 1's detections%s.",
+                    sample_id, n_dynamic, " and viz" if save_viz else "",
+                )
+                frozen_prototype = dyn_proto_tracker.effective_prototype()
+                color_stats_pass2 = [] if color_sig is not None else None
+                detections = _run_geco2_default_pass(
+                    detector, video_path, kf_indices, lambda: frozen_prototype,
+                    color_sig, cpf_cfg, color_stats_pass2, viz_dir, save_viz,
+                )
+                color_stats = color_stats_pass2
 
     if color_stats:
         arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim
@@ -688,6 +775,50 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     return det_path
 
 
+def _run_geco2_candidate_pass(
+    detector, extractor, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg, cfg,
+    on_result=None,
+) -> dict[int, list[Detection]]:
+    """One full sweep over the video's keyframes building candidates.json
+    entries -- shared by run_stage12_geco2_candidates's pass 1 (online
+    dynamic_prototype, if enabled) and optional pass 2
+    (dynamic_prototype.second_pass), same rationale as
+    _run_geco2_default_pass. on_result(frame_idx, frame_bgr, boxes, feats),
+    when given, runs after each keyframe's candidates are built -- pass 1
+    uses it to feed dyn_proto_tracker.offer(); pass 2 passes None.
+    """
+    from aero_eyes.utils.video import frame_iterator
+
+    candidates: dict[int, list[Detection]] = {}
+    for frame_idx, frame_bgr in frame_iterator(video_path):
+        if frame_idx not in kf_indices:
+            continue
+
+        boxes = detector.detect_frame(frame_bgr, get_prototype())
+        if color_sig is not None:
+            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
+
+        if boxes:
+            feats = extractor.extract_crops(
+                frame_bgr, boxes,
+                pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+                batch_size=cfg.runtime.batch_size,
+            )
+        else:
+            feats = np.zeros((0, extractor._feature_dim()), dtype=np.float32)
+
+        frame_dets: list[Detection] = []
+        for i, box in enumerate(boxes):
+            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="candidate")
+            d._feature = feats[i]  # type: ignore[attr-defined]
+            frame_dets.append(d)
+        candidates[frame_idx] = frame_dets
+        log.debug("[Stage12-GeCo2] frame %d: %d candidates", frame_idx, len(frame_dets))
+        if on_result is not None:
+            on_result(frame_idx, frame_bgr, boxes, feats)
+    return candidates
+
+
 def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     """Stage 1+2 replacement (cosine_rescore variant) — GeCo2 exemplar
     detection as a CANDIDATE generator instead of the final word.
@@ -715,7 +846,7 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     from aero_eyes.models.geco2_detector import GeCo2Detector
     from aero_eyes.stages.stage1 import run_stage1
     from aero_eyes.stages.stage2 import _write_candidates_with_features
-    from aero_eyes.utils.video import frame_iterator, keyframe_indices, video_info
+    from aero_eyes.utils.video import keyframe_indices, video_info
 
     t0 = time.time()
     work_dir = Path(cfg.project.work_dir) / sample_id
@@ -744,6 +875,30 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
 
     extractor = build_feature_extractor(cfg)
 
+    # stage123_geco2.dynamic_prototype (opt-in): same online/incremental
+    # mechanism as run_stage123_geco2's own wiring -- see
+    # GeCo2DynamicPrototypeTracker's docstring. This function already
+    # builds `extractor` (stage1.feature_extractor) and just ran run_stage1
+    # above (so prototype.npz already exists) for its OWN candidate-
+    # embedding purpose -- reuse both here instead of the tracker lazily
+    # loading a second, redundant extractor instance when
+    # cross_check_source="feature_extractor".
+    dyn_proto_tracker = None
+    if cfg.stage123_geco2.dynamic_prototype.enabled:
+        from aero_eyes.models.geco2_detector import GeCo2DynamicPrototypeTracker
+
+        dp_cfg = cfg.stage123_geco2.dynamic_prototype
+        cross_extractor = cross_prototype = cross_per_ref_features = None
+        if dp_cfg.cross_check_source == "feature_extractor":
+            from aero_eyes.utils.io import read_prototype
+            cross_extractor = extractor
+            cross_prototype, _, cross_per_ref_features = read_prototype(work_dir / cfg.stage1.prototype.cache_name)
+        dyn_proto_tracker = GeCo2DynamicPrototypeTracker(
+            cfg, detector, prototype, work_dir, sample_id,
+            cross_check_extractor=cross_extractor, cross_check_prototype=cross_prototype,
+            cross_check_per_ref_features=cross_per_ref_features,
+        )
+
     data_root = Path(cfg.data.data_root)
     video_dir = data_root / sample_id
     video_files = list(video_dir.glob(cfg.data.video_glob))
@@ -758,31 +913,46 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
 
     kf_indices = set(keyframe_indices(total_frames, cfg.stage123_geco2.keyframe_interval))
 
-    candidates: dict[int, list[Detection]] = {}
-    for frame_idx, frame_bgr in frame_iterator(video_path):
-        if frame_idx not in kf_indices:
-            continue
+    def _offer_best(frame_idx, frame_bgr, boxes, feats):
+        if dyn_proto_tracker is not None and boxes:
+            # boxes[0] is the highest-scoring surviving candidate (NMS/
+            # top-K both preserve score-descending order -- see
+            # filter_boxes_by_threshold) -- feats[0] is its embedding,
+            # already computed for candidates.json, reused here to skip a
+            # redundant re-embed inside the cross-check.
+            dyn_proto_tracker.offer(frame_bgr, boxes[0], precomputed_feature=feats[0])
 
-        boxes = detector.detect_frame(frame_bgr, prototype)
-        if color_sig is not None:
-            boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
+    get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
+    candidates = _run_geco2_candidate_pass(
+        detector, extractor, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, cfg,
+        on_result=_offer_best,
+    )
 
-        if boxes:
-            feats = extractor.extract_crops(
-                frame_bgr, boxes,
-                pad_ratio=cfg.stage2.candidate.feature_crop_pad,
-                batch_size=cfg.runtime.batch_size,
+    # dynamic_prototype.second_pass (opt-in): see run_stage123_geco2's own
+    # wiring for the full rationale -- re-run the whole video once more
+    # with pass 1's final (frozen) prototype so Stage 3 gets candidates
+    # built from a fuller exemplar set even for early keyframes, instead
+    # of just replaying pass 1's growing-prototype candidates. No-op if
+    # pass 1 accepted no dynamic tokens.
+    dp_cfg = cfg.stage123_geco2.dynamic_prototype
+    if dyn_proto_tracker is not None and dp_cfg.second_pass:
+        n_dynamic = dyn_proto_tracker.dynamic_token_count()
+        if n_dynamic == 0:
+            log.info(
+                "[Stage12-GeCo2] %s: dynamic_prototype.second_pass=true but pass 1 accepted "
+                "no dynamic tokens -- skipping (pass 2 would be identical).", sample_id,
             )
         else:
-            feats = np.zeros((0, extractor._feature_dim()), dtype=np.float32)
-
-        frame_dets: list[Detection] = []
-        for i, box in enumerate(boxes):
-            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="candidate")
-            d._feature = feats[i]  # type: ignore[attr-defined]
-            frame_dets.append(d)
-        candidates[frame_idx] = frame_dets
-        log.debug("[Stage12-GeCo2] frame %d: %d candidates", frame_idx, len(frame_dets))
+            log.info(
+                "[Stage12-GeCo2] %s: dynamic_prototype.second_pass -- re-running the whole "
+                "video with pass 1's final prototype (%d dynamic token(s)) frozen from frame "
+                "1, replacing pass 1's candidates.", sample_id, n_dynamic,
+            )
+            frozen_prototype = dyn_proto_tracker.effective_prototype()
+            candidates = _run_geco2_candidate_pass(
+                detector, extractor, video_path, kf_indices, lambda: frozen_prototype,
+                color_sig, cpf_cfg, cfg,
+            )
 
     _write_candidates_with_features(candidates, cand_path)
 

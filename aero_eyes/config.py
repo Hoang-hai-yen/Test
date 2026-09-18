@@ -1280,6 +1280,97 @@ class GlobalAdaptiveThresholdConfig(BaseModel):
     abs_floor: float = 0.15
 
 
+class Geco2DynamicPrototypeConfig(BaseModel):
+    """stage123_geco2.dynamic_prototype -- ONLINE/incremental analog of
+    stage3.dynamic_prototype for GeCo2's OWN exemplar tokens, for exactly
+    the reason that batch version can't be ported as-is: stage3's version
+    is a 2-pass mechanism (match the WHOLE video's candidates once, pick a
+    percentile-of-the-whole-video's worth of high scorers, blend, re-score)
+    -- but stage123_geco2.py processes keyframes in ONE sequential pass, so
+    there is no "whole video" distribution to compute a percentile from
+    until the video is already done (too late to have helped the frames
+    already processed).
+
+    Instead of a batch percentile, this appends new exemplar tokens to the
+    prototype's own K/V token sequence AS THE VIDEO IS PROCESSED (GeCo2's
+    adapt_features already treats prototype["main"/"l1"/"l2"] as an
+    arbitrary-length token sequence -- see GeCo2Detector.encode_exemplars
+    -- so appending more tokens needs no architecture change, just more
+    entries along that same dimension), using a SLIDING WINDOW
+    (max_tokens, FIFO eviction of the OLDEST appended token -- never the
+    original reference-image tokens) instead of "the whole video minus a
+    percentile cut".
+
+    Trustworthiness problem: GeCo2's own score is RELATIVE-only (see
+    ScoreConfig-adjacent fields' own docstrings, e.g. score_threshold_abs)
+    -- a confidently-scored box can still be a confuser, and there is no
+    reliable "percentile of a small streaming sample" to fall back on
+    early in a video the way stage3's batch version can. So a candidate is
+    NOT trusted on GeCo2's own score alone -- it must ALSO be confirmed by
+    BOTH:
+      1. min_consecutive_hits consecutive keyframes whose best box
+         spatially agrees (same mechanism as stage4.confirm_detections'
+         own DetectionConfirmer -- see aero_eyes.utils.detection_confirm)
+         -- a single spurious high-scoring frame can't poison the
+         prototype on its own.
+      2. cross_check_source's cosine similarity to a reference embedding
+         clearing cross_check_threshold -- see that field's own docstring
+         for the "feature_extractor" vs "hiera" tradeoff.
+    Only once BOTH agree does the candidate's exemplar tokens get appended.
+
+    Not yet benchmarked -- compare with scripts/check_box_refine_effect.py-
+    style before/after runs on your own footage before trusting it, same
+    as every other opt-in accuracy knob in this project.
+    """
+    enabled: bool = False
+    # Sliding-window cap on how many EXTRA (appended) exemplar token-sets
+    # are kept -- FIFO eviction of the oldest once exceeded. The original
+    # reference-image tokens are never evicted, only what this mechanism
+    # itself added. Cross-attention cost scales with total token count, so
+    # this also bounds the extra compute dynamic_prototype adds per frame.
+    max_tokens: int = 5
+    min_consecutive_hits: int = 2
+    consecutive_hits_iou: float = 0.5
+    # "feature_extractor" (default, RECOMMENDED): embeds the candidate crop
+    #   with stage1.feature_extractor (whatever model is configured there --
+    #   dinov2/dinov3/clip/siglip/ensemble) and compares against Stage 1's
+    #   OWN prototype.npz (the SAME reference-image embedding
+    #   stage4.geco2_redetect_cosine_filter already cross-checks GeCo2
+    #   re-detects against) -- a genuinely INDEPENDENT model from GeCo2's
+    #   own Hiera backbone, so it can catch a confuser that fools GeCo2's
+    #   own score without sharing GeCo2's own blind spots.
+    # "hiera": reuses GeCo2's OWN backbone feature (an appearance token
+    #   from GeCo2Detector.encode_exemplars applied to the candidate crop)
+    #   compared against the CURRENT effective prototype's own exemplar
+    #   tokens, avoiding a second model/extra load entirely. NOT actually
+    #   independent -- GeCo2's own score is ALREADY effectively a learned
+    #   similarity between the SAME two things in the SAME Hiera space
+    #   (see adapt_features), so a confuser that fools the score is likely
+    #   to also score high here (correlated failure, not an independent
+    #   second opinion). Exposed for you to A/B test yourself -- don't
+    #   assume it works as well as "feature_extractor" without checking.
+    cross_check_source: Literal["feature_extractor", "hiera"] = "feature_extractor"
+    cross_check_threshold: float = 0.5
+    # Opt-in second full sweep over the video after pass 1 finishes: pass 1
+    # runs exactly as described above (online accumulation via offer()),
+    # and if it accepted at least one dynamic token, pass 2 re-detects
+    # every keyframe from frame 1 again using that FINAL prototype --
+    # frozen, no more offer()/consecutive-hit confirmation -- instead of
+    # pass 1's prototype which only grows richer as the video progresses.
+    # This targets the specific weakness of an online/incremental
+    # mechanism: EARLY frames only ever saw the 3 original reference
+    # images, so a target whose on-video appearance differs a lot from
+    # those refs (different angle/lighting/scale) can be missed right at
+    # the start even though by the end of pass 1 the accumulated tokens
+    # would have caught it easily. Pass 2's detections/candidates and
+    # (if runtime.save_visualizations) viz REPLACE pass 1's outright --
+    # this is meant as the final answer, not a merge of both passes.
+    # Costs roughly 2x the per-video GeCo2 forward-pass time. No-op
+    # (skipped, pass 1's result stands) when pass 1 accepted zero dynamic
+    # tokens, since pass 2 would then be identical to pass 1.
+    second_pass: bool = False
+
+
 class Stage123Geco2Config(BaseModel):
     """Only used when pipeline.detector == 'geco2'. Requires the vendored
     GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
@@ -1377,6 +1468,7 @@ class Stage123Geco2Config(BaseModel):
     crop_context_margin: float = 0.5
     scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
     domain_calibration: DomainCalibrationConfig = DomainCalibrationConfig()
+    dynamic_prototype: Geco2DynamicPrototypeConfig = Geco2DynamicPrototypeConfig()
     # Diagnostic/ablation toggle: box size feeds the exemplar prototype
     # through TWO independent paths -- (1) shape_or_objectness(w,h) -> a
     # dedicated shape token, and (2) the box coordinates that define the

@@ -240,7 +240,7 @@ stage3:
   # choice; this one alone only protects this stage's own
   # topk_per_keyframe cap.
   min_box_area_enabled: false
-  min_box_area: 24
+  min_box_area: 12
   similarity: cosine         # cosine | l1 | l2  (l1/l2 = negated distance, higher still = more similar)
   match_threshold: 0.55      # calibratable; candidates below are dropped (used unless adaptive_threshold below)
   nms_iou: 0.5               # NMS across overlapping SAHI tiles
@@ -425,7 +425,7 @@ stage123_geco2:
   # min_box_area's default (24) matches the smallest real box observed --
   # validate against your own GT before changing it, don't guess.
   min_box_area_enabled: false
-  min_box_area: 24
+  min_box_area: 12
   prototype_cache_name: geco2_prototype.pt   # cached exemplar tokens (torch, not prototype.npz)
 
   # --------------------------------------------------------------------
@@ -558,6 +558,67 @@ stage123_geco2:
     enabled: false
     num_sample_frames: 5   # unlabeled video frames sampled to estimate "this video's own domain"
     strength: 1.0           # 0 = no change, 1 = fully match the video's own mean token
+
+  # --------------------------------------------------------------------
+  # ONLINE/incremental analog of stage3.dynamic_prototype for GeCo2's OWN
+  # exemplar tokens -- stage3's version is a 2-pass mechanism (match the
+  # WHOLE video once, pick a percentile-of-the-whole-video's high scorers,
+  # blend, re-score), but stage123_geco2.py processes keyframes in ONE
+  # sequential pass, so there's no "whole video" distribution to compute a
+  # percentile from until it's too late to help frames already processed.
+  # Instead, this appends new exemplar tokens to the prototype's own K/V
+  # sequence AS THE VIDEO IS PROCESSED (adapt_features already treats
+  # prototype tokens as an arbitrary-length sequence -- see
+  # GeCo2Detector.encode_exemplars -- so more tokens need no architecture
+  # change), using a sliding window (max_tokens, FIFO) instead of a
+  # percentile cut.
+  #
+  # GeCo2's own score is relative-only (see score_threshold_abs above) --
+  # a confidently-scored box can still be a confuser, and there's no
+  # reliable percentile-of-a-small-streaming-sample to fall back on early
+  # in a video. So a candidate is NOT trusted on GeCo2's own score alone --
+  # it must ALSO clear consecutive-hit confirmation (min_consecutive_hits,
+  # same mechanism as stage4.confirm_detections) AND an independent cosine
+  # cross-check (cross_check_source/cross_check_threshold below) before its
+  # tokens get appended.
+  #
+  # Not yet benchmarked -- compare with scripts/check_box_refine_effect.py-
+  # style before/after runs on your own footage before trusting it.
+  # --------------------------------------------------------------------
+  dynamic_prototype:
+    enabled: false
+    max_tokens: 5              # sliding-window cap on APPENDED token-sets (FIFO); original ref tokens never evicted
+    min_consecutive_hits: 2
+    consecutive_hits_iou: 0.5
+    # "feature_extractor" (default, RECOMMENDED): embeds the candidate crop
+    #   with stage1.feature_extractor (whatever model is configured there)
+    #   and compares against Stage 1's OWN prototype.npz -- the SAME
+    #   reference-image embedding stage4.geco2_redetect_cosine_filter
+    #   already cross-checks GeCo2 re-detects against. A genuinely
+    #   INDEPENDENT model from GeCo2's own Hiera backbone.
+    # "hiera": reuses GeCo2's OWN backbone feature instead (no second model
+    #   to load) -- but NOT actually independent: GeCo2's own score is
+    #   ALREADY effectively a learned similarity between the SAME two
+    #   things in the SAME Hiera space (see adapt_features), so a confuser
+    #   that fools the score is likely to also score high here (correlated
+    #   failure, not a second opinion). Exposed for you to A/B test
+    #   yourself -- don't assume it works as well as "feature_extractor"
+    #   without checking.
+    cross_check_source: feature_extractor   # feature_extractor | hiera
+    cross_check_threshold: 0.5
+    # Opt-in second full sweep over the video after pass 1 finishes. Pass 1
+    # runs as described above; if it accepted >=1 dynamic token, pass 2
+    # re-detects every keyframe from frame 1 again using that FINAL
+    # prototype -- frozen, no more online updates -- instead of pass 1's
+    # prototype which only grows richer as the video progresses. Targets
+    # EARLY frames that only ever saw the 3 original reference images and
+    # may have missed a target whose on-video look differs a lot from them
+    # (angle/lighting/scale), even though by the end of pass 1 the
+    # accumulated tokens would have caught it easily. Pass 2's
+    # detections/candidates and viz REPLACE pass 1's outright (not a
+    # merge). Costs ~2x the per-video GeCo2 forward-pass time. No-op if
+    # pass 1 accepted zero dynamic tokens (pass 2 would be identical).
+    second_pass: false
 
   # --------------------------------------------------------------------
   # DIAGNOSTIC/ABLATION: box size feeds the exemplar prototype through TWO

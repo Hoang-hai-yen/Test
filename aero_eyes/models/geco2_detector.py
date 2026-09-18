@@ -784,6 +784,220 @@ def load_geco2_detector_and_prototype(cfg, work_dir: Path) -> tuple:
     return detector, prototype
 
 
+class GeCo2DynamicPrototypeTracker:
+    """stage123_geco2.dynamic_prototype's online/incremental state -- one
+    instance per sample, built once before its keyframe loop starts and
+    fed the accepted best box at every keyframe via offer(). See
+    Geco2DynamicPrototypeConfig's own docstring (config.py) for the full
+    design rationale: why this can't be stage3.dynamic_prototype's batch
+    2-pass mechanism (no "whole video" score distribution exists yet
+    while still processing it), and why GeCo2's own score alone isn't
+    trusted to accept a candidate (consecutive-hit confirmation + an
+    independent cosine cross-check are both required first).
+    """
+
+    def __init__(
+        self, cfg, detector: "GeCo2Detector", base_prototype: dict, work_dir: Path, sample_id: str,
+        cross_check_extractor=None, cross_check_prototype=None, cross_check_per_ref_features=None,
+    ):
+        """cross_check_extractor/cross_check_prototype/cross_check_per_ref_features:
+        pass these when the CALLER already built a stage1.feature_extractor
+        instance and read prototype.npz for its own purposes (e.g.
+        run_stage12_geco2_candidates already does both, to embed every
+        surviving candidate for Stage 3's later cosine matching) -- reuses
+        them instead of this tracker lazily building a SECOND, redundant
+        instance of the same model. Only relevant when
+        dp_cfg.cross_check_source == "feature_extractor"; ignored (and
+        lazily built on first use instead, from
+        work_dir/stage1.prototype.cache_name) when left as None.
+
+        cross_check_per_ref_features (list[np.ndarray] | None): the 3
+        individual reference-image embeddings read_prototype() returns
+        alongside the fused prototype. When
+        accuracy.cheap_boosters.multi_reference_embedding is on, the cross
+        check scores the candidate against EACH ref separately and pools
+        with accuracy.cheap_boosters.multi_ref_pooling (mean|max) -- same
+        pattern Stage 3's own matching and
+        stage4._detect_on_frame_geco2's cosine filter use -- instead of
+        collapsing to a single mean vector first, which dilutes a good
+        match against one ref with two poor ones under "max" pooling.
+        """
+        from aero_eyes.utils.detection_confirm import DetectionConfirmer
+
+        dp_cfg = cfg.stage123_geco2.dynamic_prototype
+        self.cfg = cfg
+        self.dp_cfg = dp_cfg
+        self.detector = detector
+        self.base_prototype = base_prototype
+        self.sample_id = sample_id
+        self._confirmer = DetectionConfirmer(dp_cfg.min_consecutive_hits, dp_cfg.consecutive_hits_iou)
+        self._dynamic_tokens: list[dict] = []
+        # Lazily built on first use if not given here -- avoids loading a
+        # second model at all when dynamic_prototype is disabled or uses
+        # "hiera" instead.
+        self._cross_extractor = cross_check_extractor
+        self._cross_prototype = cross_check_prototype
+        self._cross_per_ref_features = cross_check_per_ref_features
+        self._cross_prototype_path = work_dir / cfg.stage1.prototype.cache_name
+        self._warned_cross_unavailable = False
+
+    def dynamic_token_count(self) -> int:
+        """Number of dynamic tokens accepted so far (excludes the 3
+        original reference-image tokens) -- callers use this to decide
+        whether dynamic_prototype.second_pass has anything worth
+        re-running with (0 means pass 2 would be identical to pass 1)."""
+        return len(self._dynamic_tokens)
+
+    def effective_prototype(self) -> dict[str, torch.Tensor]:
+        """The prototype to pass into detect_frame()/filter_boxes_by_threshold()
+        for THIS keyframe -- the original reference-image tokens plus
+        whatever this tracker has accepted so far. Identical to
+        base_prototype (same object, no copy) when nothing has been
+        accepted yet, so callers pay no extra cost until this actually
+        does something."""
+        if not self._dynamic_tokens:
+            return self.base_prototype
+        return {
+            key: torch.cat([self.base_prototype[key]] + [t[key] for t in self._dynamic_tokens], dim=1)
+            for key in ("main", "l1", "l2")
+        }
+
+    def offer(self, frame_bgr: np.ndarray, box: Box, precomputed_feature: np.ndarray | None = None) -> None:
+        """Call once per keyframe with the box detect_frame()/
+        filter_boxes_by_threshold() already selected as this frame's best
+        (i.e. it already cleared GeCo2's own score threshold) -- decides
+        whether to also accept it into the dynamic exemplar buffer. No-op
+        if dynamic_prototype is disabled.
+
+        precomputed_feature: pass the stage1.feature_extractor embedding
+        for THIS SAME box when the caller already computed one for its own
+        purposes (e.g. run_stage12_geco2_candidates already embeds every
+        surviving candidate for Stage 3's later cosine matching) -- skips
+        a redundant re-embed inside the "feature_extractor" cross-check.
+        Ignored when cross_check_source="hiera", or when None.
+        """
+        if not self.dp_cfg.enabled:
+            return
+        confirmed = self._confirmer.offer(box)
+        if confirmed is None:
+            return  # not yet min_consecutive_hits in a row -- keep waiting
+
+        # One extra backbone forward pass -- only for a box that ALREADY
+        # cleared both GeCo2's own threshold and consecutive-hit
+        # confirmation, so this is infrequent relative to the per-keyframe
+        # detect_frame() cost already being paid regardless.
+        new_tokens = self.detector.encode_exemplars(
+            [frame_bgr], [(confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2)],
+        )
+
+        sim = self._cross_check_similarity(frame_bgr, confirmed, new_tokens, precomputed_feature)
+        if sim is None:
+            return  # cross-check unavailable this run -- refuse to add rather than trust GeCo2 alone
+        if sim < self.dp_cfg.cross_check_threshold:
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype candidate at frame region "
+                "(%.0f,%.0f,%.0f,%.0f) rejected (cross_check sim=%.3f < %.3f)",
+                self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
+                sim, self.dp_cfg.cross_check_threshold,
+            )
+            return
+
+        self._dynamic_tokens.append(new_tokens)
+        if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
+            self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype appended a token (cross_check sim=%.3f, "
+            "source=%s) -- %d/%d dynamic token(s) active",
+            self.sample_id, sim, self.dp_cfg.cross_check_source,
+            len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+        )
+
+    def _cross_check_similarity(
+        self, frame_bgr: np.ndarray, box: Box, new_tokens: dict, precomputed_feature: np.ndarray | None = None,
+    ) -> float | None:
+        if self.dp_cfg.cross_check_source == "hiera":
+            return self._hiera_similarity(new_tokens)
+        return self._feature_extractor_similarity(frame_bgr, box, precomputed_feature)
+
+    def _hiera_similarity(self, new_tokens: dict) -> float:
+        """cross_check_source="hiera": cosine between the candidate's OWN
+        appearance token (GeCo2's Hiera backbone, same one detect_frame()
+        already used) and the mean of the ORIGINAL reference images'
+        appearance tokens -- see Geco2DynamicPrototypeConfig's own
+        docstring for why this is NOT an independent signal from GeCo2's
+        own score (same backbone, same feature space) and is offered for
+        A/B testing rather than as the recommended default.
+        """
+        tokens_per_ref = 2 if self.detector.use_shape_token else 1
+        candidate_vec = new_tokens["main"][0, 0].cpu().numpy().astype(np.float64)
+        # Appearance-only sub-tokens: index 0, tokens_per_ref, 2*tokens_per_ref, ...
+        # -- drops the interleaved shape token per ref when use_shape_token
+        # is on (see encode_exemplars: [exemplar, shape] pairs per ref).
+        ref_main = self.base_prototype["main"][0].cpu().numpy().astype(np.float64)  # [K, D]
+        ref_vecs = ref_main[::tokens_per_ref]
+        ref_vec = ref_vecs.mean(axis=0)
+        cand_n = candidate_vec / (np.linalg.norm(candidate_vec) + 1e-8)
+        ref_n = ref_vec / (np.linalg.norm(ref_vec) + 1e-8)
+        return float(cand_n @ ref_n)
+
+    def _feature_extractor_similarity(
+        self, frame_bgr: np.ndarray, box: Box, precomputed_feature: np.ndarray | None = None,
+    ) -> float | None:
+        """cross_check_source="feature_extractor" (default): embeds the
+        candidate crop with stage1.feature_extractor (an INDEPENDENT model
+        from GeCo2's own Hiera backbone) and compares against Stage 1's
+        own reference embedding(s) -- the SAME ones
+        stage4.geco2_redetect_cosine_filter already cross-checks GeCo2
+        re-detects against. Returns None (caller refuses to add) if
+        prototype.npz isn't available.
+
+        When accuracy.cheap_boosters.multi_reference_embedding is on and
+        per-ref vectors are available, scores against each of the 3
+        reference images separately and pools with
+        accuracy.cheap_boosters.multi_ref_pooling (mean|max) instead of
+        collapsing to the single fused prototype vector first -- see
+        __init__'s cross_check_per_ref_features docstring for why.
+        """
+        if self._cross_extractor is None and precomputed_feature is None:
+            if not self._cross_prototype_path.exists():
+                if not self._warned_cross_unavailable:
+                    log.warning(
+                        "[Stage123-GeCo2] %s: dynamic_prototype.cross_check_source="
+                        "'feature_extractor' but no prototype.npz found at %s -- "
+                        "dynamic_prototype disabled this run (needs Stage 1 to have "
+                        "built one).", self.sample_id, self._cross_prototype_path,
+                    )
+                    self._warned_cross_unavailable = True
+                return None
+            from aero_eyes.models.features import build_feature_extractor
+            from aero_eyes.utils.io import read_prototype
+
+            self._cross_extractor = build_feature_extractor(self.cfg)
+            self._cross_prototype, _, self._cross_per_ref_features = read_prototype(self._cross_prototype_path)
+        if precomputed_feature is not None and self._cross_prototype is None:
+            return None  # prototype.npz unavailable and no lazy-load was attempted
+
+        feat = (
+            precomputed_feature if precomputed_feature is not None
+            else self._cross_extractor.extract_crops(
+                frame_bgr, [box],
+                pad_ratio=self.cfg.stage2.candidate.feature_crop_pad,
+                batch_size=self.cfg.runtime.batch_size,
+            )[0]
+        )
+
+        use_multi_ref = (
+            self.cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+            and self.cfg.accuracy.cheap_boosters.multi_reference_embedding
+            and self._cross_per_ref_features
+        )
+        if use_multi_ref:
+            sims = np.array([float(feat @ ref_feat) for ref_feat in self._cross_per_ref_features])
+            pooling = self.cfg.accuracy.cheap_boosters.multi_ref_pooling
+            return float(sims.max()) if pooling == "max" else float(sims.mean())
+        return float(feat @ self._cross_prototype)
+
+
 class _GeCo2Args:
     """Minimal stand-in for the argparse.Namespace GECO2.build_model expects."""
 
