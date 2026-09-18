@@ -840,6 +840,27 @@ class GeCo2DynamicPrototypeTracker:
         self._cross_per_ref_features = cross_check_per_ref_features
         self._cross_prototype_path = work_dir / cfg.stage1.prototype.cache_name
         self._warned_cross_unavailable = False
+        # Diagnostic counters ONLY (never read by offer()/effective_prototype()
+        # themselves) -- log_summary() reports these at end of run so a run
+        # producing ZERO dynamic tokens has a way to tell WHERE it stalled
+        # (never offered a box at all vs. never got min_consecutive_hits in a
+        # row vs. cross-check consistently rejecting) instead of the silent
+        # "nothing happened, no idea why" every non-summary path here leaves
+        # at default INFO log level (per-candidate detail is log.debug, easy
+        # to miss -- same class of observability gap stage4's
+        # keep_tracking_on_missed_keyframe had before detections.json's
+        # empty-keyframe omission bug was found).
+        self._n_offers = 0
+        self._n_confirmed = 0
+        self._n_cross_check_unavailable = 0
+        self._n_cross_check_rejected = 0
+        self._n_appended = 0
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype tracker built (max_tokens=%d, "
+            "min_consecutive_hits=%d, consecutive_hits_iou=%.2f, cross_check_source=%s, "
+            "cross_check_threshold=%.2f)", sample_id, dp_cfg.max_tokens, dp_cfg.min_consecutive_hits,
+            dp_cfg.consecutive_hits_iou, dp_cfg.cross_check_source, dp_cfg.cross_check_threshold,
+        )
 
     def dynamic_token_count(self) -> int:
         """Number of dynamic tokens accepted so far (excludes the 3
@@ -878,9 +899,11 @@ class GeCo2DynamicPrototypeTracker:
         """
         if not self.dp_cfg.enabled:
             return
+        self._n_offers += 1
         confirmed = self._confirmer.offer(box)
         if confirmed is None:
             return  # not yet min_consecutive_hits in a row -- keep waiting
+        self._n_confirmed += 1
 
         # One extra backbone forward pass -- only for a box that ALREADY
         # cleared both GeCo2's own threshold and consecutive-hit
@@ -892,8 +915,10 @@ class GeCo2DynamicPrototypeTracker:
 
         sim = self._cross_check_similarity(frame_bgr, confirmed, new_tokens, precomputed_feature)
         if sim is None:
+            self._n_cross_check_unavailable += 1
             return  # cross-check unavailable this run -- refuse to add rather than trust GeCo2 alone
         if sim < self.dp_cfg.cross_check_threshold:
+            self._n_cross_check_rejected += 1
             log.debug(
                 "[Stage123-GeCo2] %s: dynamic_prototype candidate at frame region "
                 "(%.0f,%.0f,%.0f,%.0f) rejected (cross_check sim=%.3f < %.3f)",
@@ -902,6 +927,7 @@ class GeCo2DynamicPrototypeTracker:
             )
             return
 
+        self._n_appended += 1
         self._dynamic_tokens.append(new_tokens)
         if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
             self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
@@ -910,6 +936,26 @@ class GeCo2DynamicPrototypeTracker:
             "source=%s) -- %d/%d dynamic token(s) active",
             self.sample_id, sim, self.dp_cfg.cross_check_source,
             len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+        )
+
+    def log_summary(self) -> None:
+        """Call once after the keyframe loop finishes -- reports WHERE
+        offers stalled if dynamic_token_count() ended up at 0, since every
+        rejection path in offer() is either a silent early-return (no log
+        at all) or log.debug (invisible at the default INFO level): was
+        offer() never even called (0 offers -- check boxes/results are
+        actually non-empty), never confirmed (0 confirmed -- the
+        consecutive-hit gate never saw 2 spatially-agreeing keyframes in a
+        row, e.g. box_iou keeps missing consecutive_hits_iou on a fast/
+        jittery target), or confirmed but cross-check kept rejecting
+        (n_confirmed > 0 but n_appended == 0 -- try a lower
+        cross_check_threshold or cross_check_source="hiera")."""
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype summary -- %d offer(s), %d passed "
+            "consecutive-hit gate, %d cross-check unavailable, %d cross-check rejected, "
+            "%d appended (%d/%d active at end)",
+            self.sample_id, self._n_offers, self._n_confirmed, self._n_cross_check_unavailable,
+            self._n_cross_check_rejected, self._n_appended, len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
 
     def _cross_check_similarity(

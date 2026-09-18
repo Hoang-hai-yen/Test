@@ -715,6 +715,8 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             detector, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
             on_result=_offer_best,
         )
+        if dyn_proto_tracker is not None:
+            dyn_proto_tracker.log_summary()
 
         # dynamic_prototype.second_pass (opt-in): pass 1 above only ever
         # saw a GROWING prototype, so early frames judged against just the
@@ -927,6 +929,8 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
         detector, extractor, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, cfg,
         on_result=_offer_best,
     )
+    if dyn_proto_tracker is not None:
+        dyn_proto_tracker.log_summary()
 
     # dynamic_prototype.second_pass (opt-in): see run_stage123_geco2's own
     # wiring for the full rationale -- re-run the whole video once more

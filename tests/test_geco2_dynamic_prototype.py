@@ -242,6 +242,57 @@ def test_offer_precomputed_feature_multi_ref_pooling_gates_acceptance():
     assert eff is not tracker.base_prototype, "max-pooled per-ref score (1.0) should clear threshold=0.9"
 
 
+def test_offer_counters_track_where_candidates_stall():
+    """Diagnostic counters (log_summary's data source) must distinguish
+    the 3 failure points -- never offered, never confirmed, and confirmed
+    but cross-check rejected -- since offer()'s own early returns/debug
+    logs give no visibility into which one a zero-token run stalled at."""
+    cfg = _make_cfg(min_consecutive_hits=2, cross_check_threshold=0.9)
+    detector = _FakeDetector()
+    tracker = _make_tracker(cfg, detector=detector)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 0.5  # < 0.9
+    frame = np.zeros((10, 10, 3), dtype=np.uint8)
+    box = Box(10, 10, 20, 20, score=0.9)
+
+    tracker.offer(frame, box)  # 1st hit -- not yet confirmed (min_consecutive_hits=2)
+    assert tracker._n_offers == 1
+    assert tracker._n_confirmed == 0
+
+    tracker.offer(frame, box)  # 2nd agreeing hit -- confirmed, then cross-check rejects
+    assert tracker._n_offers == 2
+    assert tracker._n_confirmed == 1
+    assert tracker._n_cross_check_rejected == 1
+    assert tracker._n_appended == 0
+    assert tracker.dynamic_token_count() == 0
+
+
+def test_offer_counters_count_appended():
+    cfg = _make_cfg(min_consecutive_hits=1, cross_check_threshold=0.5)
+    tracker = _make_tracker(cfg)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 0.8
+    box = Box(10, 10, 20, 20, score=0.9)
+
+    tracker.offer(np.zeros((10, 10, 3), dtype=np.uint8), box)
+
+    assert tracker._n_offers == 1
+    assert tracker._n_confirmed == 1
+    assert tracker._n_appended == 1
+    assert tracker._n_cross_check_rejected == 0
+
+
+def test_offer_noop_when_disabled_does_not_increment_counters():
+    cfg = _make_cfg(enabled=False)
+    tracker = _make_tracker(cfg)
+    tracker.offer(np.zeros((10, 10, 3), dtype=np.uint8), Box(10, 10, 20, 20, score=0.9))
+    assert tracker._n_offers == 0
+
+
+def test_log_summary_does_not_raise(caplog):
+    cfg = _make_cfg()
+    tracker = _make_tracker(cfg)
+    tracker.log_summary()  # must not raise even with all counters at 0
+
+
 def test_hiera_similarity_without_shape_token():
     cfg = _make_cfg(cross_check_source="hiera")
     detector = _FakeDetector(use_shape_token=False)
