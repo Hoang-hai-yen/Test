@@ -145,6 +145,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 "refinement disabled this run (boxes left unchanged).",
                 sample_id, cfg.stage123_geco2.prototype_cache_name,
             )
+    elif box_refine_active and br_cfg.method == "sam2_native":
+        from aero_eyes.models.segmentation import SAM2Segmenter
+        box_refine_segmenter = SAM2Segmenter(cfg.stage123_geco2.repo_path)
 
     # For NoneTracker, we need proposal+matching on every frame. Which
     # detector backs re-detection must match whichever one produced
@@ -801,7 +804,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         if track_ok and box_refine_active:
                             br_attempts += 1
                             box_before_refine = box
-                            if br_cfg.method in ("sam_dense", "fastsam_dense"):
+                            if br_cfg.method in ("sam_dense", "fastsam_dense", "sam2_native"):
                                 from aero_eyes.utils.box_refine import refine_boxes_dense
                                 box = refine_boxes_dense(
                                     box_refine_segmenter, frame_bgr, [box],

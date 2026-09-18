@@ -1618,6 +1618,35 @@ class BoxRefineConfig(BaseModel):
                     way "sam"/"grabcut" were (see the IMPORTANT note
                     below) -- compare with scripts/check_box_refine_effect.py
                     and check_box_size_bias.py before trusting it.
+      sam2_native -- a GENUINELY independent SAM2: its OWN image encoder
+                    (Hiera-base-plus) AND OWN mask decoder, both from the
+                    SAME public checkpoint, run via a fresh encode pass on
+                    each refined FRAME (aero_eyes.models.segmentation.
+                    SAM2Segmenter) -- unlike "sam2_dense", which decodes
+                    from GeCo2's OWN detection-backbone features instead of
+                    running SAM2's encoder itself. In THIS project's GeCo2
+                    checkpoint the two are numerically close to equivalent
+                    (GECO2/train.sh passes --backbone_lr 0, so GeCo2's
+                    backbone stays frozen at that SAME checkpoint's original
+                    weights -- see GeCo2DynamicPrototypeTracker's neighbor
+                    discussion in aero_eyes/models/geco2_detector.py) --
+                    this method exists to verify that empirically (compare
+                    against sam2_dense on the same footage) rather than
+                    assume it, and to keep working correctly as an honestly
+                    independent baseline regardless of what any FUTURE
+                    GeCo2 checkpoint's backbone_lr was trained with. Needs
+                    the vendored GECO2/sam2 package's own hydra-core/
+                    omegaconf dependencies (see GECO2/install.sh) in
+                    addition to pipeline.detector=geco2's own requirements.
+                    Only available when pipeline.detector == "geco2" (reuses
+                    the vendored GECO2/sam2 package -- see
+                    stage123_geco2.repo_path). Costs one FULL SAM2 encoder
+                    forward pass per refined FRAME on top of whatever
+                    detector/tracker already ran -- heavier per-frame than
+                    "sam_dense" (MobileSAM's much smaller encoder) and than
+                    "sam2_dense" (reuses GeCo2's already-computed features
+                    for free). Not yet benchmarked -- compare with
+                    scripts/check_box_refine_effect.py before trusting it.
       fastsam_dense -- FastSAM-s (stage2.fastsam_s weights) "segment
                     everything" run ONCE per frame, then whichever
                     already-produced instance mask best matches a given
@@ -1659,7 +1688,7 @@ class BoxRefineConfig(BaseModel):
     produced them, unchanged.
     """
     enabled: bool = False
-    method: Literal["sam", "sam_dense", "grabcut", "sam2_dense", "fastsam_dense"] = "sam"
+    method: Literal["sam", "sam_dense", "grabcut", "sam2_dense", "fastsam_dense", "sam2_native"] = "sam"
     # Padding kept around the original box, as a fraction of the box's own
     # width/height. For "sam"/"grabcut": how much extra context to include
     # when CROPPING the region that gets segmented, so the segmenter isn't

@@ -249,6 +249,9 @@ def run_stage3(cfg, sample_id: str) -> Path:
                     "refinement disabled this run (boxes left unchanged).",
                     sample_id, cfg.stage123_geco2.prototype_cache_name,
                 )
+        elif br_cfg.method == "sam2_native":
+            from aero_eyes.models.segmentation import SAM2Segmenter
+            box_refine_segmenter = SAM2Segmenter(cfg.stage123_geco2.repo_path)
 
     # ---- Load prototype ----
     proto_path = work_dir / cfg.stage1.prototype.cache_name
@@ -532,12 +535,13 @@ def run_stage3(cfg, sample_id: str) -> Path:
             # diagnostic run would silently refine an already-refined box
             # a second time instead of comparing against the true original.
             pre_refine_detections[frame_idx] = result_dets
-            if br_cfg.method in ("sam_dense", "fastsam_dense"):
-                # One shared frame "encode" (MobileSAM's own embedding, or
-                # FastSAM's segment-everything pass) for every surviving box
-                # on this keyframe, instead of a crop+re-encode per box --
-                # see refine_boxes_dense's docstring. Same dispatch for both
-                # methods: box_refine_segmenter (built above) already
+            if br_cfg.method in ("sam_dense", "fastsam_dense", "sam2_native"):
+                # One shared frame "encode" (MobileSAM's own embedding,
+                # FastSAM's segment-everything pass, or a standalone SAM2's
+                # own encoder) for every surviving box on this keyframe,
+                # instead of a crop+re-encode per box -- see
+                # refine_boxes_dense's docstring. Same dispatch for all
+                # three methods: box_refine_segmenter (built above) already
                 # implements the set_frame()/segment_box_cached() interface
                 # this function drives generically, regardless of which
                 # concrete segmenter it is.

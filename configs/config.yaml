@@ -1085,7 +1085,7 @@ box_refine:
   #               outright -- a known FastSAM weak point on small objects).
   #               Not yet benchmarked -- compare with
   #               scripts/check_box_refine_effect.py before trusting it.
-  method: sam                # "sam" | "sam_dense" | "grabcut" | "sam2_dense" | "fastsam_dense"
+  method: sam                # "sam" | "sam_dense" | "grabcut" | "sam2_dense" | "fastsam_dense" | "sam2_native"
   # "sam"/"grabcut": padding kept around the box when CROPPING to segment.
   # "sam_dense": padding added to the box PROMPT itself before querying SAM
   #   -- without this, an undersized detector box rarely gets expanded back

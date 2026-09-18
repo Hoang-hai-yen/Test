@@ -584,3 +584,228 @@ class FastSAMSegmenter:
         if box_iou(self._cached_boxes[best_i], expanded) <= 0.0:
             return None
         return self._cached_masks[best_i]
+
+
+class SAM2Segmenter:
+    """box_refine.method == "sam2_native": a GENUINELY standalone SAM2 --
+    its OWN image encoder (Hiera-base-plus) AND its OWN mask decoder, both
+    loaded from the SAME public checkpoint and run independently of GeCo2
+    -- unlike box_refine.method="sam2_dense" (GeCo2Detector.sam2_refine_boxes),
+    which decodes masks from GeCo2's OWN detection-backbone features
+    instead of running a fresh SAM2 encoder pass.
+
+    Why this exists despite that being numerically almost the SAME
+    computation: GECO2/train.sh and train_1gpu.sh both pass
+    `--backbone_lr 0` (see GECO2/train.py's optimizer param groups), so
+    GeCo2's backbone is FROZEN at its original sam2_hiera_base_plus.pt
+    init -- meaning sam2_dense's "encoder" and this class's encoder are the
+    SAME frozen weights either way. This class exists so that fact can be
+    verified EMPIRICALLY (run both, compare) instead of assumed, and so it
+    keeps working correctly as a clean, properly-independent alternative if
+    a future GeCo2 checkpoint ever DOES fine-tune the backbone (at which
+    point sam2_dense and this class would no longer be equivalent, and
+    sam2_dense's masks would reflect a genuine encoder/decoder mismatch).
+
+    Mirrors MobileSAMSegmenter/FastSAMSegmenter's set_frame()/
+    segment_box_cached() shape so aero_eyes.utils.box_refine.
+    refine_boxes_dense drives any of the three identically -- add
+    "sam2_native" wherever "sam_dense"/"fastsam_dense" are already dispatch
+    targets.
+
+    Needs the vendored GECO2/sam2 package's OWN dependencies (hydra-core,
+    omegaconf -- see GECO2/req.txt / GECO2/install.sh) in addition to
+    whatever pipeline.detector=geco2 already requires; unavailable
+    (falls back to leaving boxes unchanged, same as every other segmenter
+    here) if those aren't installed.
+    """
+
+    _SAM2_CONFIG_NAME = "sam2_hiera_b+"
+    _SAM2_CHECKPOINT_URL = (
+        "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt"
+    )
+
+    def __init__(self, geco2_repo_path: str, device: str | None = None):
+        self.device = device or ("cuda" if _cuda_available() else "cpu")
+        self._predictor = None
+        self._available = False
+        try:
+            self._predictor = self._build_predictor(geco2_repo_path, self.device)
+            self._available = True
+            log.info("SAM2 (standalone, %s) loaded for box_refine.method=sam2_native on %s",
+                      self._SAM2_CONFIG_NAME, self.device)
+        except Exception as e:
+            log.warning(
+                "SAM2Segmenter unavailable (%s) -- box_refine.method=sam2_native disabled "
+                "this run, boxes left unchanged. Needs the vendored GECO2/sam2 package's own "
+                "deps (hydra-core, omegaconf) -- see GECO2/install.sh.", e,
+            )
+
+    @classmethod
+    def _load_sam2_package(cls, geco2_repo_path: str):
+        """Loads GECO2/sam2/sam2 (the vendored sam2 PACKAGE directory,
+        note the doubled path -- GECO2/sam2 is the vendored repo checkout,
+        GECO2/sam2/sam2 is the actual Python package inside it) directly by
+        file path and registers it under BOTH 'sam2' and 'sam2.sam2' in
+        sys.modules, WITHOUT modifying anything inside GECO2/.
+
+        Why both names are needed -- confirmed empirically, not
+        theoretical: this vendored copy's OWN internal self-imports are
+        inconsistent between files. Some (e.g. modeling/backbones/
+        hieradet.py) use `from sam2.modeling... import ...` (correct if
+        GECO2/sam2 itself were the sys.path entry, i.e. `sam2` == this
+        package directly -- the layout the ORIGINAL un-vendored repo has).
+        Others (e.g. modeling/sam2_base.py, and GECO2/models/sam_mask.py's
+        own already-working `from sam2.sam2.modeling... import ...`) use
+        the doubled prefix (correct if GECO2 itself is the sys.path entry,
+        i.e. `sam2` resolves to the OUTER empty folder and `sam2.sam2` is
+        this package -- which is how GeCo2Detector's own sam2_dense path
+        already imports it via _ensure_geco2_on_path). No single sys.path
+        arrangement satisfies both conventions at once; aliasing 'sam2.sam2'
+        to the SAME module object as 'sam2' does, regardless of which
+        convention a given vendored file happens to use.
+
+        Forcibly overwrites any PRE-EXISTING sys.modules['sam2'] (e.g. if
+        GeCo2Detector's own sam2_dense path already imported the OLD,
+        differently-resolved 'sam2' namespace-package in this same
+        process) rather than relying on import-order/sys.path-priority
+        alone, which would only work if this runs BEFORE any GeCo2Detector
+        use in the same process -- confirmed by testing that classes
+        already imported under the old registration (e.g.
+        GECO2.models.sam_mask.MaskProcessor) keep working fine afterward,
+        since only FUTURE imports consult the swapped sys.modules entry.
+        """
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        sam2_repo = Path(geco2_repo_path).resolve() / "sam2"
+        pkg_dir = sam2_repo / "sam2"
+        already_correct = (
+            "sam2" in sys.modules
+            and getattr(sys.modules["sam2"], "__file__", None) == str(pkg_dir / "__init__.py")
+        )
+        if already_correct:
+            return sys.modules["sam2"]
+
+        spec = importlib.util.spec_from_file_location(
+            "sam2", str(pkg_dir / "__init__.py"), submodule_search_locations=[str(pkg_dir)],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["sam2"] = module
+        sys.modules["sam2.sam2"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @classmethod
+    def _build_predictor(cls, geco2_repo_path: str, device: str):
+        """Builds a real sam2.sam2_image_predictor.SAM2ImagePredictor from
+        the vendored GECO2/sam2 package, WITHOUT modifying anything inside
+        GECO2/ -- same "reach in from outside" approach GeCo2Detector.
+        sam2_refine_boxes already uses for the mask_decoder it reuses.
+
+        Bypasses build_sam2()'s own hydra compose()/initialize_config_dir
+        flow entirely -- that function's config's `_target_` strings
+        (e.g. "sam2.modeling.sam2_base.SAM2Base") are the SINGLE-prefix
+        convention, which only resolves correctly if GECO2/sam2 itself
+        (not GECO2) were the sys.path entry -- the opposite of what
+        _load_sam2_package needs for the doubled-prefix files (see its own
+        docstring). Loading the yaml directly via OmegaConf and calling
+        hydra.utils.instantiate() on it directly sidesteps compose()'s own
+        config-search-path machinery, which is what needed that convention
+        in the first place.
+
+        Checkpoint: loaded the SAME way GECO2/models/sam_mask.py and
+        GECO2/models/counter_infer.py already load their own copies of this
+        exact checkpoint (torch.hub download -> strict=False state_dict
+        load) rather than build_sam2()'s own ckpt_path loading (which
+        raises on ANY missing/unexpected key -- too brittle here). Confirmed
+        empirically: 0 missing / 0 unexpected against this exact config.
+        """
+        from pathlib import Path
+
+        import torch
+        from hydra.utils import instantiate
+        from omegaconf import OmegaConf
+
+        from aero_eyes.models.geco2_detector import _ensure_geco2_on_path
+
+        _ensure_geco2_on_path(geco2_repo_path)  # GECO2's own bare `models`/`utils` imports
+        cls._load_sam2_package(geco2_repo_path)
+
+        config_path = Path(geco2_repo_path).resolve() / "sam2" / "sam2_configs" / f"{cls._SAM2_CONFIG_NAME}.yaml"
+        cfg = OmegaConf.load(config_path)
+        OmegaConf.resolve(cfg)
+        model = instantiate(cfg.model, _recursive_=True)
+        checkpoint = torch.hub.load_state_dict_from_url(cls._SAM2_CHECKPOINT_URL, map_location="cpu")["model"]
+        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+        if missing or unexpected:
+            log.warning(
+                "SAM2Segmenter: checkpoint load left %d missing / %d unexpected param(s) -- "
+                "expected to be 0 for a matching hiera_base_plus checkpoint+config; results "
+                "may be unreliable.", len(missing), len(unexpected),
+            )
+        model = model.to(device)
+        model.eval()
+
+        from sam2.sam2.sam2_image_predictor import SAM2ImagePredictor
+        return SAM2ImagePredictor(model)
+
+    def set_frame(self, frame_bgr: np.ndarray) -> bool:
+        """Encode `frame_bgr` ONCE via SAM2's own image encoder -- same
+        shape/contract as MobileSAMSegmenter.set_frame. Returns False if
+        SAM2 is unavailable or encoding fails."""
+        if not self._available:
+            return False
+        try:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self._predictor.set_image(frame_rgb)
+            return True
+        except Exception as e:
+            log.warning("SAM2 (standalone) set_frame failed (%s).", e)
+            return False
+
+    def segment_box_cached(
+        self, box: Box, margin: float = 0.0, use_center_point: bool = False,
+    ) -> np.ndarray | None:
+        """Same contract/semantics as MobileSAMSegmenter.segment_box_cached
+        (margin-expanded box prompt, optional center-point prompt +
+        connected-component isolation, best-of-multimask-output picked by
+        SAM2's own predicted IoU) -- see that method's own docstring for
+        the full rationale, identical here since both wrap a SAM-family
+        box-prompted decoder through the same predict() shape."""
+        if not self._available:
+            return None
+        try:
+            bw, bh = box.x2 - box.x1, box.y2 - box.y1
+            mx, my = bw * margin, bh * margin
+            box_arr = np.array([box.x1 - mx, box.y1 - my, box.x2 + mx, box.y2 + my])
+            if use_center_point:
+                point_coords = np.array([[(box.x1 + box.x2) / 2.0, (box.y1 + box.y2) / 2.0]])
+                point_labels = np.array([1])
+            else:
+                point_coords = None
+                point_labels = None
+            masks, scores, _ = self._predictor.predict(
+                point_coords=point_coords, point_labels=point_labels, box=box_arr,
+                multimask_output=True,
+            )
+            best_idx = int(scores.argmax())
+            mask = masks[best_idx].astype(bool)
+            if use_center_point:
+                from aero_eyes.utils.geometry import isolate_component_at_point
+                px, py = point_coords[0]
+                mask = isolate_component_at_point(mask, int(px), int(py))
+            if not mask.any():
+                return None
+            return mask
+        except Exception as e:
+            log.warning("SAM2 (standalone) box-refine inference failed (%s).", e)
+            return None
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False

@@ -117,6 +117,17 @@ def check_sample(cfg, sample_id: str) -> None:
             print("  warning: MobileSAM unavailable (weights missing/failed to load) -- "
                   "every box will silently fall back UNCHANGED. This alone can explain "
                   "a full pipeline run showing zero effect.")
+    elif br_cfg.method == "fastsam_dense":
+        from aero_eyes.models.segmentation import FastSAMSegmenter
+        fs_cfg = cfg.stage2.fastsam_s
+        segmenter = FastSAMSegmenter(weights=fs_cfg.weights, conf=fs_cfg.conf, iou=fs_cfg.iou, imgsz=fs_cfg.imgsz)
+    elif br_cfg.method == "sam2_native":
+        from aero_eyes.models.segmentation import SAM2Segmenter
+        segmenter = SAM2Segmenter(cfg.stage123_geco2.repo_path)
+        if not segmenter._available:
+            print("  warning: SAM2 (standalone) unavailable -- every box will silently "
+                  "fall back UNCHANGED. Needs the vendored GECO2/sam2 package's own deps "
+                  "(hydra-core, omegaconf) -- see GECO2/install.sh.")
     elif br_cfg.method == "sam2_dense":
         from aero_eyes.models.geco2_detector import load_geco2_detector_and_prototype
         geco2_detector, geco2_prototype = load_geco2_detector_and_prototype(cfg, work_dir)
@@ -152,11 +163,14 @@ def check_sample(cfg, sample_id: str) -> None:
             continue
 
         original_boxes = [det.box for det in dets]
-        if br_cfg.method == "sam_dense":
+        if br_cfg.method in ("sam_dense", "fastsam_dense", "sam2_native"):
             from aero_eyes.utils.box_refine import refine_boxes_dense
             refined_boxes = refine_boxes_dense(
                 segmenter, frame_bgr, original_boxes,
                 min_iou_with_original=br_cfg.min_iou_with_original,
+                context_margin=br_cfg.context_margin,
+                adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                use_center_point=br_cfg.use_center_point_prompt,
             )
         elif br_cfg.method == "sam2_dense":
             if geco2_detector is not None:
