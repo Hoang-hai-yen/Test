@@ -63,6 +63,96 @@ def _pool_sims(sims_per_ref: list, pooling: str) -> np.ndarray:
     return np.mean(sims_per_ref, axis=0)
 
 
+def _otsu_threshold(sims: np.ndarray, num_bins: int) -> float:
+    """Otsu's method on a real-valued 1-D array: histogram into num_bins,
+    then pick the bin-edge split maximizing the between-class variance of
+    the "below" vs. "at-or-above" partitions -- the standard 2-class Otsu
+    algorithm (cv2's THRESH_OTSU only accepts 8-bit input, so this is a
+    direct numpy implementation instead of reusing it). No z multiplier:
+    the split is wherever the data's OWN two implied classes separate
+    best, so it self-adapts to how much of `sims` is background vs.
+    signal instead of assuming a fixed offset from the center.
+    """
+    lo, hi = float(sims.min()), float(sims.max())
+    if hi <= lo:
+        return lo  # degenerate: every value identical, no split possible
+    hist, edges = np.histogram(sims, bins=num_bins, range=(lo, hi))
+    hist = hist.astype(np.float64)
+    bin_centers = (edges[:-1] + edges[1:]) / 2.0
+
+    weight_below = np.cumsum(hist)
+    weight_above = hist.sum() - weight_below
+    cum_sum = np.cumsum(hist * bin_centers)
+    total_sum = cum_sum[-1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_below = cum_sum / weight_below
+        mean_above = (total_sum - cum_sum) / weight_above
+        between_class_var = weight_below * weight_above * (mean_below - mean_above) ** 2
+    # Splits with an empty class (all-below or all-above the candidate bin)
+    # produce NaN from the 0/0 division above -- not a valid 2-class split.
+    between_class_var = np.nan_to_num(between_class_var, nan=-1.0)
+    return float(bin_centers[int(np.argmax(between_class_var))])
+
+
+def _gaussian_intersection(mean1: float, std1: float, w1: float, mean2: float, std2: float, w2: float) -> float:
+    """x where w1*N(x; mean1, std1) == w2*N(x; mean2, std2) -- the natural
+    decision boundary between two 1-D Gaussian mixture components. Solves
+    the log-likelihood-ratio equation analytically (quadratic in the
+    general case, linear when std1==std2); falls back to the plain
+    midpoint if the quadratic has no real root between the two means (can
+    happen when the components nearly coincide)."""
+    if abs(std1 - std2) < 1e-9:
+        denom = mean2 - mean1
+        if abs(denom) < 1e-12:
+            return float((mean1 + mean2) / 2.0)
+        return float((mean1 + mean2) / 2.0 + (std1 ** 2) * np.log(w2 / w1) / denom)
+
+    a = 1.0 / (2 * std1 ** 2) - 1.0 / (2 * std2 ** 2)
+    b = mean2 / (std2 ** 2) - mean1 / (std1 ** 2)
+    c = (mean1 ** 2) / (2 * std1 ** 2) - (mean2 ** 2) / (2 * std2 ** 2) - np.log((std2 * w1) / (std1 * w2))
+    disc = b ** 2 - 4 * a * c
+    if disc < 0:
+        return float((mean1 + mean2) / 2.0)
+    sqrt_disc = np.sqrt(disc)
+    roots = [(-b + sqrt_disc) / (2 * a), (-b - sqrt_disc) / (2 * a)]
+    lo, hi = sorted((mean1, mean2))
+    in_range = [r for r in roots if lo <= r <= hi]
+    return float(in_range[0]) if in_range else float((mean1 + mean2) / 2.0)
+
+
+def _gmm_threshold(sims: np.ndarray, min_separation_std: float, fallback_percentile: float) -> tuple[float, str]:
+    """Fits 1- and 2-component 1-D Gaussian mixtures to `sims`. Bimodal
+    (better BIC AND components separated by >= min_separation_std pooled
+    std) -> threshold at the analytic crossing point between the two
+    fitted Gaussians. Not bimodal (e.g. a low-FP sample where `sims` is
+    really one cluster of mostly true positives, nothing resembling a
+    second background cluster) -> forcing a 2-cluster split onto it is
+    meaningless, so falls back to a permissive percentile cut instead.
+    Returns (threshold, stat_label) with stat_label recording which path
+    was taken, for observability (matches "mean/std"/"median/MAD" style).
+    """
+    from sklearn.mixture import GaussianMixture
+
+    x = sims.reshape(-1, 1)
+    gmm1 = GaussianMixture(n_components=1, random_state=0).fit(x)
+    gmm2 = GaussianMixture(n_components=2, random_state=0).fit(x)
+
+    means = gmm2.means_.flatten()
+    stds = np.sqrt(gmm2.covariances_.flatten())
+    weights = gmm2.weights_
+    lo_idx, hi_idx = (0, 1) if means[0] <= means[1] else (1, 0)
+    pooled_std = float(np.sqrt((stds[lo_idx] ** 2 + stds[hi_idx] ** 2) / 2.0)) + 1e-8
+    separation = (means[hi_idx] - means[lo_idx]) / pooled_std
+
+    if gmm2.bic(x) < gmm1.bic(x) and separation >= min_separation_std:
+        threshold = _gaussian_intersection(
+            float(means[lo_idx]), float(stds[lo_idx]), float(weights[lo_idx]),
+            float(means[hi_idx]), float(stds[hi_idx]), float(weights[hi_idx]),
+        )
+        return threshold, "gmm_bimodal"
+    return float(np.percentile(sims, fallback_percentile)), "gmm_unimodal_fallback"
+
+
 def compute_adaptive_threshold(
     all_sims: np.ndarray,
     all_sims_original_refs: np.ndarray,
@@ -84,25 +174,50 @@ def compute_adaptive_threshold(
     so the threshold) up for everyone -- anchoring keeps the threshold
     computation stable regardless.
 
-    stat_label is "mean/std" or "median/MAD" (s3.adaptive_threshold_robust)
-    -- median/MAD is far less moved by a handful of outlier-high scores,
-    exactly what a narrow dynamic_prototype addition produces.
+    stat_label is "mean/std"/"median/MAD" (s3.adaptive_threshold_robust,
+    method="z_score"), "otsu" (method="otsu"), or "gmm_bimodal"/
+    "gmm_unimodal_fallback" (method="gmm") -- see
+    Stage3Config.adaptive_threshold_method's own docstring for the full
+    rationale behind offering "otsu"/"gmm" as alternatives to a fixed z
+    multiplier. Both fall back to the z_score path (label suffixed
+    "_min_samples_fallback") when stats_sims has fewer than
+    s3.adaptive_threshold_min_samples points -- too little data for a
+    distribution-SHAPE method to be reliable.
     """
     stats_sims = all_sims_original_refs if s3.adaptive_threshold_anchor_to_original_refs else all_sims
 
-    if s3.adaptive_threshold_robust:
-        center = float(np.median(stats_sims))
-        # 1.4826 = consistency constant that makes MAD comparable to std
-        # under a roughly-normal distribution, so adaptive_z_score means
-        # roughly the same thing in either mode.
-        spread = float(1.4826 * np.median(np.abs(stats_sims - center)))
-        stat_label = "median/MAD"
-    else:
-        center = float(stats_sims.mean())
-        spread = float(stats_sims.std())
-        stat_label = "mean/std"
+    method = s3.adaptive_threshold_method
+    if method in ("otsu", "gmm") and len(stats_sims) < s3.adaptive_threshold_min_samples:
+        log.warning(
+            "stage3.adaptive_threshold_method=%r but only %d similarity samples on hand "
+            "(< adaptive_threshold_min_samples=%d) -- falling back to z_score for this sample.",
+            method, len(stats_sims), s3.adaptive_threshold_min_samples,
+        )
+        method = "z_score"
 
-    raw_threshold = center + s3.adaptive_z_score * spread
+    if method == "otsu":
+        center, spread = float(stats_sims.mean()), float(stats_sims.std())
+        raw_threshold = _otsu_threshold(stats_sims, s3.adaptive_otsu_bins)
+        stat_label = "otsu"
+    elif method == "gmm":
+        center, spread = float(stats_sims.mean()), float(stats_sims.std())
+        raw_threshold, stat_label = _gmm_threshold(
+            stats_sims, s3.adaptive_gmm_min_separation_std, s3.adaptive_gmm_fallback_percentile,
+        )
+    else:
+        if s3.adaptive_threshold_robust:
+            center = float(np.median(stats_sims))
+            # 1.4826 = consistency constant that makes MAD comparable to std
+            # under a roughly-normal distribution, so adaptive_z_score means
+            # roughly the same thing in either mode.
+            spread = float(1.4826 * np.median(np.abs(stats_sims - center)))
+            stat_label = "median/MAD"
+        else:
+            center = float(stats_sims.mean())
+            spread = float(stats_sims.std())
+            stat_label = "mean/std"
+        raw_threshold = center + s3.adaptive_z_score * spread
+
     # adaptive_min_floor is calibrated for cosine's roughly [-1,1] range.
     # l1/l2 scores are negated distances (unbounded, typically negative),
     # so the floor has no meaningful interpretation there -- skip it.

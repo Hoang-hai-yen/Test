@@ -457,6 +457,48 @@ class Stage3Config(BaseModel):
     # anchoring picks WHICH distribution to summarize, this picks HOW to
     # summarize it). False (default) = mean/std, unchanged.
     adaptive_threshold_robust: bool = False
+    # "z_score" (default, unchanged): threshold = center + adaptive_z_score
+    #   * spread, per adaptive_threshold_robust above. A single fixed z
+    #   multiplier can't serve every video at once: a LOW-FP sample's
+    #   all_sims is mostly true positives already clustered near the top,
+    #   so center is already high and mean/median+z*std OVERSHOOTS,
+    #   cutting real positives that are merely "average" within that
+    #   already-good population (needs a LOWER z) -- while a HIGH-FP
+    #   sample's center is dragged down by the FP mass, so the same z
+    #   barely clears it, letting FPs through (needs a HIGHER z). The
+    #   right z isn't a property of the similarity metric, it's a property
+    #   of how much of all_sims is background vs. signal -- which varies
+    #   per video, so no single z serves both regimes.
+    # "otsu": Otsu's method (the classic image-binarization algorithm,
+    #   applied directly to the real-valued all_sims distribution instead
+    #   of an 8-bit pixel histogram) -- finds the split maximizing
+    #   between-class separation, with NO z multiplier to hand-tune at
+    #   all. Self-adapts to how separated the FP/TP populations actually
+    #   are for this video, instead of assuming a fixed offset from center.
+    # "gmm": fits 1- and 2-component 1D Gaussian mixtures to all_sims. If
+    #   the 2-component fit is genuinely bimodal (better BIC AND the 2
+    #   component means separated by >= adaptive_gmm_min_separation_std
+    #   pooled std), thresholds at the analytic crossing point between the
+    #   2 fitted Gaussians -- the natural FP/TP decision boundary. If NOT
+    #   bimodal (e.g. a low-FP sample where all_sims is really just one
+    #   cluster of mostly true positives, nothing resembling a second
+    #   background cluster), forcing a 2-cluster split onto it is
+    #   meaningless -- falls back to adaptive_gmm_fallback_percentile
+    #   instead (a permissive cut: a unimodal all_sims here usually means
+    #   "most of these candidates are already good").
+    # Both "otsu"/"gmm" fall back to "z_score" (with a warning) when
+    # all_sims has fewer than adaptive_threshold_min_samples points -- too
+    # little data for a distribution-SHAPE method to be reliable (same
+    # class of problem as topk_fusion's min_window_for_zscore).
+    # NOT YET VALIDATED against this project's own footage -- compare
+    # against the z_score baseline (e.g. scripts/sweep_zscore_loocv.py-
+    # style before/after) on your own videos before trusting either in
+    # production, same as every other opt-in accuracy knob in this project.
+    adaptive_threshold_method: Literal["z_score", "otsu", "gmm"] = "z_score"
+    adaptive_threshold_min_samples: int = 20
+    adaptive_otsu_bins: int = 256
+    adaptive_gmm_min_separation_std: float = 1.5
+    adaptive_gmm_fallback_percentile: float = 20.0  # keep roughly the top (100 - this)% when no real bimodality is found
     calibrate: CalibrateConfig = CalibrateConfig()
     dynamic_prototype: DynamicPrototypeConfig = DynamicPrototypeConfig()
 

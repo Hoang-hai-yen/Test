@@ -281,6 +281,22 @@ stage3:
   # with adaptive_threshold_anchor_to_original_refs above (independent knobs).
   # false (default) = mean/std, unchanged.
   adaptive_threshold_robust: false
+  # EXPERIMENTAL, not yet validated on this project's own footage -- see
+  # Stage3Config.adaptive_threshold_method's own docstring for the full
+  # rationale. z_score (default) picks the threshold as center +
+  # adaptive_z_score*spread -- one fixed z can't serve both a low-FP video
+  # (needs a LOWER z, mean/median is already near the true-positive level)
+  # and a high-FP video (needs a HIGHER z, mean/median is dragged down by
+  # the FP mass) at once. otsu/gmm instead adapt the threshold to the
+  # ACTUAL shape of this video's own similarity distribution, no z to
+  # hand-tune. Compare against the z_score baseline on your own footage
+  # (e.g. scripts/sweep_zscore_loocv.py-style before/after) before trusting
+  # either in production.
+  adaptive_threshold_method: z_score   # z_score | otsu | gmm
+  adaptive_threshold_min_samples: 20   # otsu/gmm fall back to z_score below this many candidates -- too little data for a shape-based split to be reliable
+  adaptive_otsu_bins: 256
+  adaptive_gmm_min_separation_std: 1.5   # gmm: min separation (in pooled std) between the 2 fitted components to trust a bimodal split
+  adaptive_gmm_fallback_percentile: 20.0 # gmm: percentile cut used when the fit looks unimodal (no real background cluster found)
   # Optional auto-calibration of match_threshold on a labelled subset.
   calibrate:
     enabled: false
