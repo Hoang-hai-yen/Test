@@ -499,6 +499,31 @@ class Stage3Config(BaseModel):
     adaptive_otsu_bins: int = 256
     adaptive_gmm_min_separation_std: float = 1.5
     adaptive_gmm_fallback_percentile: float = 20.0  # keep roughly the top (100 - this)% when no real bimodality is found
+    # EXPERIMENTAL, opt-in: real-time-deployment-compatible variant of
+    # adaptive_threshold. Everything above (adaptive_threshold_method's
+    # z_score/otsu/gmm) needs the WHOLE video's all_sims computed up front
+    # -- fine for offline/batch evaluation on a pre-recorded video file,
+    # but incompatible with a live feed where keyframe N+1's candidates
+    # don't exist yet when keyframe N needs a decision NOW. When true, the
+    # threshold for keyframe N is instead computed from a RUNNING WINDOW
+    # of only the STRICTLY-PRIOR keyframes' own similarity scores (the most
+    # recent adaptive_threshold_online_window samples -- see stage3.py's
+    # OnlineAdaptiveThreshold) -- reuses compute_adaptive_threshold's
+    # z_score/otsu/gmm dispatch unchanged, just fed a causal buffer instead
+    # of the whole video. Cold start (fewer than adaptive_threshold_min_
+    # samples observed so far) falls back to adaptive_min_floor, same
+    # philosophy as stage123_geco2.dynamic_prototype's own cold start.
+    # Mutually exclusive with stage3.dynamic_prototype below (also a
+    # whole-video, 2-pass batch mechanism) -- forced off with a warning if
+    # both are enabled, since dynamic_prototype's own rounds need the
+    # entire video's candidates just as much as the batch threshold does.
+    # NOT YET VALIDATED -- an online/causal threshold is inherently less
+    # stable than one computed on the whole video (same cold-start
+    # tradeoff stage123_geco2.dynamic_prototype already accepts): compare
+    # against the batch baseline on recorded footage before trusting it
+    # for a live feed.
+    adaptive_threshold_online: bool = False
+    adaptive_threshold_online_window: int = 200
     calibrate: CalibrateConfig = CalibrateConfig()
     dynamic_prototype: DynamicPrototypeConfig = DynamicPrototypeConfig()
 

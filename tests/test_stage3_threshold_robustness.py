@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from aero_eyes.config import Stage3Config
-from aero_eyes.stages.stage3 import compute_adaptive_threshold
+from aero_eyes.stages.stage3 import OnlineAdaptiveThreshold, compute_adaptive_threshold
 
 
 def test_anchor_to_original_refs_ignores_dynamic_prototype_inflation():
@@ -174,3 +174,79 @@ def test_adaptive_min_floor_still_applies_to_otsu_and_gmm():
     s3_gmm = Stage3Config(adaptive_threshold=True, adaptive_min_floor=0.05, adaptive_threshold_method="gmm")
     thresh_gmm, *_ = compute_adaptive_threshold(all_sims, all_sims, "cosine", s3_gmm)
     assert thresh_gmm == pytest.approx(0.05)
+
+
+def test_online_threshold_cold_start_uses_floor():
+    """Fewer than adaptive_threshold_min_samples observed so far -- no
+    distribution exists yet to compute z_score/otsu/gmm from, must fall
+    back to adaptive_min_floor (real-time deployment can't wait for a
+    whole video's worth of data before making its first decisions)."""
+    s3 = Stage3Config(adaptive_threshold=True, adaptive_min_floor=0.07, adaptive_threshold_min_samples=10)
+    online = OnlineAdaptiveThreshold(s3)
+
+    thresh, label = online.threshold_for_next_frame()
+    assert label == "online_cold_start"
+    assert thresh == pytest.approx(0.07)
+
+    online.observe(np.array([0.5, 0.5, 0.5]))  # only 3 of 10 needed -- still cold
+    thresh, label = online.threshold_for_next_frame()
+    assert label == "online_cold_start"
+    assert thresh == pytest.approx(0.07)
+
+
+def test_online_threshold_warms_up_and_matches_batch_z_score():
+    """Once enough history has accumulated, the running-window threshold
+    must equal compute_adaptive_threshold applied to that SAME buffer --
+    OnlineAdaptiveThreshold is meant to reuse that dispatch unchanged, just
+    fed a causal window instead of the whole video."""
+    s3 = Stage3Config(
+        adaptive_threshold=True, adaptive_z_score=1.0, adaptive_min_floor=0.0,
+        adaptive_threshold_min_samples=5,
+    )
+    online = OnlineAdaptiveThreshold(s3)
+    history = np.array([0.10, 0.12, 0.11, 0.09, 0.13])
+    online.observe(history)
+
+    thresh, label = online.threshold_for_next_frame()
+    assert label == "online_mean/std"
+
+    expected, *_ = compute_adaptive_threshold(history, history, "cosine", s3)
+    assert thresh == pytest.approx(expected)
+
+
+def test_online_threshold_is_causal_not_influenced_by_its_own_frame():
+    """A frame's own similarity scores must NOT affect the threshold used
+    to judge that SAME frame -- observe() only feeds the buffer for
+    FUTURE frames' decisions."""
+    s3 = Stage3Config(
+        adaptive_threshold=True, adaptive_z_score=1.0, adaptive_min_floor=0.0,
+        adaptive_threshold_min_samples=5,
+    )
+    online = OnlineAdaptiveThreshold(s3)
+    online.observe(np.array([0.10, 0.12, 0.11, 0.09, 0.13]))
+
+    # Calling threshold_for_next_frame() twice without an intervening
+    # observe() (i.e. simulating "haven't decided this frame's fate yet")
+    # must return the IDENTICAL threshold both times -- it cannot have
+    # been mutated by merely being read.
+    thresh_a, _ = online.threshold_for_next_frame()
+    thresh_b, _ = online.threshold_for_next_frame()
+    assert thresh_a == pytest.approx(thresh_b)
+
+    # A frame with extreme outlier scores must not shift the threshold
+    # applied to ITS OWN candidates -- only what comes after.
+    outlier_frame_sims = np.array([5.0, -5.0])
+    thresh_same_frame, _ = online.threshold_for_next_frame()
+    assert thresh_same_frame == pytest.approx(thresh_a)
+    online.observe(outlier_frame_sims)
+    thresh_next_frame, _ = online.threshold_for_next_frame()
+    assert thresh_next_frame != pytest.approx(thresh_a)
+
+
+def test_online_threshold_window_respects_maxlen():
+    s3 = Stage3Config(adaptive_threshold=True, adaptive_threshold_online_window=3)
+    online = OnlineAdaptiveThreshold(s3)
+    for v in [0.1, 0.2, 0.3, 0.4, 0.5]:
+        online.observe(np.array([v]))
+    assert len(online.history) == 3
+    assert list(online.history) == [0.3, 0.4, 0.5]

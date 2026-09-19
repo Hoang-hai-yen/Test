@@ -840,6 +840,13 @@ class GeCo2DynamicPrototypeTracker:
         self._cross_per_ref_features = cross_check_per_ref_features
         self._cross_prototype_path = work_dir / cfg.stage1.prototype.cache_name
         self._warned_cross_unavailable = False
+        # Debug viz (gated by cfg.runtime.save_visualizations, same
+        # opt-out convention every other stage's viz already uses): saves
+        # the crop + full-frame context for every ACCEPTED token, so a
+        # confuser that slipped past consecutive-hit + cross-check can be
+        # spotted by eye instead of only inferred from downstream metrics.
+        self._viz_dir = work_dir / "viz" / "dynamic_prototype"
+        self._save_viz = cfg.runtime.save_visualizations
         # cross_check_threshold_self_calibrate / topk_fusion.
         # min_absolute_cosine_floor_self_calibrate (opt-in, share this same
         # cached value) -- see _ref_self_sim()'s own docstring.
@@ -914,7 +921,10 @@ class GeCo2DynamicPrototypeTracker:
             for key in ("main", "l1", "l2")
         }
 
-    def offer(self, frame_bgr: np.ndarray, box: Box, precomputed_feature: np.ndarray | None = None) -> None:
+    def offer(
+        self, frame_bgr: np.ndarray, box: Box, precomputed_feature: np.ndarray | None = None,
+        frame_idx: int | None = None,
+    ) -> None:
         """Call once per keyframe with the box detect_frame()/
         filter_boxes_by_threshold() already selected as this frame's best
         (i.e. it already cleared GeCo2's own score threshold) -- decides
@@ -927,6 +937,9 @@ class GeCo2DynamicPrototypeTracker:
         surviving candidate for Stage 3's later cosine matching) -- skips
         a redundant re-embed inside the "feature_extractor" cross-check.
         Ignored when cross_check_source="hiera", or when None.
+
+        frame_idx: purely for the debug viz filename/log below (see
+        _save_debug_viz) -- optional, no effect on accept/reject logic.
         """
         if not self.dp_cfg.enabled:
             return
@@ -963,14 +976,15 @@ class GeCo2DynamicPrototypeTracker:
         self._dynamic_tokens.append(new_tokens)
         if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
             self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
+        self._save_debug_viz(frame_bgr, confirmed, frame_idx, f"cross_check_sim={sim:.3f}")
         log.info(
-            "[Stage123-GeCo2] %s: dynamic_prototype appended a token (cross_check sim=%.3f, "
-            "source=%s) -- %d/%d dynamic token(s) active",
-            self.sample_id, sim, self.dp_cfg.cross_check_source,
+            "[Stage123-GeCo2] %s: dynamic_prototype appended a token (frame=%s, cross_check "
+            "sim=%.3f, source=%s) -- %d/%d dynamic token(s) active",
+            self.sample_id, frame_idx, sim, self.dp_cfg.cross_check_source,
             len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
 
-    def offer_topk(self, frame_bgr: np.ndarray, boxes: list[Box], feats: np.ndarray) -> None:
+    def offer_topk(self, frame_bgr: np.ndarray, boxes: list[Box], feats: np.ndarray, frame_idx: int | None = None) -> None:
         """stage123_geco2.dynamic_prototype.topk_fusion (opt-in) -- ONLY
         wired into run_stage12_geco2_candidates. Considers EVERY box in
         `boxes` (GeCo2's own score-descending surviving candidates this
@@ -1007,7 +1021,7 @@ class GeCo2DynamicPrototypeTracker:
             return
         tk_cfg = self.dp_cfg.topk_fusion
         if not tk_cfg.enabled or self.dp_cfg.cross_check_source != "feature_extractor" or self._cross_prototype is None:
-            self.offer(frame_bgr, boxes[0], precomputed_feature=feats[0])
+            self.offer(frame_bgr, boxes[0], precomputed_feature=feats[0], frame_idx=frame_idx)
             return
 
         self._n_offers += 1
@@ -1114,11 +1128,28 @@ class GeCo2DynamicPrototypeTracker:
         self._dynamic_tokens.append(new_tokens)
         if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
             self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
+        self._save_debug_viz(frame_bgr, confirmed, frame_idx, f"{gate_name}={sim:.3f}")
         log.info(
             "[Stage123-GeCo2] %s: dynamic_prototype (topk_fusion) appended a token "
-            "(chosen_idx=%d/%d, %s=%.3f) -- %d/%d dynamic token(s) active",
-            self.sample_id, chosen_idx, len(boxes), gate_name, sim,
+            "(frame=%s, chosen_idx=%d/%d, %s=%.3f) -- %d/%d dynamic token(s) active",
+            self.sample_id, frame_idx, chosen_idx, len(boxes), gate_name, sim,
             len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+        )
+
+    def _save_debug_viz(self, frame_bgr: np.ndarray, box: Box, frame_idx: int | None, label: str) -> None:
+        """Gated by cfg.runtime.save_visualizations (same convention every
+        other stage's viz uses) -- saves the crop + full-frame context for
+        an ACCEPTED token under <work_dir>/<sample_id>/viz/dynamic_prototype/
+        so a confuser that slipped past consecutive-hit + cross-check can
+        be spotted by eye. `label` matches the corresponding "appended a
+        token" log line's own score, so the two can be cross-referenced by
+        token index (this method is only ever called right before that log
+        line, using len(self._dynamic_tokens) as the token's position)."""
+        if not self._save_viz:
+            return
+        from aero_eyes.utils import viz as vizmod
+        vizmod.save_dynamic_prototype_token(
+            frame_bgr, box, frame_idx, len(self._dynamic_tokens), label, self._viz_dir,
         )
 
     def log_summary(self) -> None:

@@ -69,6 +69,32 @@ def draw_frame_annotation(frame: np.ndarray, box: Box | None, source: str,
     return vis
 
 
+def save_dynamic_prototype_token(
+    frame_bgr: np.ndarray, box: Box, frame_idx: int | None, token_idx: int,
+    label: str, out_dir: Path,
+) -> None:
+    """stage123_geco2.dynamic_prototype (debug, gated by runtime.
+    save_visualizations): saves the CROP that just got encoded into a new
+    exemplar token, plus a full-frame overlay for context -- lets you
+    visually confirm each appended token is genuinely the target object,
+    not a confuser that slipped past consecutive-hit confirmation + the
+    cross-check/fused_score gate. `label` is whatever gate/score accepted
+    it (e.g. "cosine=0.146" or "fused_score=1.189"), matching the
+    corresponding "appended a token" log line so the two can be
+    cross-referenced."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frame_tag = f"{frame_idx:06d}" if frame_idx is not None else "unknown"
+    h, w = frame_bgr.shape[:2]
+    x1, y1 = max(0, int(box.x1)), max(0, int(box.y1))
+    x2, y2 = min(w, int(box.x2)), min(h, int(box.y2))
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size > 0:
+        cv2.imwrite(str(out_dir / f"token_{token_idx:02d}_frame_{frame_tag}_crop.jpg"), crop)
+    vis = frame_bgr.copy()
+    draw_box(vis, box, label, _COLORS["detect"])
+    cv2.imwrite(str(out_dir / f"token_{token_idx:02d}_frame_{frame_tag}_context.jpg"), vis)
+
+
 def save_stage5_timeline(tube: dict[int, Box], total_frames: int, out_path: Path) -> None:
     """Draw a horizontal timeline strip showing present/absent frames."""
     strip_w = min(total_frames, 2000)

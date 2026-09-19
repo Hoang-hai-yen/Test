@@ -229,6 +229,51 @@ def compute_adaptive_threshold(
     return effective_threshold, center, spread, stat_label
 
 
+class OnlineAdaptiveThreshold:
+    """Causal, streaming-compatible replacement for compute_adaptive_
+    threshold's whole-video computation -- see Stage3Config.
+    adaptive_threshold_online's own docstring for the real-time deployment
+    rationale (a live drone feed can't wait for the whole video before
+    deciding what to do with keyframe 1).
+
+    threshold_for_next_frame() decides the upcoming keyframe's threshold
+    using ONLY similarity scores observed at STRICTLY EARLIER keyframes (a
+    running window, oldest evicted once adaptive_threshold_online_window
+    is exceeded); observe() then feeds that keyframe's OWN scores in,
+    called AFTER its own accept/reject decision was already made against
+    the pre-update window -- a keyframe's own candidates can never
+    influence their own threshold, only future keyframes'. Reuses
+    compute_adaptive_threshold's z_score/otsu/gmm dispatch unchanged,
+    just fed the running buffer instead of the whole video's all_sims.
+    """
+
+    def __init__(self, s3):
+        from collections import deque
+        self.s3 = s3
+        self.history: deque = deque(maxlen=s3.adaptive_threshold_online_window)
+
+    def threshold_for_next_frame(self) -> tuple[float, str]:
+        """Returns (threshold, stat_label) to apply to the UPCOMING
+        keyframe's candidates. Cold start (fewer than
+        s3.adaptive_threshold_min_samples observed so far) falls back to
+        adaptive_min_floor -- same "not enough history to trust a
+        distribution-shape method yet" philosophy compute_adaptive_
+        threshold's own otsu/gmm min-samples fallback uses, except here
+        there is no whole-video z_score to fall back to either (the whole
+        point of this class is that one doesn't exist yet), so the floor
+        itself is the fallback.
+        """
+        if len(self.history) < self.s3.adaptive_threshold_min_samples:
+            floor = self.s3.adaptive_min_floor if self.s3.similarity == "cosine" else float("-inf")
+            return floor, "online_cold_start"
+        sims = np.array(self.history)
+        threshold, _, _, stat_label = compute_adaptive_threshold(sims, sims, self.s3.similarity, self.s3)
+        return threshold, f"online_{stat_label}"
+
+    def observe(self, frame_sims: np.ndarray) -> None:
+        self.history.extend(frame_sims.tolist())
+
+
 def run_dynamic_prototype_rounds(
     sample_id: str,
     all_feats: np.ndarray,
@@ -513,11 +558,22 @@ def run_stage3(cfg, sample_id: str) -> Path:
     all_sims_original_refs = all_sims.copy()
 
     # ---- Dynamic prototype update (stage3.dynamic_prototype, opt-in) ----
-    prototype, all_sims, per_ref_features = run_dynamic_prototype_rounds(
-        sample_id, all_feats, all_sims, prototype, per_ref_features,
-        use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
-        all_frame_idxs=all_frame_idxs,
-    )
+    # Also a whole-video, 2-pass batch mechanism -- its own rounds need the
+    # ENTIRE video's candidates just as much as a batch threshold would, so
+    # it's skipped entirely (not just its role in the threshold below) when
+    # adaptive_threshold_online is active, to keep all_sims itself causal.
+    if s3.adaptive_threshold and s3.adaptive_threshold_online and s3.dynamic_prototype.enabled:
+        log.warning(
+            "[Stage3] %s: adaptive_threshold_online=true is incompatible with "
+            "stage3.dynamic_prototype (also a whole-video batch mechanism) -- "
+            "skipping dynamic_prototype rounds entirely this run.", sample_id,
+        )
+    else:
+        prototype, all_sims, per_ref_features = run_dynamic_prototype_rounds(
+            sample_id, all_feats, all_sims, prototype, per_ref_features,
+            use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
+            all_frame_idxs=all_frame_idxs,
+        )
 
     # Persist the dynamic_prototype-adapted state SEPARATELY from
     # prototype.npz (Stage 1's own, never touched here) -- lets
@@ -556,44 +612,79 @@ def run_stage3(cfg, sample_id: str) -> Path:
         float(np.percentile(all_sims, 95)), float(all_sims.max()), len(all_sims),
     )
 
-    # ---- Compute effective threshold ----
-    if s3.adaptive_threshold:
-        effective_threshold, center, spread, stat_label = compute_adaptive_threshold(
-            all_sims, all_sims_original_refs, s3.similarity, s3,
-        )
-        anchor_note = ", anchored to original refs" if s3.adaptive_threshold_anchor_to_original_refs else ""
-        floor_note = f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else ""
-        if stat_label in ("mean/std", "median/MAD"):
-            # z_score method (s3.adaptive_threshold_method == "z_score"):
-            # effective_threshold IS literally center + adaptive_z_score*spread.
-            log.info(
-                "[Stage3] %s: adaptive threshold (metric=%s, stat=%s%s) = %.3f + %.1f*%.3f = %.3f%s",
-                sample_id, s3.similarity, stat_label, anchor_note,
-                center, s3.adaptive_z_score, spread, effective_threshold, floor_note,
-            )
-        else:
-            # otsu / gmm_bimodal / gmm_unimodal_fallback: adaptive_z_score
-            # plays NO role in how effective_threshold was derived -- center/
-            # spread here are just the distribution's own mean/std, reported
-            # for reference only, not inputs to a formula that produced
-            # effective_threshold (unlike the z_score branch above).
-            log.info(
-                "[Stage3] %s: adaptive threshold (metric=%s, method=%s%s) = %.3f%s "
-                "(distribution mean=%.3f, std=%.3f -- adaptive_z_score not used by this method)",
-                sample_id, s3.similarity, stat_label, anchor_note,
-                effective_threshold, floor_note, center, spread,
-            )
-    else:
-        effective_threshold = threshold
+    # ---- Compute effective threshold + filter ----
+    if s3.adaptive_threshold and s3.adaptive_threshold_online:
+        # Real-time-deployment-compatible path: decide each keyframe's
+        # candidates using ONLY strictly-earlier keyframes' own similarity
+        # scores (see OnlineAdaptiveThreshold's own docstring) -- no single
+        # scalar threshold describes the whole video, so effective_threshold
+        # is left as None (write_detections accepts that) and only the
+        # LAST window's threshold is logged, for a rough sense of where it
+        # ended up.
+        from collections import defaultdict as _defaultdict
+        frame_to_indices: dict[int, list[int]] = _defaultdict(list)
+        for i, fi in enumerate(all_frame_idxs):
+            frame_to_indices[fi].append(i)
 
-    # ---- Filter by threshold ----
-    keep_mask = all_sims >= effective_threshold
-    selected = [
-        (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
-        for i in range(len(all_sims)) if keep_mask[i]
-    ]
-    log.info("[Stage3] %s: threshold=%.3f → %d / %d candidates pass",
-             sample_id, effective_threshold, len(selected), len(all_sims))
+        online = OnlineAdaptiveThreshold(s3)
+        keep_mask = np.zeros(len(all_sims), dtype=bool)
+        last_threshold, last_stat_label = None, None
+        for fi in sorted(frame_to_indices):
+            idxs = frame_to_indices[fi]
+            last_threshold, last_stat_label = online.threshold_for_next_frame()
+            frame_sims = all_sims[idxs]
+            keep_mask[idxs] = frame_sims >= last_threshold
+            online.observe(frame_sims)
+
+        effective_threshold = None
+        selected = [
+            (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
+            for i in range(len(all_sims)) if keep_mask[i]
+        ]
+        log.info(
+            "[Stage3] %s: adaptive_threshold_online (window=%d, min_samples=%d, "
+            "final threshold=%.3f, stat=%s) -> %d / %d candidates pass",
+            sample_id, s3.adaptive_threshold_online_window, s3.adaptive_threshold_min_samples,
+            last_threshold if last_threshold is not None else float("nan"), last_stat_label,
+            len(selected), len(all_sims),
+        )
+    else:
+        if s3.adaptive_threshold:
+            effective_threshold, center, spread, stat_label = compute_adaptive_threshold(
+                all_sims, all_sims_original_refs, s3.similarity, s3,
+            )
+            anchor_note = ", anchored to original refs" if s3.adaptive_threshold_anchor_to_original_refs else ""
+            floor_note = f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else ""
+            if stat_label in ("mean/std", "median/MAD"):
+                # z_score method (s3.adaptive_threshold_method == "z_score"):
+                # effective_threshold IS literally center + adaptive_z_score*spread.
+                log.info(
+                    "[Stage3] %s: adaptive threshold (metric=%s, stat=%s%s) = %.3f + %.1f*%.3f = %.3f%s",
+                    sample_id, s3.similarity, stat_label, anchor_note,
+                    center, s3.adaptive_z_score, spread, effective_threshold, floor_note,
+                )
+            else:
+                # otsu / gmm_bimodal / gmm_unimodal_fallback: adaptive_z_score
+                # plays NO role in how effective_threshold was derived -- center/
+                # spread here are just the distribution's own mean/std, reported
+                # for reference only, not inputs to a formula that produced
+                # effective_threshold (unlike the z_score branch above).
+                log.info(
+                    "[Stage3] %s: adaptive threshold (metric=%s, method=%s%s) = %.3f%s "
+                    "(distribution mean=%.3f, std=%.3f -- adaptive_z_score not used by this method)",
+                    sample_id, s3.similarity, stat_label, anchor_note,
+                    effective_threshold, floor_note, center, spread,
+                )
+        else:
+            effective_threshold = threshold
+
+        keep_mask = all_sims >= effective_threshold
+        selected = [
+            (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
+            for i in range(len(all_sims)) if keep_mask[i]
+        ]
+        log.info("[Stage3] %s: threshold=%.3f → %d / %d candidates pass",
+                 sample_id, effective_threshold, len(selected), len(all_sims))
 
     # ---- Apply global_topk cap (after threshold, not instead of it) ----
     global_topk = s3.global_topk

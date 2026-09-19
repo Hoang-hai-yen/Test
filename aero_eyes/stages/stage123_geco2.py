@@ -708,7 +708,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 # Highest-scoring surviving box this keyframe -- the SAME
                 # one _finalize_keyframe_detections already picked as the
                 # frame's best (see its own NMS/top-K ordering).
-                dyn_proto_tracker.offer(frame_bgr, result_dets[0].box)
+                dyn_proto_tracker.offer(frame_bgr, result_dets[0].box, frame_idx=frame_idx)
 
         get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
         detections = _run_geco2_default_pass(
@@ -923,7 +923,7 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
             # offer(boxes[0], ...) (today's behavior) otherwise. feats[i]
             # is already computed for candidates.json regardless, reused
             # here at no extra cost.
-            dyn_proto_tracker.offer_topk(frame_bgr, boxes, feats)
+            dyn_proto_tracker.offer_topk(frame_bgr, boxes, feats, frame_idx=frame_idx)
 
     get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
     candidates = _run_geco2_candidate_pass(

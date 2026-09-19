@@ -44,7 +44,7 @@ def _make_cfg(
         stage123_geco2=SimpleNamespace(dynamic_prototype=SimpleNamespace(**dp_defaults)),
         stage1=SimpleNamespace(prototype=SimpleNamespace(cache_name="prototype.npz")),
         stage2=SimpleNamespace(candidate=SimpleNamespace(feature_crop_pad=0.1)),
-        runtime=SimpleNamespace(batch_size=16),
+        runtime=SimpleNamespace(batch_size=16, save_visualizations=False),
         accuracy=SimpleNamespace(
             mode=accuracy_mode,
             cheap_boosters=SimpleNamespace(
@@ -349,7 +349,7 @@ def test_offer_topk_falls_back_when_cross_check_source_is_hiera():
     assert tracker._warned_topk_fusion_unsupported is True  # warned once at construction
 
     calls = []
-    tracker.offer = lambda frame_bgr, box, precomputed_feature=None: calls.append(box)
+    tracker.offer = lambda frame_bgr, box, precomputed_feature=None, frame_idx=None: calls.append(box)
     boxes = [Box(0, 0, 10, 10, score=0.9), Box(20, 20, 30, 30, score=0.8)]
     feats = np.array([[0.1, 0.0], [0.9, 0.0]])
     tracker.offer_topk(np.zeros((10, 10, 3), dtype=np.uint8), boxes, feats)
@@ -726,3 +726,34 @@ def test_hiera_similarity_skips_shape_tokens_when_enabled():
     new_tokens = {"main": torch.tensor([[[1.0, 0.0]]]), "l1": torch.zeros(1, 1, 2), "l2": torch.zeros(1, 1, 2)}
     sim = tracker._hiera_similarity(new_tokens)
     assert sim == pytest.approx(1.0, abs=1e-5)  # candidate == the (only) exemplar token exactly
+
+
+def test_offer_saves_debug_viz_when_enabled(tmp_path):
+    """runtime.save_visualizations=true -- an accepted token must save a
+    crop + full-frame context image under viz/dynamic_prototype/, so a
+    confuser that slipped through can be spotted by eye."""
+    cfg = _make_cfg(min_consecutive_hits=1, cross_check_threshold=0.0)
+    cfg.runtime.save_visualizations = True
+    tracker = _make_tracker(cfg, tmp_path=tmp_path)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 0.9
+
+    box = Box(10, 10, 20, 20, score=0.9)
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    tracker.offer(frame, box, frame_idx=42)
+
+    viz_dir = tmp_path / "viz" / "dynamic_prototype"
+    files = sorted(f.name for f in viz_dir.glob("*.jpg"))
+    assert len(files) == 2  # crop + context
+    assert all("frame_000042" in f for f in files)
+
+
+def test_offer_skips_debug_viz_when_disabled(tmp_path):
+    cfg = _make_cfg(min_consecutive_hits=1, cross_check_threshold=0.0)  # save_visualizations=False by default
+    tracker = _make_tracker(cfg, tmp_path=tmp_path)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 0.9
+
+    box = Box(10, 10, 20, 20, score=0.9)
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    tracker.offer(frame, box, frame_idx=42)
+
+    assert not (tmp_path / "viz" / "dynamic_prototype").exists()
