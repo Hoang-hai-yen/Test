@@ -561,13 +561,28 @@ def run_stage3(cfg, sample_id: str) -> Path:
         effective_threshold, center, spread, stat_label = compute_adaptive_threshold(
             all_sims, all_sims_original_refs, s3.similarity, s3,
         )
-        log.info(
-            "[Stage3] %s: adaptive threshold (metric=%s, stat=%s%s) = %.3f + %.1f*%.3f = %.3f%s",
-            sample_id, s3.similarity, stat_label,
-            ", anchored to original refs" if s3.adaptive_threshold_anchor_to_original_refs else "",
-            center, s3.adaptive_z_score, spread, effective_threshold,
-            f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else "",
-        )
+        anchor_note = ", anchored to original refs" if s3.adaptive_threshold_anchor_to_original_refs else ""
+        floor_note = f" (floor={s3.adaptive_min_floor:.3f})" if s3.similarity == "cosine" else ""
+        if stat_label in ("mean/std", "median/MAD"):
+            # z_score method (s3.adaptive_threshold_method == "z_score"):
+            # effective_threshold IS literally center + adaptive_z_score*spread.
+            log.info(
+                "[Stage3] %s: adaptive threshold (metric=%s, stat=%s%s) = %.3f + %.1f*%.3f = %.3f%s",
+                sample_id, s3.similarity, stat_label, anchor_note,
+                center, s3.adaptive_z_score, spread, effective_threshold, floor_note,
+            )
+        else:
+            # otsu / gmm_bimodal / gmm_unimodal_fallback: adaptive_z_score
+            # plays NO role in how effective_threshold was derived -- center/
+            # spread here are just the distribution's own mean/std, reported
+            # for reference only, not inputs to a formula that produced
+            # effective_threshold (unlike the z_score branch above).
+            log.info(
+                "[Stage3] %s: adaptive threshold (metric=%s, method=%s%s) = %.3f%s "
+                "(distribution mean=%.3f, std=%.3f -- adaptive_z_score not used by this method)",
+                sample_id, s3.similarity, stat_label, anchor_note,
+                effective_threshold, floor_note, center, spread,
+            )
     else:
         effective_threshold = threshold
 
