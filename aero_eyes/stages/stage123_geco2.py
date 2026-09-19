@@ -348,6 +348,25 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                 sample_id, num_orig_refs, len(levels), len(ref_imgs), levels,
             )
 
+    # Debug viz: the ACTUAL final images/boxes about to be encoded, after
+    # every step above (mask, background-fill, crop_to_object,
+    # scale_calibration, ref_downscale_factor/levels -- or none of those,
+    # if segmentation is disabled) -- every EARLIER viz call above only
+    # shows an intermediate stage, none of them show what encode_exemplars
+    # itself actually receives. Saved unconditionally right before the
+    # call so this always reflects reality regardless of which branch ran.
+    if cfg.runtime.save_visualizations:
+        from aero_eyes.utils.viz import draw_box
+        out_dir = work_dir / "viz" / "stage123_geco2" / "refs_final"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i, img in enumerate(ref_imgs):
+            cv2.imwrite(str(out_dir / f"ref_final_{i:02d}.jpg"), img)
+            box_i = ref_boxes[i] if ref_boxes is not None else None
+            if box_i is not None:
+                annotated = img.copy()
+                draw_box(annotated, Box(*box_i), "RoI-Align region", (0, 255, 0))
+                cv2.imwrite(str(out_dir / f"ref_final_{i:02d}_box.jpg"), annotated)
+
     prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
 
     dc_cfg = g.domain_calibration

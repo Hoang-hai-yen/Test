@@ -90,3 +90,37 @@ def test_ref_downscale_levels_multiplies_exemplar_count_when_segmentation_disabl
 
     imgs = detector.calls[0][0]
     assert len(imgs) == 3 * 2  # 3 ref images x 2 levels
+
+
+def test_refs_final_viz_saved_when_enabled(tmp_path):
+    """The debug viz saves the ACTUAL post-downscale images that
+    encode_exemplars receives -- one file per exemplar entry, matching
+    the count encode_exemplars was actually called with."""
+    sample_id = "IDCard_0"
+    detector = _FakeDetector()
+    cfg = _make_cfg(
+        tmp_path, sample_id, ref_downscale_factor=0.1, seg_enabled=False,
+        ref_downscale_levels=[1.0, 0.3],
+    )
+    cfg.runtime.save_visualizations = True
+    work_dir = Path(cfg.project.work_dir) / sample_id
+    build_exemplar_prototype(cfg, sample_id, detector, work_dir)
+
+    viz_dir = work_dir / "viz" / "stage123_geco2" / "refs_final"
+    files = sorted(f.name for f in viz_dir.glob("ref_final_*.jpg") if "_box" not in f.name)
+    assert len(files) == len(detector.calls[0][0]) == 6  # 3 refs x 2 levels
+
+    # Must be the ACTUAL images passed to encode_exemplars, not some other
+    # intermediate copy.
+    saved = cv2.imread(str(viz_dir / files[0]))
+    assert saved.shape == detector.calls[0][0][0].shape
+
+
+def test_refs_final_viz_not_saved_when_disabled(tmp_path):
+    sample_id = "IDCard_0"
+    detector = _FakeDetector()
+    cfg = _make_cfg(tmp_path, sample_id, ref_downscale_factor=1.0, seg_enabled=False)
+    work_dir = Path(cfg.project.work_dir) / sample_id
+    build_exemplar_prototype(cfg, sample_id, detector, work_dir)
+
+    assert not (work_dir / "viz" / "stage123_geco2" / "refs_final").exists()
