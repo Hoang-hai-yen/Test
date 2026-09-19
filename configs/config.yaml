@@ -70,8 +70,8 @@ stage1:
     weights: null            # path to MobileSAM ckpt; null = auto-download
     fallback_if_missing: passthrough   # passthrough = skip masking, use full image
   feature_extractor:
-    model: dinov2            # <<< CHUYỂN VỀ dinov2
-    dinov2_variant: vitb14   # <<< BỎ DẤU # Ở ĐẦU DÒNG NÀY (~86M, 768-d)
+    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dinov2+clip concat)
+    dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
                               # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
     # dinov3_variant: used only when model=dinov3. Weights are GATED on
     # HuggingFace (facebook/dinov3-*-pretrain-lvd1689m) -- request access on
@@ -81,16 +81,12 @@ stage1:
     clip_variant: vit-b/32   # vit-b/32 (512-d) | vit-l/14 (768-d)
     # siglip_variant: used only when model=siglip. Open access on HuggingFace,
     # no token needed. Vision encoder only (no text tower loaded).
-    dinov3_pretrain_dataset: sat493m   
-    dinov3_source: huggingface         
-    dinov3_kaggle_model_id: null
     siglip_variant: base     # base (768-d) | large (1024-d) | so400m (1152-d, slow)
     weights: null            # null = load from torch.hub / hf
     image_size: 224
-    
   prototype:
     # How the 3 per-reference feature sets are fused.
-    fusion: max             # mean | max | concat_then_pca
+    fusion: mean             # mean | max | concat_then_pca
     l2_normalize: true
     cache_name: prototype.npz
 
@@ -199,9 +195,9 @@ stage3:
 # STAGE 4 — Tracking between keyframes
 # ----------------------------------------------------------------------------
 stage4:
-  tracker: litetrack           # <<< "builtin" | "litetrack" | "none"
+  tracker: builtin           # <<< "builtin" | "litetrack" | "none"
                              #   builtin   = OpenCV CSRT/KCF (no extra weights)
-                             #   litetrack = LiteTrack-B4 ONNX (needs weights)
+                             #   litetrack = LiteTrack-B4 ONNX (needs 2 ONNX graphs: z + x)
                              #   none      = run detection on EVERY frame
   builtin:
     algorithm: csrt          # csrt | kcf | mosse | mil
@@ -211,10 +207,18 @@ stage4:
                               # aero_eyes.models.trackers auto-falls-back to
                               # mil (logs a warning) instead of failing.
   litetrack:
-    # Cặp file ONNX của LiteTrack-B4 Center
-    onnx_path_z: "weights/litetrack_B4_cae_center_all_ep300_z.onnx"
-    onnx_path_x: "weights/litetrack_B4_cae_center_all_ep300_x.onnx"
-    # Thông số chuẩn theo LiteTrack-B4 config
+    # Both REQUIRED if tracker=litetrack; else fail clearly. Real LiteTrack
+    # inference is 2 separate graphs, not 1 -- see
+    # aero_eyes/models/trackers.py module docstring. Export both from a
+    # trained checkpoint (e.g. LiteTrack_ep0300.pth.tar) with
+    # LiteTrack/tracking/export_litetrack_onnx.py.
+    # e.g. .../litetrack_B4_cae_center_all_ep300_z.onnx  (template encoder)
+    #      .../litetrack_B4_cae_center_all_ep300_x.onnx  (search -> box head)
+    onnx_path_z: null
+    onnx_path_x: null
+    # Must match the exported checkpoint's own experiment yaml
+    # (experiments/litetrack/*.yaml TEST.* / MODEL.BACKBONE.STRIDE).
+    # Defaults below are LiteTrack's B4 config.
     template_size: 128
     search_size: 256
     template_factor: 2.0
@@ -255,7 +259,6 @@ accuracy:
     scales: [0.75, 1.0, 1.5]
     tuned_nms: true
     multi_reference_embedding: true   # keep per-ref protos + ensemble match
-    multi_ref_pooling: max
 
   max_accuracy:
     synthetic_viewpoint_aug:

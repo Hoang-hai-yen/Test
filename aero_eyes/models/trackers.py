@@ -4,6 +4,21 @@ Selected by config stage4.tracker.
   builtin   : OpenCV CSRT/KCF/MOSSE/MIL — no extra weights (DEFAULT)
   litetrack : LiteTrack ONNX — REQUIRES stage4.litetrack.onnx_path_z/onnx_path_x
   none      : sentinel; Stage 4 will run detection on every frame
+
+LiteTrack needs 2 ONNX graphs, not 1 -- its real forward pass is split into
+`forward_z` (encode the template crop ONCE per track init) and `forward`
+(template features + search crop -> box, every tracked frame); see
+LiteTrack/lib/models/litetrack/litetrack.py. Both are produced from a real
+trained checkpoint by LiteTrack/tracking/export_litetrack_onnx.py.
+
+The preprocessing/decoding below (_lt_sample_target, _lt_template_bb_xyxy_norm,
+_lt_cal_bbox, _lt_map_box_back, _lt_clip_box) is a from-scratch numpy port of
+LiteTrack's own lib/test/tracker/litetrack.py (LiteTrack.initialize/
+track_center) -- that file can't actually run as published: it imports
+`sample_target` from lib.train.data.processing_utils, a module missing from
+the LiteTrack repo (TsingWei/LiteTrack) as cloned. This reconstructs the
+same STARK/OSTrack-family crop-and-decode algorithm the whole LiteTrack
+model family is trained against.
 """
 from __future__ import annotations
 
@@ -30,7 +45,8 @@ class Tracker(ABC):
 
 
 def _resolve_cv2_tracker_ctor(name: str):
-    """Return the constructor for an OpenCV tracker, trying multiple API paths."""
+    """Return the constructor for an OpenCV tracker, trying multiple API paths
+    across versions, or None if unavailable in the installed OpenCV build."""
     candidates = {
         "csrt":  ["cv2.legacy.TrackerCSRT_create",  "cv2.TrackerCSRT_create"],
         "kcf":   ["cv2.legacy.TrackerKCF_create",   "cv2.TrackerKCF_create"],
@@ -50,7 +66,16 @@ def _resolve_cv2_tracker_ctor(name: str):
 
 
 def _make_cv2_tracker(name: str):
-    """Create an OpenCV tracker, falling back to MIL if unavailable."""
+    """Create an OpenCV tracker, falling back to MIL if the requested
+    algorithm was removed from the installed OpenCV build.
+
+    OpenCV 5.x dropped CSRT/KCF/MOSSE from the Python bindings entirely (not
+    just moved to `cv2.legacy` — they no longer exist there either), so a
+    config asking for csrt/kcf/mosse would otherwise hard-fail regardless of
+    which opencv-contrib-python(-headless) version pip happens to resolve to.
+    MIL needs no extra weights and is present in both the old `cv2.legacy.*`
+    and the new top-level `cv2.*` API, so it's a safe universal fallback.
+    """
     ctor = _resolve_cv2_tracker_ctor(name)
     if ctor is not None:
         return ctor()
@@ -60,14 +85,16 @@ def _make_cv2_tracker(name: str):
         if fallback_ctor is not None:
             log.warning(
                 "OpenCV tracker '%s' not available in this OpenCV build "
-                "-- falling back to 'mil'.", name,
+                "(likely OpenCV >=5.0, which removed csrt/kcf/mosse from the "
+                "Python API) -- falling back to 'mil'.", name,
             )
             return fallback_ctor()
 
     raise RuntimeError(
-        f"OpenCV tracker '{name}' not found. "
-        "Install opencv-contrib-python: pip install opencv-contrib-python-headless "
-        "or switch to stage4.tracker: none in config."
+        f"OpenCV tracker '{name}' not found, and the 'mil' fallback is also "
+        "unavailable. Install opencv-contrib-python:  "
+        "pip install opencv-contrib-python-headless  "
+        "or switch to  stage4.tracker: none  in config."
     )
 
 
@@ -94,32 +121,28 @@ class BuiltinTracker(Tracker):
         self._tracker = self._FACTORY[self.algorithm]()
         x1, y1 = int(box.x1), int(box.y1)
         w, h = int(box.x2 - box.x1), int(box.y2 - box.y1)
-        if w <= 0 or h <= 0:
-            log.warning(
-                "BuiltinTracker.init: degenerate box (w=%d, h=%d) -- refusing to initialize.", w, h
-            )
-            self._initialized = False
-            return
-        try:
-            self._tracker.init(frame_bgr, (x1, y1, w, h))
-            self._initialized = True
-        except cv2.error as e:
-            log.warning("BuiltinTracker.init failed (%s) -- treating as tracker-not-active.", e)
-            self._initialized = False
+        self._tracker.init(frame_bgr, (x1, y1, w, h))
+        self._initialized = True
 
     def update(self, frame_bgr: np.ndarray) -> tuple[Box | None, float]:
         if not self._initialized or self._tracker is None:
             return None, 0.0
-        try:
-            success, rect = self._tracker.update(frame_bgr)
-        except cv2.error as e:
-            log.warning("BuiltinTracker.update failed (%s) -- treating as tracking lost.", e)
-            self._initialized = False
-            return None, 0.0
+        success, rect = self._tracker.update(frame_bgr)
         if not success:
             return None, 0.0
         x, y, w, h = rect
         box = Box(float(x), float(y), float(x + w), float(y + h))
+        # OpenCV trackers don't expose a real confidence score -- `success`
+        # only means the tracker didn't internally give up, NOT that the box
+        # is actually on the target (CSRT/MIL happily lock onto background
+        # clutter and keep reporting success while drifting). This 0.9 is a
+        # placeholder so callers have a well-formed (box, score) pair; it
+        # must NOT be trusted as a real quality signal. The actual
+        # correctness check lives in Stage 4 (`_should_reverify` /
+        # `_reverify_track` in stage4.py), which periodically re-embeds the
+        # tracked crop with DINOv2 and compares it against the prototype —
+        # relying on this fixed 0.9 alone would mean the
+        # `tracker_conf_threshold` gate almost never fires.
         return box, 0.9
 
 
@@ -133,15 +156,15 @@ class NoneTracker(Tracker):
         return None, 0.0
 
 
-# ============================================================================
-# Thuật toán phụ trợ xử lý khung tìm kiếm và tọa độ cho LiteTrack (ONNX)
-# ============================================================================
-
 def _lt_sample_target(
     im: np.ndarray, target_xywh: tuple[float, float, float, float],
     search_area_factor: float, output_sz: int,
 ) -> tuple[np.ndarray, float]:
-    """Cắt vùng ảnh vuông bao quanh mục tiêu với độ phóng search_area_factor."""
+    """Crop a square region centered on `target_xywh`, padded to
+    `search_area_factor` x the box's own size, then resize to `output_sz`.
+    Port of LiteTrack/STARK/OSTrack's own sample_target (see module
+    docstring for why this can't just be imported). Returns
+    (patch_bgr [output_sz, output_sz, 3], resize_factor)."""
     x, y, w, h = target_xywh
     crop_sz = math.ceil(math.sqrt(max(w, 1e-3) * max(h, 1e-3)) * search_area_factor)
     if crop_sz < 1:
@@ -169,7 +192,13 @@ def _lt_sample_target(
 def _lt_template_bb_xyxy_norm(
     w: float, h: float, resize_factor: float, output_sz: int,
 ) -> tuple[float, float, float, float]:
-    """Tọa độ normalized xyxy của hộp bao mục tiêu nằm trong patch template."""
+    """Where the target box sits inside its OWN template crop, normalized
+    xyxy -- since _lt_sample_target always centers the crop on the box
+    itself, this is a closed form of LiteTrack's
+    transform_bbox_to_crop/transform_image_to_crop for that special case
+    (box_in == box_extract). LiteTrack.forward_z needs this as
+    `template_bb` (MODEL.USE_CLS_TOKEN=True feeds it through a target-token
+    embedding)."""
     cx = cy = (output_sz - 1) / 2.0
     out_w, out_h = w * resize_factor, h * resize_factor
     x1 = (cx - 0.5 * out_w) / output_sz
@@ -180,7 +209,11 @@ def _lt_template_bb_xyxy_norm(
 def _lt_cal_bbox(
     response: np.ndarray, size_map: np.ndarray, offset_map: np.ndarray, feat_size: int,
 ) -> tuple[tuple[float, float, float, float], float]:
-    """Tìm tọa độ argmax score và kích thước từ feature map của LiteTrack."""
+    """Port of LiteTrack's CenterPredictor.cal_bbox (lib/models/layers/head.py):
+    argmax the response map (already hann-windowed inside the exported ONNX
+    graph -- see export_litetrack_onnx.py), then read size/offset at that
+    same spatial cell. Returns ((cx, cy, w, h) normalized to the search
+    canvas, confidence in ~(0,1))."""
     flat_response = response.reshape(-1)
     idx = int(np.argmax(flat_response))
     max_score = float(flat_response[idx])
@@ -200,7 +233,8 @@ def _lt_map_box_back(
     pred_cxcywh_norm: tuple[float, float, float, float], resize_factor: float,
     search_size: int, prev_state_xywh: tuple[float, float, float, float],
 ) -> tuple[float, float, float, float]:
-    """Chiếu ngược tọa độ từ không gian search patch về tọa độ pixel gốc của frame."""
+    """Undo the search-crop resize/recenter to get the predicted box back in
+    full-frame pixel coords. Port of LiteTrack.map_box_back."""
     cx_n, cy_n, w_n, h_n = pred_cxcywh_norm
     scale = search_size / resize_factor
     cx, cy, w, h = cx_n * scale, cy_n * scale, w_n * scale, h_n * scale
@@ -214,7 +248,7 @@ def _lt_map_box_back(
 def _lt_clip_box(
     box_xywh: tuple[float, float, float, float], img_h: int, img_w: int, margin: float = 10.0,
 ) -> tuple[float, float, float, float]:
-    """Giới hạn bounding box không vượt ra ngoài biên ảnh."""
+    """Port of LiteTrack's clip_box (lib/utils/box_ops.py)."""
     x1, y1, w, h = box_xywh
     x2, y2 = x1 + w, y1 + h
     x1 = min(max(0.0, x1), img_w - margin)
@@ -225,7 +259,9 @@ def _lt_clip_box(
 
 
 class LiteTrackTracker(Tracker):
-    """LiteTrack ONNX tracker gồm 2 đồ thị: Template (z) và Search (x)."""
+    """LiteTrack ONNX tracker -- see module docstring for why this needs 2
+    ONNX graphs and a from-scratch numpy pre/postprocessing port instead of
+    a single onnxruntime call."""
 
     def __init__(
         self,
@@ -241,8 +277,9 @@ class LiteTrackTracker(Tracker):
         for path in (onnx_path_z, onnx_path_x):
             if not os.path.isfile(path):
                 raise FileNotFoundError(
-                    f"Không tìm thấy file LiteTrack ONNX tại '{path}'. "
-                    "Hãy kiểm tra lại đường dẫn stage4.litetrack.onnx_path_z / onnx_path_x trong config."
+                    f"LiteTrack ONNX weights not found at '{path}'. Export both graphs from a "
+                    "trained checkpoint with LiteTrack/tracking/export_litetrack_onnx.py and set "
+                    "stage4.litetrack.onnx_path_z / onnx_path_x in your config."
                 )
         import onnxruntime as ort  # type: ignore
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -261,7 +298,8 @@ class LiteTrackTracker(Tracker):
         w, h = box.x2 - box.x1, box.y2 - box.y1
         if w <= 0 or h <= 0:
             log.warning(
-                "LiteTrackTracker.init: Bounding box lỗi (w=%.1f, h=%.1f) -- từ chối khởi tạo.", w, h
+                "LiteTrackTracker.init: degenerate box (w=%.1f, h=%.1f) -- "
+                "refusing to initialize, treating as tracker-not-active.", w, h,
             )
             self._template_feats = None
             self._state_xywh = None
@@ -272,7 +310,7 @@ class LiteTrackTracker(Tracker):
         template_bb = np.array(
             [_lt_template_bb_xyxy_norm(w, h, resize_factor, self.template_size)],
             dtype=np.float32,
-        )  # Tensor shape (1, 4)
+        )  # (1, 4) -- see export_litetrack_onnx.py's dummy_template_bb comment for why not (1,1,4)
         outputs = self._sess_z.run(None, {
             self._sess_z.get_inputs()[0].name: template,
             self._sess_z.get_inputs()[1].name: template_bb,
@@ -305,11 +343,11 @@ class LiteTrackTracker(Tracker):
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         img_rgb = (img_rgb - mean) / std
-        return img_rgb.transpose(2, 0, 1)[None].astype(np.float32)  # [1, 3, H, W]
+        return img_rgb.transpose(2, 0, 1)[None].astype(np.float32)  # (1,3,H,W)
 
 
 def build_tracker(cfg) -> Tracker:
-    """Factory: khởi tạo tracker tương ứng theo config."""
+    """Factory: construct the configured tracker."""
     name = cfg.stage4.tracker
     if name == "builtin":
         return BuiltinTracker(algorithm=cfg.stage4.builtin.algorithm)
@@ -317,22 +355,21 @@ def build_tracker(cfg) -> Tracker:
         return NoneTracker()
     if name == "litetrack":
         lt_cfg = cfg.stage4.litetrack
-        # Đọc 2 đường dẫn z và x
-        path_z = getattr(lt_cfg, "onnx_path_z", None)
-        path_x = getattr(lt_cfg, "onnx_path_x", None)
-
-        if not path_z or not path_x:
+        missing = [f for f in ("onnx_path_z", "onnx_path_x") if not getattr(lt_cfg, f)]
+        if missing:
             raise ValueError(
-                "stage4.tracker là 'litetrack' nhưng thiếu 'onnx_path_z' hoặc 'onnx_path_x'. "
-                "Vui lòng kiểm tra lại cấu hình stage4.litetrack trong config.yaml."
+                f"stage4.tracker is 'litetrack' but stage4.litetrack.{missing[0]} is not set. "
+                "Export both ONNX graphs from a trained checkpoint with "
+                "LiteTrack/tracking/export_litetrack_onnx.py and set the paths in your config, "
+                "or switch to tracker: builtin."
             )
         return LiteTrackTracker(
-            onnx_path_z=path_z,
-            onnx_path_x=path_x,
-            template_size=getattr(lt_cfg, "template_size", 128),
-            search_size=getattr(lt_cfg, "search_size", 256),
-            template_factor=getattr(lt_cfg, "template_factor", 2.0),
-            search_factor=getattr(lt_cfg, "search_factor", 4.0),
-            stride=getattr(lt_cfg, "stride", 16),
+            onnx_path_z=lt_cfg.onnx_path_z,
+            onnx_path_x=lt_cfg.onnx_path_x,
+            template_size=lt_cfg.template_size,
+            search_size=lt_cfg.search_size,
+            template_factor=lt_cfg.template_factor,
+            search_factor=lt_cfg.search_factor,
+            stride=lt_cfg.stride,
         )
     raise ValueError(f"Unknown tracker '{name}'. Choose from: builtin, litetrack, none.")

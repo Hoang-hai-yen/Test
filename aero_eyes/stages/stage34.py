@@ -1,3 +1,4 @@
+%%writefile /kaggle/working/aero_eyes/aero_eyes/stages/stage34.py
 """Stage B — Match & Track (xử lý chính).
 
 Gộp từ 2 stage cũ:
@@ -7,11 +8,6 @@ Gộp từ 2 stage cũ:
   - Stage 4 (tracking): init tracker tại mỗi keyframe detection -> propagate
     -> re-detect khi confidence thấp / track quá cũ / verify thất bại ->
     tracks.json
-
-Lý do gộp: Stage 4 vốn đã đọc trực tiếp `prototype_dynamic.npz` và
-`match_threshold` do Stage 3 ghi ra (đồng bộ hai stage qua file trung gian).
-Gộp lại thành 1 stage giúp rõ ràng rằng đây là một luồng xử lý liền mạch
-"match rồi track", tránh nguy cơ chạy Stage B thiếu phần matching.
 
 Reads:  candidates.json (+ .feats.npz), prototype.npz, video
 Writes: detections.json, (prototype_dynamic.npz nếu có), tracks.json
@@ -28,6 +24,13 @@ import numpy as np
 from aero_eyes.types import Box, Detection
 
 log = logging.getLogger(__name__)
+
+
+def _get_pool_fn(cfg):
+    """Lấy hàm gộp điểm đa tham chiếu động (max hoặc mean) từ cấu hình."""
+    cheap_boosters = getattr(getattr(cfg, "accuracy", None), "cheap_boosters", None)
+    pool_mode = getattr(cheap_boosters, "multi_ref_pooling", "mean") if cheap_boosters is not None else "mean"
+    return np.max if pool_mode == "max" else np.mean
 
 
 # =====================================================================
@@ -83,6 +86,7 @@ def _run_matching(cfg, sample_id: str) -> Path:
         and cfg.accuracy.cheap_boosters.multi_reference_embedding
         and len(per_ref_features) > 0
     )
+    pool_fn = _get_pool_fn(cfg)
 
     detections: dict[int, list[Detection]] = {}
 
@@ -104,19 +108,11 @@ def _run_matching(cfg, sample_id: str) -> Path:
     # --- LƯỢT 1: So khớp cơ bản ---
     if use_multi_ref:
         sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-        all_sims = np.mean(sims_per_ref, axis=0)
+        all_sims = pool_fn(sims_per_ref, axis=0)
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
 
-    # --- CẢI TIẾN 1 (mở rộng): DYNAMIC PROTOTYPE UPDATE với NGƯỠNG THÍCH ỨNG ---
-    # Ngưỡng cứng 0.40 trước đây chỉ "may mắn" kích hoạt được với nhóm dễ
-    # (BlackBox) vì phân phối similarity của nó cao sẵn. Với nhóm khó
-    # (CardboardBox, LifeJacket) similarity hiếm khi vượt 0.40 -> cơ chế
-    # không bao giờ kích hoạt -> prototype không được tinh chỉnh theo domain
-    # thực tế của video. Sửa: chọn "high-confidence" theo phân vị (percentile)
-    # của CHÍNH phân phối điểm số của sample này, có sàn tuyệt đối để tránh
-    # kéo theo nhiễu khi toàn bộ điểm số đều thấp, và chạy nhiều vòng để
-    # prototype hội tụ dần về đúng target trong video.
+    # --- CẢI TIẾN 1: DYNAMIC PROTOTYPE UPDATE với NGƯỠNG THÍCH ỨNG ---
     dyn_cfg = getattr(s3, "dynamic_prototype", None)
     dyn_enabled = getattr(dyn_cfg, "enabled", True) if dyn_cfg is not None else True
     dyn_rounds = getattr(dyn_cfg, "rounds", 2) if dyn_cfg is not None else 2
@@ -149,16 +145,12 @@ def _run_matching(cfg, sample_id: str) -> Path:
             if use_multi_ref:
                 per_ref_features.append(dynamic_feat)
                 sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
-                all_sims = np.mean(sims_per_ref, axis=0)
+                all_sims = pool_fn(sims_per_ref, axis=0)
             else:
                 prototype = (1 - dyn_alpha) * prototype + dyn_alpha * dynamic_feat
                 prototype /= (np.linalg.norm(prototype) + 1e-8)
                 all_sims = _score_against_ref(all_feats, prototype, s3.similarity)
 
-    # Ghi lại prototype đã tinh chỉnh (dynamic-updated) ra file riêng
-    # (prototype_dynamic.npz), KHÔNG ghi đè prototype.npz gốc (giữ tái lập
-    # được / tránh trôi dạt qua nhiều lần rerun). Phần tracking bên dưới sẽ
-    # ưu tiên đọc file này nếu có.
     if dynamic_updated:
         refined_proto_path = work_dir / "prototype_dynamic.npz"
         refined_meta = dict(meta) if isinstance(meta, dict) else {}
@@ -187,11 +179,7 @@ def _run_matching(cfg, sample_id: str) -> Path:
             effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
         else:
             effective_threshold = raw_threshold
-        # Cap tại điểm số cao nhất thực tế quan sát được trong video. Công
-        # thức mean + z*std chỉ là ước lượng thống kê, không phải trần cứng
-        # -- với video có độ phân tán điểm số cao, nó có thể vượt max thực
-        # tế một chút (từng gặp: max=0.727 vs threshold=0.736), làm loại bỏ
-        # oan ứng viên tốt nhất và trả về 0 detection dù có ứng viên mạnh.
+
         sim_max = float(all_sims.max())
         if effective_threshold > sim_max:
             log.info(
@@ -254,9 +242,6 @@ def _run_matching(cfg, sample_id: str) -> Path:
 # =====================================================================
 
 def _load_best_prototype(work_dir: Path, cfg):
-    """Ưu tiên đọc prototype đã tinh chỉnh (`prototype_dynamic.npz`, ghi ra
-    ở phần matching phía trên) nếu tồn tại, fallback về bản gốc
-    `prototype.npz` nếu chưa có (ví dụ dynamic update không kích hoạt)."""
     from aero_eyes.utils.io import read_prototype
 
     refined_path = work_dir / "prototype_dynamic.npz"
@@ -279,9 +264,6 @@ def _track_still_matches(
     cfg,
     match_threshold: float,
 ) -> bool:
-    """Re-embed crop đang track và kiểm tra còn giống target không -- đây là
-    check đúng nghĩa mà confidence cố định của BuiltinTracker không cung
-    cấp được."""
     feats = extractor.extract_crops(
         frame_bgr, [box],
         pad_ratio=cfg.stage2.candidate.feature_crop_pad,
@@ -295,8 +277,10 @@ def _track_still_matches(
         and cfg.accuracy.cheap_boosters.multi_reference_embedding
         and len(per_ref_features) > 0
     )
+    pool_fn = _get_pool_fn(cfg)
+
     if use_multi_ref:
-        sim = float(np.mean([feats[0] @ ref_feat for ref_feat in per_ref_features]))
+        sim = float(pool_fn([feats[0] @ ref_feat for ref_feat in per_ref_features]))
     else:
         sim = float(feats[0] @ prototype)
 
@@ -313,7 +297,6 @@ def _detect_on_frame(
     cfg,
     match_threshold: float,
 ):
-    """Run proposal + matching trên 1 frame; trả về (best_box, source)."""
     if proposal_model is None or extractor is None or prototype is None:
         return None, "none"
 
@@ -352,9 +335,11 @@ def _detect_on_frame(
         and cfg.accuracy.cheap_boosters.multi_reference_embedding
         and len(per_ref_features) > 0
     )
+    pool_fn = _get_pool_fn(cfg)
+
     if use_multi_ref:
         sims_per_ref = [feats @ ref_feat for ref_feat in per_ref_features]
-        sims = np.mean(sims_per_ref, axis=0)
+        sims = pool_fn(sims_per_ref, axis=0)
     else:
         sims = feats @ prototype
 
@@ -365,7 +350,6 @@ def _detect_on_frame(
 
 
 def _run_tracking(cfg, sample_id: str) -> Path:
-    """(cũ: run_stage4) Track object giữa các keyframe."""
     from aero_eyes.models.trackers import NoneTracker, build_tracker
     from aero_eyes.utils import viz as vizmod
     from aero_eyes.utils.io import read_detections, read_detections_threshold, write_tracks
@@ -380,21 +364,16 @@ def _run_tracking(cfg, sample_id: str) -> Path:
         log.info("[StageB/track] %s: using cached tracks at %s", sample_id, tracks_path)
         return tracks_path
 
-    # ---- Load detections ----
     det_path = work_dir / "detections.json"
     if not det_path.exists():
         raise FileNotFoundError(
             f"detections.json not found at {det_path}. Chạy phần matching trước."
         )
     detections = read_detections(det_path)
-    # Dùng lại đúng threshold mà phần matching đã dùng (giá trị adaptive
-    # z-score khi bật) để re-detect giữa video áp cùng ngưỡng chấp nhận,
-    # thay vì âm thầm rơi về default cố định trong config.
     match_threshold = read_detections_threshold(det_path)
     if match_threshold is None:
         match_threshold = cfg.stage3.match_threshold
 
-    # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
     video_files = list((data_root / sample_id).glob(cfg.data.video_glob))
     if not video_files:
@@ -403,7 +382,6 @@ def _run_tracking(cfg, sample_id: str) -> Path:
     vinfo = video_info(video_path)
     total_frames = vinfo["total_frames"]
 
-    # ---- Build tracker ----
     tracker = build_tracker(cfg)
     is_none_tracker = isinstance(tracker, NoneTracker)
     s4 = cfg.stage4
@@ -425,7 +403,6 @@ def _run_tracking(cfg, sample_id: str) -> Path:
         extractor = build_feature_extractor(cfg)
         prototype, _, per_ref_features = _load_best_prototype(work_dir, cfg)
 
-    # ---- Video writer for visualizations ----
     writer = None
     if cfg.runtime.save_visualizations:
         viz_dir = work_dir / "viz" / "stageB_track"
@@ -437,7 +414,6 @@ def _run_tracking(cfg, sample_id: str) -> Path:
             height=vinfo["height"],
         )
 
-    # ---- Main loop ----
     kf_set = set(detections.keys())
     tracks: dict[int, Box | None] = {}
     tracker_active = False
@@ -475,12 +451,6 @@ def _run_tracking(cfg, sample_id: str) -> Path:
                                 and track_age <= s4.max_track_age
                                 and box is not None)
 
-                    # OpenCV's own "confidence" is a near-constant placeholder
-                    # -- nó không phân biệt được lock trôi dạt với lock đúng.
-                    # Cứ mỗi verify_interval frame, đối chiếu crop đang track
-                    # với prototype bằng cùng DINOv2 embedding dùng để
-                    # detect, để bắt được track trôi dạt trong vài frame
-                    # thay vì để nó tồn tại hết max_track_age.
                     if (track_ok and box is not None and extractor is not None
                             and prototype is not None and s4.verify_interval > 0
                             and frames_since_verify >= s4.verify_interval):

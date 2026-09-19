@@ -131,7 +131,7 @@ class MobileSAMSegmenter:
 
             best_score = float(np.max(scores))
             border_total = float(2 * (h + w))
-            plausible = []  # (mask, area_frac, border_frac) passing area + score only
+            valid_candidates = []
 
             for m, s in zip(masks, scores):
                 m_bool = m.astype(bool)
@@ -145,16 +145,19 @@ class MobileSAMSegmenter:
                 if s < (best_score * self.score_ratio_floor):
                     continue
 
+                # Border touch filter
                 border_touch_px = float(
                     np.sum(m_bool[0, :])
                     + np.sum(m_bool[-1, :])
                     + np.sum(m_bool[:, 0])
                     + np.sum(m_bool[:, -1])
                 )
-                border_frac = border_touch_px / border_total
-                plausible.append((m_bool, area_frac, border_frac))
+                if (border_touch_px / border_total) > self.max_border_touch_frac:
+                    continue
 
-            if not plausible:
+                valid_candidates.append((m_bool, area_frac))
+
+            if not valid_candidates:
                 # Fallback: Pick highest-scoring mask that satisfies area bounds
                 best_idx = int(np.argmax(scores))
                 mask = masks[best_idx].astype(bool)
@@ -167,27 +170,9 @@ class MobileSAMSegmenter:
                     return fallback_mask
                 return mask
 
-            # Border touch is used to pick a trustworthy candidate, never to
-            # guess among untrustworthy ones. A previous version of this
-            # picked the *largest*-area mask when none were border-clean —
-            # that is backwards: on a cluttered reference photo (e.g. a
-            # textured pavement background), a lightweight model like
-            # MobileSAM can return a degenerate "whole frame is foreground"
-            # mask as one of its 3 candidates, and it is by construction the
-            # largest one. Confirmed on Helmet_0/Helmet_1's reference photos:
-            # every candidate touched the border, and picking the largest
-            # produced a near-100%-area mask (visually verified — nothing in
-            # the frame was excluded), tanking their score far below even
-            # leaving MobileSAM out entirely. When no candidate is border
-            # clean, the segmentation itself is untrustworthy, so return
-            # passthrough instead of guessing: the caller (stage1/stage12)
-            # already treats a >max_valid_mask_ratio mask as implausible and
-            # substitutes a safe center-crop, which is what we want here.
-            clean = [c for c in plausible if c[2] <= self.max_border_touch_frac]
-            if not clean:
-                return fallback_mask
-            clean.sort(key=lambda c: c[1], reverse=True)  # largest area first
-            return clean[0][0]
+            # Prefer the largest mask among valid candidates
+            valid_candidates.sort(key=lambda x: x[1], reverse=True)
+            return valid_candidates[0][0]
 
         except Exception as e:
             log.warning("MobileSAM inference failed (%s), using passthrough mask.", e)

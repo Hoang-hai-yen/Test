@@ -23,4 +23,13 @@ scikit-learn          # stage1.prototype.fusion == "concat_then_pca"
 pytest
 
 # Optional — only needed if stage4.tracker == "litetrack"
-onnxruntime           # (or onnxruntime-gpu)
+# Use onnxruntime-gpu (NOT plain onnxruntime) on a CUDA machine -- plain
+# onnxruntime is CPU-only and silently falls back (a logged UserWarning,
+# easy to miss) instead of erroring, which pegs the CPU at 100% during
+# Stage 4 while the GPU sits idle.
+# Verify after install: python -c "import onnxruntime as ort;
+# print(ort.get_available_providers())" should list CUDAExecutionProvider.
+# If it doesn't even with onnxruntime-gpu installed, onnxruntime-gpu needs
+# cuDNN's shared libraries at runtime (not bundled) -- also install
+# nvidia-cudnn-cu12 and point LD_LIBRARY_PATH at its lib/ dir.
+onnxruntime-gpu        # CPU-only machine: use `onnxruntime` instead

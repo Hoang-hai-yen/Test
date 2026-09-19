@@ -303,6 +303,9 @@ stage4:
   tracker: builtin             # "builtin" | "litetrack" | "none"
   builtin:
     algorithm: csrt            # "csrt" | "kcf" | "mosse"
+  litetrack:                   # chỉ cần khi tracker: litetrack
+    onnx_path_z: path/to/litetrack_z.onnx   # encode template (chạy 1 lần mỗi lần init track)
+    onnx_path_x: path/to/litetrack_x.onnx   # search crop -> box (chạy mỗi frame)
 
 # Độ chính xác
 accuracy:
@@ -322,7 +325,7 @@ accuracy:
 | Tracker | Yêu cầu | Tốc độ | Ghi chú |
 |---------|---------|--------|---------|
 | `builtin` | Chỉ OpenCV | Nhanh | Mặc định, luôn hoạt động |
-| `litetrack` | File `.onnx` | Trung bình | Cần `stage4.litetrack.onnx_path` |
+| `litetrack` | 2 file `.onnx` (z + x) | Trung bình | Cần `stage4.litetrack.onnx_path_z` và `onnx_path_x`, xuất bằng `LiteTrack/tracking/export_litetrack_onnx.py` |
 | `none` | Không | Chậm nhất | Detect lại mỗi frame |
 
 ---
@@ -430,12 +433,14 @@ tests/fixtures/synth001/
 **Cách fix:** Chạy `run_all` từ đầu hoặc `stage1` riêng lẻ.
 
 ### Lỗi: `LiteTrack ONNX weights not found`
-**Nguyên nhân:** Đang dùng `tracker: litetrack` nhưng chưa cung cấp file `.onnx`.  
-**Cách fix:** Đổi sang `tracker: builtin`, hoặc set đường dẫn:
+**Nguyên nhân:** Đang dùng `tracker: litetrack` nhưng chưa cung cấp đủ 2 file `.onnx` (z + x).  
+**Cách fix:** Đổi sang `tracker: builtin`, hoặc xuất 2 file ONNX từ checkpoint đã train
+bằng `LiteTrack/tracking/export_litetrack_onnx.py` rồi set đường dẫn:
 ```powershell
 --set stage4.tracker=builtin
 # hoặc
---set stage4.litetrack.onnx_path=path/to/litetrack.onnx
+--set stage4.litetrack.onnx_path_z=path/to/litetrack_z.onnx
+--set stage4.litetrack.onnx_path_x=path/to/litetrack_x.onnx
 ```
 
 ### Lỗi: MobileSAM không tải được

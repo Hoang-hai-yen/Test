@@ -72,12 +72,11 @@ class SegmentationConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: str = "dinov3"
+    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
-    dinov3_pretrain_dataset: Literal["lvd1689m", "sat493m"] = "sat493m"
-    dinov3_source: Literal["huggingface", "kaggle"] = "huggingface"
-    dinov3_kaggle_model_id: Optional[str] = None
+    clip_variant: str = "vit-b/32"
+    siglip_variant: Literal["base", "large", "so400m"] = "base"
     weights: Optional[str] = None
     image_size: int = 224
 
@@ -174,13 +173,20 @@ class BuiltinTrackerConfig(BaseModel):
 
 
 class LiteTrackConfig(BaseModel):
-    onnx_path: Optional[str] = None
-    input_size: int = 256
-    onnx_path_z: Optional[str] = None        # Đường dẫn file _z.onnx
-    onnx_path_x: Optional[str] = None        # Đường dẫn file _x.onnx
-    template_size: int = 127                 # Kích thước crop template z
-    search_size: int = 255                   # Kích thước crop search x
-    score_threshold: float = 0.40
+    # LiteTrack's real network is 2 separate graphs (see
+    # aero_eyes/models/trackers.py module docstring for why one ONNX file
+    # isn't enough), both produced by LiteTrack/tracking/export_litetrack_onnx.py
+    # from a real trained checkpoint (e.g. LiteTrack_ep0300.pth.tar).
+    onnx_path_z: Optional[str] = None   # template crop -> template_feats (run once per track init)
+    onnx_path_x: Optional[str] = None   # template_feats + search crop -> response/size/offset maps (every tracked frame)
+    # Must match the exported checkpoint's own experiment yaml (TEST.* /
+    # MODEL.BACKBONE.STRIDE) -- defaults here are LiteTrack's B4 config.
+    template_size: int = 128
+    search_size: int = 256
+    template_factor: float = 2.0
+    search_factor: float = 4.0
+    stride: int = 16
+
 
 class DetectionConfirmationConfig(BaseModel):
     enabled: bool = False
@@ -337,13 +343,16 @@ class AeroEyesConfig(BaseModel):
     @model_validator(mode="after")
     def check_litetrack_path(self) -> "AeroEyesConfig":
         if self.stage4.tracker == "litetrack":
-            lt = self.stage4.litetrack
-            has_pair = bool(lt.onnx_path_z and lt.onnx_path_x)
-            has_single = bool(lt.onnx_path)
-            if not (has_pair or has_single):
+            missing = [
+                f for f in ("onnx_path_z", "onnx_path_x")
+                if not getattr(self.stage4.litetrack, f)
+            ]
+            if missing:
                 raise ValueError(
-                    "stage4.tracker='litetrack' nhưng chưa cấu hình đường dẫn weights ONNX. "
-                    "Vui lòng thiết lập stage4.litetrack.onnx_path_z và stage4.litetrack.onnx_path_x."
+                    f"stage4.tracker is 'litetrack' but stage4.litetrack.{missing[0]} is not set. "
+                    "Export both ONNX graphs from a trained checkpoint with "
+                    "LiteTrack/tracking/export_litetrack_onnx.py and set "
+                    "stage4.litetrack.onnx_path_z / onnx_path_x in your config."
                 )
         return self
 
