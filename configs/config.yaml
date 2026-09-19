@@ -637,6 +637,14 @@ stage123_geco2:
   dynamic_prototype:
     enabled: false
     max_tokens: 5              # sliding-window cap on APPENDED token-sets (FIFO); original ref tokens never evicted
+    # false (default): once max_tokens is full, a new accepted candidate
+    # still gets appended, evicting the OLDEST appended token (set keeps
+    # drifting toward the most recent accepted appearances).
+    # true: once max_tokens is full, stop accepting new tokens -- the set
+    # locked in first stays fixed for the rest of the video instead of
+    # being replaced later (trade FIFO's ability to adapt to a drifting
+    # appearance for immunity to a later confuser evicting a good token).
+    freeze_when_full: false
     # IMPORTANT: "consecutive" = consecutive PROCESSED KEYFRAMES (spaced
     # keyframe_interval RAW FRAMES apart, default 8 -- ~0.27s at 30fps),
     # NOT consecutive video frames -- GeCo2 never runs between keyframes in

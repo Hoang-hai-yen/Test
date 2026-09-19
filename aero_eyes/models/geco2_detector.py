@@ -867,6 +867,7 @@ class GeCo2DynamicPrototypeTracker:
         self._n_cross_check_unavailable = 0
         self._n_cross_check_rejected = 0
         self._n_appended = 0
+        self._n_frozen_rejected = 0  # dynamic_prototype.freeze_when_full -- see log_summary()
         # dynamic_prototype.topk_fusion (opt-in, offer_topk() only -- see
         # that method's own docstring): running Z-score baselines + its own
         # diagnostic counters, separate from the generic ones above so
@@ -969,6 +970,17 @@ class GeCo2DynamicPrototypeTracker:
                 "(%.0f,%.0f,%.0f,%.0f) rejected (cross_check sim=%.3f < %.3f)",
                 self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
                 sim, threshold,
+            )
+            return
+
+        if self.dp_cfg.freeze_when_full and len(self._dynamic_tokens) >= self.dp_cfg.max_tokens:
+            self._n_frozen_rejected += 1
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype candidate at frame region "
+                "(%.0f,%.0f,%.0f,%.0f) passed all gates but freeze_when_full -- "
+                "%d/%d slots already full, set stays as-is.",
+                self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
+                len(self._dynamic_tokens), self.dp_cfg.max_tokens,
             )
             return
 
@@ -1120,6 +1132,17 @@ class GeCo2DynamicPrototypeTracker:
                 )
                 return
 
+        if self.dp_cfg.freeze_when_full and len(self._dynamic_tokens) >= self.dp_cfg.max_tokens:
+            self._n_frozen_rejected += 1
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype (topk_fusion) candidate at frame "
+                "region (%.0f,%.0f,%.0f,%.0f) [chosen_idx=%d/%d] passed all gates but "
+                "freeze_when_full -- %d/%d slots already full, set stays as-is.",
+                self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
+                chosen_idx, len(boxes), len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+            )
+            return
+
         if tk_cfg.history_update_on_append_only:
             self._topk_cosine_history.append(float(cosines[chosen_idx]))
             self._topk_geco2_history.append(float(geco2_scores[chosen_idx]))
@@ -1167,9 +1190,10 @@ class GeCo2DynamicPrototypeTracker:
         log.info(
             "[Stage123-GeCo2] %s: dynamic_prototype summary -- %d offer(s), %d passed "
             "consecutive-hit gate, %d cross-check unavailable, %d cross-check rejected, "
-            "%d appended (%d/%d active at end)",
+            "%d frozen-out (freeze_when_full), %d appended (%d/%d active at end)",
             self.sample_id, self._n_offers, self._n_confirmed, self._n_cross_check_unavailable,
-            self._n_cross_check_rejected, self._n_appended, len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+            self._n_cross_check_rejected, self._n_frozen_rejected, self._n_appended,
+            len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
         if self.dp_cfg.topk_fusion.enabled and self._n_topk_offers > 0:
             log.info(

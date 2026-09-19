@@ -31,6 +31,7 @@ def _make_cfg(
     dp_defaults = dict(
         enabled=True,
         max_tokens=3,
+        freeze_when_full=False,
         min_consecutive_hits=2,
         consecutive_hits_iou=0.5,
         cross_check_source="feature_extractor",
@@ -195,6 +196,51 @@ def test_offer_evicts_oldest_appended_token_never_the_original():
     assert eff["main"].shape[1] == 3  # base + 2 dynamic
     values = sorted(eff["main"][:, i, 0].item() for i in range(3))
     assert values == [0.0, 11.0, 12.0]
+
+
+def test_offer_freeze_when_full_stops_accepting_new_tokens():
+    """freeze_when_full=True: once max_tokens is reached, a candidate that
+    passes every gate must still be REJECTED (not evicting the oldest via
+    FIFO) -- the set locked in first stays fixed."""
+    cfg = _make_cfg(min_consecutive_hits=1, cross_check_threshold=0.0, max_tokens=2, freeze_when_full=True)
+    detector = _FakeDetector()
+    base = _token_set(value=0.0)
+    tracker = _make_tracker(cfg, detector=detector, base_prototype=base)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 1.0
+    frame = np.zeros((10, 10, 3), dtype=np.uint8)
+    box = Box(10, 10, 20, 20, score=0.9)
+
+    for _ in range(3):
+        tracker.offer(frame, box)
+
+    eff = tracker.effective_prototype()
+    # The FIRST 2 accepted tokens (values 10, 11) stay; the 3rd (value 12)
+    # never gets appended despite passing every gate.
+    assert eff["main"].shape[1] == 3  # base + 2 dynamic
+    values = sorted(eff["main"][:, i, 0].item() for i in range(3))
+    assert values == [0.0, 10.0, 11.0]
+    assert tracker._n_frozen_rejected == 1
+    assert tracker._n_appended == 2
+
+
+def test_offer_topk_freeze_when_full_stops_accepting_new_tokens():
+    cfg = _make_cfg(
+        min_consecutive_hits=1, cross_check_threshold=0.0, max_tokens=2, freeze_when_full=True,
+        topk_fusion_overrides={"enabled": True, "min_window_for_zscore": 100},  # stay cold-start throughout
+    )
+    detector = _FakeDetector()
+    tracker = _make_tracker(cfg, detector=detector)
+    tracker._cross_prototype = np.array([1.0, 0.0])
+
+    box = Box(10, 10, 20, 20, score=0.9)
+    feat = np.array([[1.0, 0.0]])
+    for _ in range(3):
+        tracker.offer_topk(np.zeros((10, 10, 3), dtype=np.uint8), [box], feat)
+
+    eff = tracker.effective_prototype()
+    assert eff["main"].shape[1] == 1 + 2  # base (1 token) + max_tokens (2)
+    assert tracker._n_frozen_rejected == 1
+    assert tracker._n_appended == 2
 
 
 def test_feature_extractor_similarity_uses_single_prototype_when_multi_ref_off():

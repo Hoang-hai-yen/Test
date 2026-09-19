@@ -1569,6 +1569,21 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     # itself added. Cross-attention cost scales with total token count, so
     # this also bounds the extra compute dynamic_prototype adds per frame.
     max_tokens: int = 5
+    # false (default): once max_tokens is reached, a new accepted candidate
+    # STILL gets appended, evicting the OLDEST appended token (FIFO) --
+    # the active set keeps drifting to reflect the most RECENT accepted
+    # appearances of the target.
+    # true: once max_tokens is reached, stop accepting new tokens entirely
+    # -- the set locked in first stays fixed for the rest of the video,
+    # instead of being replaced by whatever gets accepted later. Useful
+    # when early-video acceptances are trusted more than later ones (e.g.
+    # the target's appearance is expected to stay stable, and you'd rather
+    # keep a known-good early set than risk a later confuser slipping in
+    # and evicting it) -- the flip side of FIFO's own tradeoff (a later
+    # confuser can push out a genuinely good early token; freezing removes
+    # that risk but also removes FIFO's ability to adapt to a target whose
+    # appearance genuinely drifts over the video).
+    freeze_when_full: bool = False
     # IMPORTANT: "consecutive" here means consecutive PROCESSED KEYFRAMES,
     # not consecutive video frames -- GeCo2's own detect_frame() only ever
     # runs at stage123_geco2.keyframe_interval spacing (default 8), and
