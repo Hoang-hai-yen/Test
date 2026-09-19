@@ -18,7 +18,7 @@ def _seg_cfg(model: str) -> SimpleNamespace:
     return SimpleNamespace(
         model=model, weights="/mobilesam.pt", fallback_if_missing="passthrough",
         min_area_frac=0.05, max_area_frac=0.95, score_ratio_floor=0.85,
-        max_border_touch_frac=0.02, use_point_prompt=True,
+        max_border_touch_frac=0.02, use_point_prompt=True, reject_implausible_mask=True,
     )
 
 

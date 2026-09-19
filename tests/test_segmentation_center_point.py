@@ -135,3 +135,56 @@ def test_segment_box_use_center_point_isolates_component_at_point_in_crop_local_
     assert not np.allclose(captured["point_coords"][0], [60.0, 60.0])
     assert mask[20, 20] == True     # real component (containing the point) kept
     assert mask[2, 2] == False      # unrelated blob dropped
+
+
+def test_segment_returns_implausible_mask_when_reject_disabled():
+    """MobileSAMSegmenter.segment() (Stage 1 reference-image masking) with
+    reject_implausible_mask=False: a too-small mask must be returned AS-IS
+    instead of falling back to the all-ones passthrough."""
+    seg = _make_segmenter()
+    seg.use_point_prompt = True
+    seg.min_area_frac = 0.05
+    seg.max_area_frac = 0.95
+    seg.score_ratio_floor = 0.85
+    seg.max_border_touch_frac = 0.02
+    seg.reject_implausible_mask = False
+
+    class _FakePredictor:
+        def set_image(self, frame_rgb):
+            pass
+
+        def predict(self, point_coords, point_labels, box, multimask_output):
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[45:55, 45:55] = True  # 1% of frame -- would normally be rejected
+            return np.array([mask]), np.array([0.9]), None
+
+    seg._predictor = _FakePredictor()
+    result = seg.segment(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert not result.all()
+    assert result[50, 50] == True
+    assert result.mean() < 0.05
+
+
+def test_segment_falls_back_to_passthrough_when_reject_enabled():
+    """Same setup as above but with the default (reject_implausible_mask=
+    True) -- proves the flag, not something else, controls this."""
+    seg = _make_segmenter()
+    seg.use_point_prompt = True
+    seg.min_area_frac = 0.05
+    seg.max_area_frac = 0.95
+    seg.score_ratio_floor = 0.85
+    seg.max_border_touch_frac = 0.02
+    seg.reject_implausible_mask = True
+
+    class _FakePredictor:
+        def set_image(self, frame_rgb):
+            pass
+
+        def predict(self, point_coords, point_labels, box, multimask_output):
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[45:55, 45:55] = True
+            return np.array([mask]), np.array([0.9]), None
+
+    seg._predictor = _FakePredictor()
+    result = seg.segment(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result.all()

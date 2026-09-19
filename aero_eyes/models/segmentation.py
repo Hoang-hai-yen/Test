@@ -57,9 +57,13 @@ class MobileSAMSegmenter:
     def __init__(self, weights_path: str | None = None, fallback_if_missing: str = "passthrough",
                  min_area_frac: float = 0.05, max_area_frac: float = 0.95,
                  score_ratio_floor: float = 0.85, max_border_touch_frac: float = 0.02,
-                 use_point_prompt: bool = True):
+                 use_point_prompt: bool = True, reject_implausible_mask: bool = True):
         self.weights_path = weights_path
         self.fallback_if_missing = fallback_if_missing
+        # See SegmentationConfig.reject_implausible_mask's own docstring --
+        # False skips the area/border-touch pass/fail gate below entirely,
+        # returning whatever segment()'s candidate-selection picked as-is.
+        self.reject_implausible_mask = reject_implausible_mask
         # Center-point prompt assumes the geometric center pixel is
         # foreground -- breaks down for ring/donut-shaped objects (e.g. a
         # life ring) whose center is a HOLLOW interior (background), which
@@ -481,6 +485,8 @@ class MobileSAMSegmenter:
             else:
                 best_idx = int(np.argmax(scores))
             mask = cleaned[best_idx]
+            if not self.reject_implausible_mask:
+                return mask
             area_frac = mask.mean()
             if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
                 log.warning(
@@ -535,10 +541,12 @@ class FastSAMSegmenter:
         self, weights: str, conf: float = 0.2, iou: float = 0.7, imgsz: int = 640,
         min_area_frac: float = 0.05, max_area_frac: float = 0.95,
         max_border_touch_frac: float = 0.02, use_point_prompt: bool = True,
+        reject_implausible_mask: bool = True,
     ):
         self.conf = conf
         self.iou = iou
         self.imgsz = imgsz
+        self.reject_implausible_mask = reject_implausible_mask
         # Only used by segment() (SegmentationConfig.model="fastsam") --
         # segment_box_cached() above (box_refine.method="fastsam_dense")
         # trusts its own box-IoU match directly instead, same as every
@@ -662,6 +670,8 @@ class FastSAMSegmenter:
             mask = self.segment_box_cached(synthetic_box, margin=0.0, use_center_point=self.use_point_prompt)
             if mask is None:
                 return np.ones((h, w), dtype=bool)
+            if not self.reject_implausible_mask:
+                return mask
             area_frac = mask.mean()
             if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
                 log.warning(
@@ -724,9 +734,10 @@ class SAM2Segmenter:
         self, geco2_repo_path: str, device: str | None = None,
         min_area_frac: float = 0.05, max_area_frac: float = 0.95,
         score_ratio_floor: float = 0.85, max_border_touch_frac: float = 0.02,
-        use_point_prompt: bool = True,
+        use_point_prompt: bool = True, reject_implausible_mask: bool = True,
     ):
         self.device = device or ("cuda" if _cuda_available() else "cpu")
+        self.reject_implausible_mask = reject_implausible_mask
         # Only used by segment() (SegmentationConfig.model="sam2") --
         # segment_box_cached() below (box_refine.method="sam2_native")
         # trusts its own predicted-IoU score directly instead, same as
@@ -946,6 +957,8 @@ class SAM2Segmenter:
                 masks, scores, self.use_point_prompt, cx, cy,
                 self.min_area_frac, self.max_area_frac, self.score_ratio_floor, self.max_border_touch_frac,
             )
+            if not self.reject_implausible_mask:
+                return mask
             area_frac = mask.mean()
             if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
                 log.warning(
@@ -983,19 +996,20 @@ def build_segmenter(seg_cfg, cfg):
             weights=fs_cfg.weights, conf=fs_cfg.conf, iou=fs_cfg.iou, imgsz=fs_cfg.imgsz,
             min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
             max_border_touch_frac=seg_cfg.max_border_touch_frac, use_point_prompt=seg_cfg.use_point_prompt,
+            reject_implausible_mask=seg_cfg.reject_implausible_mask,
         )
     if seg_cfg.model == "sam2":
         return SAM2Segmenter(
             cfg.stage123_geco2.repo_path,
             min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
             score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
-            use_point_prompt=seg_cfg.use_point_prompt,
+            use_point_prompt=seg_cfg.use_point_prompt, reject_implausible_mask=seg_cfg.reject_implausible_mask,
         )
     return MobileSAMSegmenter(
         weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
         min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
         score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
-        use_point_prompt=seg_cfg.use_point_prompt,
+        use_point_prompt=seg_cfg.use_point_prompt, reject_implausible_mask=seg_cfg.reject_implausible_mask,
     )
 
 

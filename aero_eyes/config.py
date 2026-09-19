@@ -116,6 +116,19 @@ class SegmentationConfig(BaseModel):
     # edges, so a correctly-segmented subject essentially never reaches the
     # real border; a background plane (ground, wall, sky) commonly does.
     max_border_touch_frac: float = 0.02
+    # Opt-out: min_area_frac/max_area_frac/max_border_touch_frac above are
+    # calibrated against MobileSAM's own behavior -- with a newly-wired
+    # model (model="fastsam"/"sam2"), or just to see what the model
+    # actually proposed before any of this project's own heuristics get a
+    # say, set this false to skip BOTH final rejection checks entirely and
+    # return whichever mask segment()'s own candidate-selection picked, no
+    # matter its area or how much it touches the border (never falls back
+    # to the all-ones passthrough for THIS reason -- inference failures/
+    # the model being unavailable still do). The candidate-selection step
+    # itself (isolate a connected component, prefer the largest among
+    # confident candidates) still runs; this only skips the pass/fail
+    # gate applied to whatever it picked.
+    reject_implausible_mask: bool = True
     # Center-point prompt (in addition to the box prompt) assumes the
     # geometric center pixel is foreground -- breaks down for ring/donut-
     # shaped objects (e.g. a life ring) whose center is a HOLLOW interior

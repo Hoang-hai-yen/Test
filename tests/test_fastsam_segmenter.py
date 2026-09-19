@@ -27,6 +27,7 @@ def _make_segmenter() -> FastSAMSegmenter:
     seg.max_area_frac = 0.95
     seg.max_border_touch_frac = 0.02
     seg.use_point_prompt = True
+    seg.reject_implausible_mask = True
     return seg
 
 
@@ -223,3 +224,23 @@ def test_segment_falls_back_to_passthrough_when_touches_border():
 
     result = seg.segment(np.zeros((h, w, 3), dtype=np.uint8))
     assert result.all()
+
+
+def test_segment_returns_implausible_mask_when_reject_disabled():
+    """reject_implausible_mask=False: an area-implausible mask must be
+    returned AS-IS instead of falling back to passthrough."""
+    seg = _make_segmenter()
+    seg.reject_implausible_mask = False
+    h, w = 100, 100
+    mask_data = np.zeros((1, h, w), dtype=np.float32)
+    mask_data[0, 45:55, 45:55] = 1.0  # 1% of frame -- would normally be rejected
+    boxes_xyxy = np.array([[45, 45, 55, 55]], dtype=np.float32)
+    seg._model = lambda frame_bgr, conf, iou, imgsz, verbose, retina_masks: [
+        _FakeResult(_FakeMasks(_TorchLike(mask_data)), _FakeBoxes(_TorchLike(boxes_xyxy)))
+    ]
+    seg.conf, seg.iou, seg.imgsz = 0.2, 0.7, 640
+
+    result = seg.segment(np.zeros((h, w, 3), dtype=np.uint8))
+    assert not result.all(), "must return the tiny mask itself, not all-ones passthrough"
+    assert result[50, 50] == True
+    assert result.mean() < 0.05

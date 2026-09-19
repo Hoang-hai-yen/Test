@@ -83,6 +83,14 @@ stage1:
     model: mobilesam
     weights: null            # path to MobileSAM ckpt; null = auto-download (only used when model=mobilesam)
     fallback_if_missing: passthrough   # passthrough = skip masking, use full image
+    # true (default): reject a mask outside [min_area_frac, max_area_frac]
+    # or touching the border more than max_border_touch_frac, falling back
+    # to the all-ones passthrough for that reference image. false: skip
+    # this check entirely and use whatever segment()'s own candidate
+    # picked, however oddly sized/bordered -- useful to see a newly-wired
+    # model's (fastsam/sam2) raw output unfiltered, since these thresholds
+    # were calibrated against MobileSAM's own behavior.
+    reject_implausible_mask: true
     # What to do with the non-mask (background) region of a reference image:
     #   mean_fill (default) -- flat mean-color fill.
     #   keep_real -- leave the reference photo's real background untouched.
@@ -403,6 +411,10 @@ stage123_geco2:
     # inclusive masks on the candidate that WAS accepted). Set false to
     # prompt with the box alone for object shapes like this.
     use_point_prompt: true
+    # See stage1.segmentation.reject_implausible_mask's own comment --
+    # false skips the min/max_area_frac + max_border_touch_frac check
+    # entirely, using whatever segment() picked as-is.
+    reject_implausible_mask: true
     # What to do with the non-mask (background) region of a reference image:
     #   mean_fill (default) -- flat mean-color fill. Cheapest, but a large
     #     flat, textureless region is far outside what the backbone
