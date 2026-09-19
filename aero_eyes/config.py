@@ -81,7 +81,26 @@ class RuntimeConfig(BaseModel):
 
 class SegmentationConfig(BaseModel):
     enabled: bool = True
-    model: str = "mobilesam"
+    # "mobilesam" (default): lightest/fastest of the 3, proven in production
+    #   here. "weights" below is its checkpoint path.
+    # "fastsam": reuses stage2.fastsam_s's weights/conf/iou/imgsz (NOT
+    #   "weights" below, which is ignored for this model) -- has NO
+    #   prompt-conditioned decoder, so it can only SELECT among masks its
+    #   own "segment everything" pass already produced for this image,
+    #   never generate a NEW one conditioned on where it's prompted (same
+    #   ceiling noted on box_refine.method=fastsam_dense: a small/thin
+    #   object merged with a neighbor or missed outright in that pass
+    #   can't be recovered here either).
+    # "sam2": a full standalone SAM2 (same one box_refine.method=
+    #   sam2_native uses) -- "weights" below is ignored, needs
+    #   stage123_geco2.repo_path's vendored GECO2/sam2 package + its own
+    #   deps (hydra-core, omegaconf). Heavier/slower than mobilesam per
+    #   reference image (3 images/sample here, so this adds up).
+    # fastsam/sam2 are NOT YET VALIDATED for this reference-image masking
+    # role (only proven so far as box_refine methods, a different job) --
+    # compare against the mobilesam baseline on your own footage before
+    # trusting either here.
+    model: Literal["mobilesam", "fastsam", "sam2"] = "mobilesam"
     weights: Optional[str] = None
     fallback_if_missing: str = "passthrough"
     min_area_frac: float = 0.05

@@ -73,8 +73,15 @@ runtime:
 stage1:
   segmentation:
     enabled: true
-    model: mobilesam         # mobilesam  (background removal on refs)
-    weights: null            # path to MobileSAM ckpt; null = auto-download
+    # mobilesam (default, lightest/proven) | fastsam (reuses stage2.fastsam_s's
+    # weights/conf/iou/imgsz -- weights below is ignored; no promptable
+    # decoder, can only select among its own "segment everything" masks) |
+    # sam2 (full standalone SAM2, needs stage123_geco2.repo_path's vendored
+    # GECO2/sam2 -- weights below is ignored; heavier/slower per ref image).
+    # fastsam/sam2 NOT YET VALIDATED for this reference-masking role --
+    # compare against mobilesam on your own footage first.
+    model: mobilesam
+    weights: null            # path to MobileSAM ckpt; null = auto-download (only used when model=mobilesam)
     fallback_if_missing: passthrough   # passthrough = skip masking, use full image
     # What to do with the non-mask (background) region of a reference image:
     #   mean_fill (default) -- flat mean-color fill.
@@ -365,12 +372,12 @@ stage3:
 stage123_geco2:
   repo_path: ./GECO2
   weights_path: ./GECO2/CNTQG_multitrain_ca44.pth
-  # Same MobileSAM foreground masking as stage1.segmentation (background
-  # filled with the ref image's own mean color) -- applied before
-  # ref_downscale_factor below. Same fields/defaults as stage1.segmentation.
+  # Same foreground masking as stage1.segmentation (background filled with
+  # the ref image's own mean color) -- applied before ref_downscale_factor
+  # below. Same fields/defaults/model choices as stage1.segmentation.
   segmentation:
     enabled: true
-    model: mobilesam
+    model: mobilesam   # mobilesam | fastsam | sam2 -- see stage1.segmentation.model's own comment
     weights: null
     fallback_if_missing: passthrough
     min_area_frac: 0.05    # reject a mask smaller than this fraction of the frame

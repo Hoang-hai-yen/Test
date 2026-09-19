@@ -181,16 +181,8 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     seg_cfg = g.segmentation
     sc_cfg = g.scale_calibration
     if seg_cfg.enabled:
-        from aero_eyes.models.segmentation import MobileSAMSegmenter
-        segmenter = MobileSAMSegmenter(
-            weights_path=seg_cfg.weights,
-            fallback_if_missing=seg_cfg.fallback_if_missing,
-            min_area_frac=seg_cfg.min_area_frac,
-            max_area_frac=seg_cfg.max_area_frac,
-            score_ratio_floor=seg_cfg.score_ratio_floor,
-            max_border_touch_frac=seg_cfg.max_border_touch_frac,
-            use_point_prompt=seg_cfg.use_point_prompt,
-        )
+        from aero_eyes.models.segmentation import build_segmenter
+        segmenter = build_segmenter(seg_cfg, cfg)
         masks = []
         for img in ref_imgs:
             mask = segmenter.segment(img)
@@ -414,13 +406,8 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
         seg_cfg = cfg.stage123_geco2.segmentation
         masks: list[np.ndarray | None] = [None] * len(ref_imgs)
         if seg_cfg.enabled:
-            from aero_eyes.models.segmentation import MobileSAMSegmenter
-            segmenter = MobileSAMSegmenter(
-                weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
-                min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
-                score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
-                use_point_prompt=seg_cfg.use_point_prompt,
-            )
+            from aero_eyes.models.segmentation import build_segmenter
+            segmenter = build_segmenter(seg_cfg, cfg)
             masks = [segmenter.segment(img) for img in ref_imgs]
         else:
             log.warning(

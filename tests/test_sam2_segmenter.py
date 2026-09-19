@@ -23,6 +23,11 @@ def _make_segmenter() -> SAM2Segmenter:
     seg = object.__new__(SAM2Segmenter)
     seg._available = True
     seg._predictor = None
+    seg.min_area_frac = 0.05
+    seg.max_area_frac = 0.95
+    seg.score_ratio_floor = 0.85
+    seg.max_border_touch_frac = 0.02
+    seg.use_point_prompt = True
     return seg
 
 
@@ -161,3 +166,62 @@ def test_set_frame_false_on_predictor_exception():
 
     seg._predictor = _FakePredictor()
     assert seg.set_frame(np.zeros((10, 10, 3), dtype=np.uint8)) is False
+
+
+def test_segment_returns_passthrough_when_unavailable():
+    seg = object.__new__(SAM2Segmenter)
+    seg._available = False
+    seg._predictor = None
+    result = seg.segment(np.zeros((50, 50, 3), dtype=np.uint8))
+    assert result.all()
+    assert result.shape == (50, 50)
+
+
+def test_segment_picks_plausible_mask():
+    seg = _make_segmenter()
+
+    class _FakePredictor:
+        def set_image(self, frame_rgb):
+            pass
+
+        def predict(self, point_coords, point_labels, box, multimask_output):
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[10:90, 10:90] = True
+            return np.array([mask]), np.array([0.9]), None
+
+    seg._predictor = _FakePredictor()
+    result = seg.segment(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result[50, 50] == True
+    assert not result.all()
+
+
+def test_segment_falls_back_to_passthrough_when_area_implausible():
+    seg = _make_segmenter()
+
+    class _FakePredictor:
+        def set_image(self, frame_rgb):
+            pass
+
+        def predict(self, point_coords, point_labels, box, multimask_output):
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[45:55, 45:55] = True  # 1% of frame -- below min_area_frac=0.05
+            return np.array([mask]), np.array([0.9]), None
+
+    seg._predictor = _FakePredictor()
+    result = seg.segment(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result.all()
+
+
+def test_segment_falls_back_to_passthrough_on_predict_exception():
+    seg = _make_segmenter()
+
+    class _FakePredictor:
+        def set_image(self, frame_rgb):
+            pass
+
+        def predict(self, **kwargs):
+            raise RuntimeError("boom")
+
+    seg._predictor = _FakePredictor()
+    result = seg.segment(np.zeros((50, 50, 3), dtype=np.uint8))
+    assert result.all()

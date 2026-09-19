@@ -23,6 +23,10 @@ def _make_segmenter() -> FastSAMSegmenter:
     seg._model = None
     seg._cached_masks = []
     seg._cached_boxes = []
+    seg.min_area_frac = 0.05
+    seg.max_area_frac = 0.95
+    seg.max_border_touch_frac = 0.02
+    seg.use_point_prompt = True
     return seg
 
 
@@ -164,3 +168,58 @@ class _TorchLike:
 
     def numpy(self):
         return self._arr
+
+
+def test_segment_returns_passthrough_when_model_unavailable():
+    seg = _make_segmenter()
+    result = seg.segment(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result.all()
+    assert result.shape == (100, 100)
+
+
+def test_segment_picks_mask_matching_synthetic_box():
+    """A cached instance covering most of the frame (like a real subject)
+    must be picked and returned as-is (not the passthrough fallback)."""
+    seg = _make_segmenter()
+    h, w = 100, 100
+    mask_data = np.zeros((1, h, w), dtype=np.float32)
+    mask_data[0, 10:90, 10:90] = 1.0
+    boxes_xyxy = np.array([[10, 10, 90, 90]], dtype=np.float32)
+    seg._model = lambda frame_bgr, conf, iou, imgsz, verbose, retina_masks: [
+        _FakeResult(_FakeMasks(_TorchLike(mask_data)), _FakeBoxes(_TorchLike(boxes_xyxy)))
+    ]
+    seg.conf, seg.iou, seg.imgsz = 0.2, 0.7, 640
+
+    result = seg.segment(np.zeros((h, w, 3), dtype=np.uint8))
+    assert result[50, 50] == True
+    assert not result.all()
+
+
+def test_segment_falls_back_to_passthrough_when_area_implausible():
+    seg = _make_segmenter()
+    h, w = 100, 100
+    mask_data = np.zeros((1, h, w), dtype=np.float32)
+    mask_data[0, 45:55, 45:55] = 1.0  # 1% of frame -- below min_area_frac=0.05
+    boxes_xyxy = np.array([[45, 45, 55, 55]], dtype=np.float32)
+    seg._model = lambda frame_bgr, conf, iou, imgsz, verbose, retina_masks: [
+        _FakeResult(_FakeMasks(_TorchLike(mask_data)), _FakeBoxes(_TorchLike(boxes_xyxy)))
+    ]
+    seg.conf, seg.iou, seg.imgsz = 0.2, 0.7, 640
+
+    result = seg.segment(np.zeros((h, w, 3), dtype=np.uint8))
+    assert result.all()
+
+
+def test_segment_falls_back_to_passthrough_when_touches_border():
+    seg = _make_segmenter()
+    h, w = 100, 100
+    mask_data = np.zeros((1, h, w), dtype=np.float32)
+    mask_data[0, 0:60, 0:60] = 1.0  # touches the top-left image border
+    boxes_xyxy = np.array([[0, 0, 60, 60]], dtype=np.float32)
+    seg._model = lambda frame_bgr, conf, iou, imgsz, verbose, retina_masks: [
+        _FakeResult(_FakeMasks(_TorchLike(mask_data)), _FakeBoxes(_TorchLike(boxes_xyxy)))
+    ]
+    seg.conf, seg.iou, seg.imgsz = 0.2, 0.7, 640
+
+    result = seg.segment(np.zeros((h, w, 3), dtype=np.uint8))
+    assert result.all()

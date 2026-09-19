@@ -1,7 +1,10 @@
-"""MobileSAM wrapper for reference foreground masking (Stage 1).
+"""Reference foreground masking (Stage 1 / stage123_geco2.segmentation) --
+MobileSAM (default), FastSAM, or standalone SAM2, selected by
+SegmentationConfig.model. See build_segmenter() for the dispatch factory.
 
 If weights are unavailable and fallback_if_missing == "passthrough",
-returns an all-ones mask without crashing.
+returns an all-ones mask without crashing (FastSAM/SAM2's segment() always
+behaves this way -- neither has a fallback_if_missing="error" mode).
 """
 from __future__ import annotations
 
@@ -13,6 +16,39 @@ import numpy as np
 from aero_eyes.types import Box
 
 log = logging.getLogger(__name__)
+
+
+def _pick_best_full_frame_mask(
+    masks: np.ndarray, scores: np.ndarray, use_point_prompt: bool, cx: int, cy: int,
+    min_area_frac: float, max_area_frac: float, score_ratio_floor: float, max_border_touch_frac: float,
+) -> np.ndarray:
+    """Shared "which of a SAM-family promptable decoder's multimask_output
+    candidates is the genuine whole-object mask" selection -- the exact
+    algorithm MobileSAMSegmenter.segment() uses (isolate a connected
+    component per candidate, prefer the LARGEST among candidates the model
+    itself scored within score_ratio_floor of its own best AND that pass
+    the area/border-touch plausibility gates, else fall back to the single
+    highest-scoring candidate). Factored out so SAM2Segmenter.segment() can
+    reuse it exactly instead of drifting out of sync with MobileSAM's own
+    tuning -- see MobileSAMSegmenter.segment()'s own docstring for the full
+    rationale behind each step.
+    """
+    from aero_eyes.utils.geometry import isolate_component_at_point
+
+    if use_point_prompt:
+        cleaned = [isolate_component_at_point(m, cx, cy) for m in masks]
+    else:
+        cleaned = [MobileSAMSegmenter._isolate_largest_component(m) for m in masks]
+    areas = [float(m.mean()) for m in cleaned]
+    border_touch = [MobileSAMSegmenter._border_touch_frac(m) for m in cleaned]
+    max_score = float(np.max(scores))
+    confident = [i for i, s in enumerate(scores) if s >= max_score * score_ratio_floor]
+    plausible = [
+        i for i in confident
+        if min_area_frac <= areas[i] <= max_area_frac and border_touch[i] <= max_border_touch_frac
+    ]
+    best_idx = max(plausible, key=lambda i: areas[i]) if plausible else int(np.argmax(scores))
+    return cleaned[best_idx]
 
 
 class MobileSAMSegmenter:
@@ -495,10 +531,24 @@ class FastSAMSegmenter:
     trusting it, same as every other box_refine.method choice.
     """
 
-    def __init__(self, weights: str, conf: float = 0.2, iou: float = 0.7, imgsz: int = 640):
+    def __init__(
+        self, weights: str, conf: float = 0.2, iou: float = 0.7, imgsz: int = 640,
+        min_area_frac: float = 0.05, max_area_frac: float = 0.95,
+        max_border_touch_frac: float = 0.02, use_point_prompt: bool = True,
+    ):
         self.conf = conf
         self.iou = iou
         self.imgsz = imgsz
+        # Only used by segment() (SegmentationConfig.model="fastsam") --
+        # segment_box_cached() above (box_refine.method="fastsam_dense")
+        # trusts its own box-IoU match directly instead, same as every
+        # other box_refine method. Same names/semantics as
+        # MobileSAMSegmenter's own plausibility gates -- see its __init__
+        # for the full rationale.
+        self.min_area_frac = min_area_frac
+        self.max_area_frac = max_area_frac
+        self.max_border_touch_frac = max_border_touch_frac
+        self.use_point_prompt = use_point_prompt
         self._model = None
         try:
             from ultralytics import FastSAM  # type: ignore
@@ -585,6 +635,52 @@ class FastSAMSegmenter:
             return None
         return self._cached_masks[best_i]
 
+    def segment(self, image_bgr: np.ndarray) -> np.ndarray:
+        """SegmentationConfig.model == "fastsam" (reference-image
+        foreground masking, Stage 1 / stage123_geco2.segmentation) --
+        different job from segment_box_cached above (box_refine, matching
+        against an already-detected box): here there is no box yet, so
+        this matches the same synthetic near-full-frame box (+ optional
+        center-point containment via use_center_point) MobileSAMSegmenter.
+        segment()/SAM2Segmenter.segment() prompt with, against whatever
+        instance set_frame()'s "segment everything" pass already produced
+        -- see class docstring for FastSAM's own ceiling here (can only
+        SELECT among those, never generate a new mask conditioned on the
+        prompt). Falls back to an all-ones passthrough mask if FastSAM is
+        unavailable, finds nothing, nothing matches, or the picked mask
+        fails the same area/border-touch plausibility gates MobileSAM/SAM2
+        apply.
+        """
+        h, w = image_bgr.shape[:2]
+        if self._model is None:
+            return np.ones((h, w), dtype=bool)
+        try:
+            if not self.set_frame(image_bgr):
+                return np.ones((h, w), dtype=bool)
+            margin = 0.05
+            synthetic_box = Box(w * margin, h * margin, w * (1 - margin), h * (1 - margin))
+            mask = self.segment_box_cached(synthetic_box, margin=0.0, use_center_point=self.use_point_prompt)
+            if mask is None:
+                return np.ones((h, w), dtype=bool)
+            area_frac = mask.mean()
+            if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
+                log.warning(
+                    "FastSAM mask area implausible (%.1f%% of frame), using passthrough mask.",
+                    area_frac * 100,
+                )
+                return np.ones((h, w), dtype=bool)
+            border_touch = MobileSAMSegmenter._border_touch_frac(mask)
+            if border_touch > self.max_border_touch_frac:
+                log.warning(
+                    "FastSAM mask touches the image border (%.1f%% of edge pixels), likely "
+                    "leaked into background; using passthrough mask.", border_touch * 100,
+                )
+                return np.ones((h, w), dtype=bool)
+            return mask
+        except Exception as e:
+            log.warning("FastSAM segment() inference failed (%s), using passthrough mask.", e)
+            return np.ones((h, w), dtype=bool)
+
 
 class SAM2Segmenter:
     """box_refine.method == "sam2_native": a GENUINELY standalone SAM2 --
@@ -624,8 +720,24 @@ class SAM2Segmenter:
         "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt"
     )
 
-    def __init__(self, geco2_repo_path: str, device: str | None = None):
+    def __init__(
+        self, geco2_repo_path: str, device: str | None = None,
+        min_area_frac: float = 0.05, max_area_frac: float = 0.95,
+        score_ratio_floor: float = 0.85, max_border_touch_frac: float = 0.02,
+        use_point_prompt: bool = True,
+    ):
         self.device = device or ("cuda" if _cuda_available() else "cpu")
+        # Only used by segment() (SegmentationConfig.model="sam2") --
+        # segment_box_cached() below (box_refine.method="sam2_native")
+        # trusts its own predicted-IoU score directly instead, same as
+        # every other box_refine method. Same names/semantics as
+        # MobileSAMSegmenter's own plausibility gates -- see its __init__
+        # for the full rationale.
+        self.min_area_frac = min_area_frac
+        self.max_area_frac = max_area_frac
+        self.score_ratio_floor = score_ratio_floor
+        self.max_border_touch_frac = max_border_touch_frac
+        self.use_point_prompt = use_point_prompt
         self._predictor = None
         self._available = False
         try:
@@ -801,6 +913,90 @@ class SAM2Segmenter:
         except Exception as e:
             log.warning("SAM2 (standalone) box-refine inference failed (%s).", e)
             return None
+
+    def segment(self, image_bgr: np.ndarray) -> np.ndarray:
+        """SegmentationConfig.model == "sam2" (reference-image foreground
+        masking, Stage 1 / stage123_geco2.segmentation) -- same near-
+        full-frame box (+ optional center-point) prompt and candidate-
+        selection algorithm as MobileSAMSegmenter.segment (see
+        _pick_best_full_frame_mask), just decoded by SAM2's own promptable
+        decoder instead of MobileSAM's. Falls back to an all-ones
+        passthrough mask if SAM2 is unavailable or inference fails
+        (SAM2Segmenter has no fallback_if_missing="error" mode -- see class
+        docstring).
+        """
+        h, w = image_bgr.shape[:2]
+        if not self._available:
+            return np.ones((h, w), dtype=bool)
+        try:
+            if not self.set_frame(image_bgr):
+                return np.ones((h, w), dtype=bool)
+            margin = 0.05
+            box = np.array([w * margin, h * margin, w * (1 - margin), h * (1 - margin)])
+            if self.use_point_prompt:
+                cx, cy = w // 2, h // 2
+                point_coords, point_labels = np.array([[cx, cy]]), np.array([1])
+            else:
+                cx = cy = 0
+                point_coords, point_labels = None, None
+            masks, scores, _ = self._predictor.predict(
+                point_coords=point_coords, point_labels=point_labels, box=box, multimask_output=True,
+            )
+            mask = _pick_best_full_frame_mask(
+                masks, scores, self.use_point_prompt, cx, cy,
+                self.min_area_frac, self.max_area_frac, self.score_ratio_floor, self.max_border_touch_frac,
+            )
+            area_frac = mask.mean()
+            if area_frac < self.min_area_frac or area_frac > self.max_area_frac:
+                log.warning(
+                    "SAM2 (standalone) mask area implausible (%.1f%% of frame), using passthrough mask.",
+                    area_frac * 100,
+                )
+                return np.ones((h, w), dtype=bool)
+            border_touch = MobileSAMSegmenter._border_touch_frac(mask)
+            if border_touch > self.max_border_touch_frac:
+                log.warning(
+                    "SAM2 (standalone) mask touches the image border (%.1f%% of edge pixels), "
+                    "likely leaked into background; using passthrough mask.", border_touch * 100,
+                )
+                return np.ones((h, w), dtype=bool)
+            return mask
+        except Exception as e:
+            log.warning("SAM2 (standalone) segment() inference failed (%s), using passthrough mask.", e)
+            return np.ones((h, w), dtype=bool)
+
+
+def build_segmenter(seg_cfg, cfg):
+    """Factory: builds the configured reference-image segmentation backend
+    (seg_cfg.model: mobilesam | fastsam | sam2 -- see SegmentationConfig's
+    own docstring for the tradeoffs) for stage1.segmentation /
+    stage123_geco2.segmentation. Takes the FULL config (not just seg_cfg)
+    because fastsam/sam2 need fields that live outside SegmentationConfig
+    itself: fastsam reuses stage2.fastsam_s's weights/conf/iou/imgsz (the
+    SAME FastSAM-s checkpoint stage2's own proposal model uses, if
+    configured -- avoids requiring a second, separately-configured FastSAM
+    checkpoint just for this), sam2 needs stage123_geco2.repo_path (the
+    vendored GECO2/sam2 package)."""
+    if seg_cfg.model == "fastsam":
+        fs_cfg = cfg.stage2.fastsam_s
+        return FastSAMSegmenter(
+            weights=fs_cfg.weights, conf=fs_cfg.conf, iou=fs_cfg.iou, imgsz=fs_cfg.imgsz,
+            min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
+            max_border_touch_frac=seg_cfg.max_border_touch_frac, use_point_prompt=seg_cfg.use_point_prompt,
+        )
+    if seg_cfg.model == "sam2":
+        return SAM2Segmenter(
+            cfg.stage123_geco2.repo_path,
+            min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
+            score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
+            use_point_prompt=seg_cfg.use_point_prompt,
+        )
+    return MobileSAMSegmenter(
+        weights_path=seg_cfg.weights, fallback_if_missing=seg_cfg.fallback_if_missing,
+        min_area_frac=seg_cfg.min_area_frac, max_area_frac=seg_cfg.max_area_frac,
+        score_ratio_floor=seg_cfg.score_ratio_floor, max_border_touch_frac=seg_cfg.max_border_touch_frac,
+        use_point_prompt=seg_cfg.use_point_prompt,
+    )
 
 
 def _cuda_available() -> bool:

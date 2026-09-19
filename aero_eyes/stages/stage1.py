@@ -45,7 +45,7 @@ def run_stage1(cfg, sample_id: str) -> Path:
     """Run Stage 1 for the given sample. Returns path to prototype.npz."""
     from aero_eyes.config import load_config
     from aero_eyes.models.features import build_feature_extractor
-    from aero_eyes.models.segmentation import MobileSAMSegmenter
+    from aero_eyes.models.segmentation import build_segmenter
     from aero_eyes.utils.geometry import apply_background_mode, crop_to_object, generate_synth_views, mask_bbox
     from aero_eyes.utils.io import write_prototype
     from aero_eyes.utils import viz as vizmod
@@ -77,12 +77,9 @@ def run_stage1(cfg, sample_id: str) -> Path:
     ref_paths = ref_paths[: cfg.data.num_references]
     ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
 
-    # ---- 2. MobileSAM masking ----
+    # ---- 2. Reference-image foreground masking (mobilesam | fastsam | sam2) ----
     seg_cfg = cfg.stage1.segmentation
-    segmenter = MobileSAMSegmenter(
-        weights_path=seg_cfg.weights,
-        fallback_if_missing=seg_cfg.fallback_if_missing,
-    ) if seg_cfg.enabled else None
+    segmenter = build_segmenter(seg_cfg, cfg) if seg_cfg.enabled else None
 
     masked_imgs: list[np.ndarray] = []
     masks: list[np.ndarray] = []
