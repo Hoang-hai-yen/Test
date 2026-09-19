@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -140,11 +141,35 @@ def merge_submissions(
         sample_ids = sorted(d.name for d in work_dir.iterdir() if d.is_dir())
 
     out_path = Path(out_path)
+    merged: dict = {}
     if out_path.exists():
-        with open(out_path) as f:
-            merged = {e["video_id"]: e for e in json.load(f)}
+        try:
+            with open(out_path) as f:
+                merged = {e["video_id"]: e for e in json.load(f)}
+        except json.JSONDecodeError as e:
+            # out_path is read-modify-written on EVERY run_all.py invocation
+            # (unlike every other artifact here, which is written once and
+            # never re-read) -- an interrupted write (killed process, OOM,
+            # concurrent runs sharing the same work_dir) can leave it
+            # truncated/corrupted. That corruption would otherwise crash
+            # every future run at this very last step, even though every
+            # per-sample submission.json it would merge is untouched and
+            # intact -- so warn loudly and start from empty (this run's own
+            # sample_ids get merged in below as usual) rather than blocking
+            # the whole pipeline on a file that exists purely to aggregate
+            # data already safely on disk elsewhere. Entries from OTHER
+            # samples a past run merged in (but not part of THIS run's own
+            # sample_ids) are lost from the aggregate this way -- rebuild
+            # them by re-running merge_submissions with every sample_id
+            # that has its own submission.json on disk.
+            log.warning(
+                "merge_submissions: %s is corrupted (%s) -- starting from an empty "
+                "merge instead of crashing. Every per-sample submission.json is "
+                "untouched; re-run with ALL processed sample_ids to rebuild any "
+                "other samples' entries this dropped from the aggregate.",
+                out_path, e,
+            )
     else:
-        merged = {}
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
     missing: list[str] = []
@@ -157,8 +182,15 @@ def merge_submissions(
             for entry in json.load(f):
                 merged[entry["video_id"]] = entry
 
-    with open(out_path, "w") as f:
+    # Atomic write (temp file + os.replace, both on the SAME filesystem as
+    # out_path so the replace is a single directory-entry swap, not a
+    # copy): a process killed mid-write to a temp file just leaves an
+    # orphaned .tmp, never a half-written out_path -- exactly the failure
+    # mode that produced the corrupted-file recovery path above.
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(list(merged.values()), f, indent=2)
+    os.replace(tmp_path, out_path)
 
     if missing:
         log.warning("merge_submissions: %d sample(s) had no submission file yet: %s",

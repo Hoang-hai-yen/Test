@@ -327,6 +327,26 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                 )
             ref_imgs = multiscale_imgs
             ref_boxes = multiscale_boxes
+    else:
+        # No mask/box exists without segmentation, so background-fill/
+        # crop_to_object above (both need one) are skipped here -- but
+        # ref_downscale_factor/ref_downscale_levels is just a resize, no
+        # mask required, so it still applies to the RAW reference images.
+        # Previously there was no else branch at all here, which silently
+        # made both a no-op whenever segmentation.enabled was false,
+        # regardless of their own value -- neither field's own docstring
+        # documented that dependency. ref_boxes stays None (whole image,
+        # its value from above) since there's no box to scale alongside.
+        levels = list(g.ref_downscale_levels) if g.ref_downscale_levels else [g.ref_downscale_factor]
+        num_orig_refs = len(ref_imgs)
+        ref_imgs = [_apply_ref_downscale(img, f) for img in ref_imgs for f in levels]
+        if len(levels) > 1:
+            log.info(
+                "[Stage123-GeCo2] %s: ref_downscale_levels multi-scale exemplar "
+                "(segmentation disabled) -- %d ref image(s) x %d level(s) = %d "
+                "exemplar entries (levels=%s)",
+                sample_id, num_orig_refs, len(levels), len(ref_imgs), levels,
+            )
 
     prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
 

@@ -1720,6 +1720,9 @@ class Stage123Geco2Config(BaseModel):
     # NOTE: proven no-op on final object SIZE on the model's canvas (see
     # ScaleCalibrationConfig docstring) -- it only affects blur/detail level.
     # Use scale_calibration below to actually fix apparent-size mismatch.
+    # Applies whether or not segmentation.enabled -- with it off, shrinks
+    # the RAW (unmasked) reference image instead of the masked/background-
+    # filled/cropped one.
     ref_downscale_factor: float = 1.0
     # Multi-blur appearance-token ensemble (opt-in, config toggle since we
     # don't yet know if it helps): when set (non-empty), OVERRIDES
