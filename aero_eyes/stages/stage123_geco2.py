@@ -152,6 +152,30 @@ def _load_ref_images(cfg, sample_id: str) -> list:
     return [cv2.imread(str(p)) for p in ref_paths]
 
 
+def _save_mask_box_viz(ref_imgs: list[np.ndarray], raw_boxes: list, out_dir: Path) -> None:
+    """Debug viz: draws MobileSAM's tight mask_bbox on top of the ORIGINAL
+    (unprocessed, un-background-filled) reference photo -- lets you
+    sanity-check that segmentation actually bounds the real object BEFORE
+    trusting a downstream crop/scale sweep built from it
+    (auto_scale_calibration, learned_scale_fusion, crop_to_object,
+    scale_calibration all pool from exactly this box). Drawn on the
+    original photo (not background_mode-filled/blurred) so surrounding
+    context stays visible for judging whether the box is tight/correct or
+    has drifted onto background/a wrong object.
+    """
+    from aero_eyes.utils.viz import draw_box
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, (img, b) in enumerate(zip(ref_imgs, raw_boxes)):
+        annotated = img.copy()
+        if b is not None:
+            draw_box(annotated, Box(*b), "MobileSAM tight box", (0, 255, 0))
+        else:
+            cv2.putText(annotated, "no mask/box (empty mask?)", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        cv2.imwrite(str(out_dir / f"ref_{i}_mask_box.jpg"), annotated)
+
+
 def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
     """Exemplar-token build shared by run_stage123_geco2() (below) and
     scripts/check_geco2_score_separation.py, so the diagnostic script always
@@ -225,6 +249,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                    for img, m in zip(ref_imgs, masks)]
         if cfg.runtime.save_visualizations:
             vizmod.save_stage1_refs(bg_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+            _save_mask_box_viz(ref_imgs, raw_boxes, work_dir / "viz" / "stage123_geco2" / "refs_mask_box")
 
         video_path = _locate_video(cfg, sample_id)
         prototype, debug_info = build_auto_scaled_prototype(
@@ -275,6 +300,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                    for img, m in zip(ref_imgs, masks)]
         if cfg.runtime.save_visualizations:
             vizmod.save_stage1_refs(bg_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+            _save_mask_box_viz(ref_imgs, raw_boxes, work_dir / "viz" / "stage123_geco2" / "refs_mask_box")
 
         multiscale_imgs: list[np.ndarray] = []
         multiscale_boxes: list[tuple[float, float, float, float] | None] = []
@@ -323,6 +349,8 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
         # resize_and_pad zero-padding, diluting the exemplar token
         # (empirically confirmed to matter).
         raw_boxes = [mask_bbox(m) for m in masks]
+        if cfg.runtime.save_visualizations:
+            _save_mask_box_viz(ref_imgs, raw_boxes, work_dir / "viz" / "stage123_geco2" / "refs_mask_box")
 
         if sc_cfg.enabled:
             # scale_calibration: build a canvas per (ref image, scale) pair

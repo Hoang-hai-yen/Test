@@ -19,7 +19,7 @@ from aero_eyes.types import Box
 
 def _make_cfg(
     accuracy_mode="cheap_boosters", multi_reference_embedding=True, multi_ref_pooling="mean",
-    topk_fusion_overrides=None, **dp_overrides,
+    topk_fusion_overrides=None, cluster_verification_overrides=None, **dp_overrides,
 ):
     tk_defaults = dict(
         enabled=False, cosine_weight=0.5, running_window=50, min_window_for_zscore=5, acceptance_z_threshold=0.0,
@@ -28,6 +28,11 @@ def _make_cfg(
         min_absolute_cosine_floor_self_calibrate=False, min_absolute_cosine_floor_self_calibrate_ratio=0.3,
     )
     tk_defaults.update(topk_fusion_overrides or {})
+    cv_defaults = dict(
+        enabled=False, cluster_method="hdbscan", min_cluster_size=2, min_samples=None,
+        spectral_n_clusters=2, min_candidates_for_cluster=4,
+    )
+    cv_defaults.update(cluster_verification_overrides or {})
     dp_defaults = dict(
         enabled=True,
         max_tokens=3,
@@ -39,6 +44,7 @@ def _make_cfg(
         cross_check_threshold_self_calibrate=False,
         cross_check_threshold_self_calibrate_ratio=0.7,
         topk_fusion=SimpleNamespace(**tk_defaults),
+        cluster_verification=SimpleNamespace(**cv_defaults),
     )
     dp_defaults.update(dp_overrides)
     return SimpleNamespace(

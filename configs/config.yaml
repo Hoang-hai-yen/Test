@@ -358,6 +358,49 @@ stage3:
     # unrepresentative slice. false (default) = unchanged, count-only gate.
     require_diverse_picks: false
     min_frame_span: 30
+  # "threshold" (default): accept/reject via match_threshold or
+  #   adaptive_threshold above (z_score/otsu/gmm, batch or online).
+  # "cluster": DAVE (arXiv:2404.16622) module (ii)-style per-keyframe
+  #   exemplar-cluster verification instead of a global scalar threshold --
+  #   see cluster_verification below and ClusterVerificationConfig's own
+  #   docstring in aero_eyes/config.py for the full rationale. Groups this
+  #   video's candidates by keyframe and, for each keyframe independently,
+  #   clusters that keyframe's own candidate features together with
+  #   per_ref_features (the exemplar features); a candidate is kept iff it
+  #   clusters with an exemplar. No scalar threshold at all in this mode,
+  #   so adaptive_threshold/adaptive_threshold_online/match_threshold above
+  #   are ignored. Naturally causal (each keyframe's decision only reads
+  #   that keyframe's own candidates + the current exemplar set) -- for a
+  #   fully causal run also leave dynamic_prototype above disabled (still a
+  #   whole-video batch mechanism); a warning is logged and cluster wins if
+  #   both are enabled together.
+  verification_method: threshold   # threshold | cluster -- this field is the switch, NOT cluster_verification.enabled below (unlike stage123_geco2.dynamic_prototype.cluster_verification, where enabled IS the switch)
+  # NOT YET VALIDATED against this project's own footage -- compare against
+  # the z_score/otsu/gmm baseline (e.g.
+  # scripts/compare_cluster_vs_zscore_verification.py-style before/after) on
+  # your own videos before trusting it in production, same as every other
+  # opt-in accuracy knob in this project.
+  cluster_verification:
+    enabled: false
+    # "hdbscan" (default, RECOMMENDED): density-based, does NOT need the
+    #   number of clusters chosen up front, and natively labels low-density
+    #   points as noise (-1) instead of forcing every point into some
+    #   cluster -- directly targets "distribution shape varies per
+    #   video/keyframe" since it makes no shape assumption at all.
+    # "spectral": matches DAVE's paper exactly (spectral clustering on the
+    #   cosine-similarity affinity matrix), but needs spectral_n_clusters
+    #   chosen up front -- itself a hyperparameter as fragile as a z-score.
+    #   Kept so it can be A/B'd against hdbscan on this project's own
+    #   footage instead of assuming the paper's own choice transfers here.
+    cluster_method: hdbscan   # hdbscan | spectral
+    min_cluster_size: 2       # hdbscan only
+    min_samples: null         # hdbscan only; null = sklearn default (= min_cluster_size)
+    spectral_n_clusters: 2    # spectral only
+    # Below this many candidates this keyframe, clustering can't find
+    # meaningful density/spectral structure -- falls back to a plain fixed
+    # cosine cutoff (match_threshold) instead, same "too little data for a
+    # shape method" precedent otsu/gmm use for adaptive_threshold_min_samples.
+    min_candidates_for_cluster: 4
 
 # ----------------------------------------------------------------------------
 # STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
@@ -781,6 +824,36 @@ stage123_geco2:
       # with ref_self_sim * ratio.
       min_absolute_cosine_floor_self_calibrate: false
       min_absolute_cosine_floor_self_calibrate_ratio: 0.3
+
+    # ----------------------------------------------------------------------
+    # DAVE (arXiv:2404.16622) module (ii)-style alternative to topk_fusion
+    # above: instead of Z-scoring cosine+geco2 scores against a running
+    # window/intra-frame baseline (needs min_window_for_zscore keyframes to
+    # warm up, falls back to blindly trusting boxes[0] until then), clusters
+    # this keyframe's own candidate feature_extractor embeddings together
+    # with the exemplar embeddings and only ever considers candidates that
+    # cluster with an exemplar -- see stage3.cluster_verification above and
+    # ClusterVerificationConfig's own docstring (aero_eyes/config.py) for
+    # the shared mechanism. Needs no warm-up: the very first keyframe can
+    # verify and accept a candidate, since the decision only ever depends
+    # on THIS keyframe's own candidates + the current exemplar set, never
+    # on accumulated history. Needs cross_check_source=feature_extractor
+    # (the embedding space `feats` already provides per candidate) --
+    # falls back to topk_fusion/plain selection, with a warning, otherwise.
+    # Mutually exclusive with topk_fusion above -- cluster_verification
+    # wins (with a warning) if both are enabled.
+    # NOT YET VALIDATED -- compare against the topk_fusion baseline (see
+    # scripts/compare_cluster_vs_zscore_verification.py) before trusting it.
+    # ----------------------------------------------------------------------
+    cluster_verification:
+      enabled: false
+      cluster_method: hdbscan   # hdbscan | spectral -- see stage3.cluster_verification's own comment
+      min_cluster_size: 2       # hdbscan only
+      min_samples: null         # hdbscan only; null = sklearn default (= min_cluster_size)
+      spectral_n_clusters: 2    # spectral only
+      # Below this many surviving candidates this keyframe, falls back to
+      # today's plain cosine gate (cross_check_threshold) instead.
+      min_candidates_for_cluster: 4
 
   # --------------------------------------------------------------------
   # DIAGNOSTIC/ABLATION: box size feeds the exemplar prototype through TWO

@@ -1015,6 +1015,17 @@ class GeCo2DynamicPrototypeTracker:
         self._n_topk_intra_frame_baseline = 0
         self._n_topk_floor_rejected = 0
         self._warned_topk_fusion_unsupported = False
+        # dynamic_prototype.cluster_verification (opt-in, offer_topk() only
+        # -- see _offer_topk_cluster's own docstring): DAVE-style
+        # alternative to topk_fusion's Z-score fusion above. Separate
+        # counters so log_summary() can report how many keyframes verified
+        # nothing at all (reported absent) vs. fell back to the plain
+        # cosine-threshold gate (too few candidates for clustering).
+        self._n_cluster_offers = 0
+        self._n_cluster_unverified = 0
+        self._n_cluster_fallback = 0
+        self._warned_cluster_topk_conflict = False
+        self._warned_cluster_verification_unsupported = False
         if tk_cfg.enabled and dp_cfg.cross_check_source != "feature_extractor":
             log.warning(
                 "[Stage123-GeCo2] %s: dynamic_prototype.topk_fusion.enabled=true but "
@@ -1025,6 +1036,16 @@ class GeCo2DynamicPrototypeTracker:
                 sample_id, dp_cfg.cross_check_source,
             )
             self._warned_topk_fusion_unsupported = True
+        cv_cfg = dp_cfg.cluster_verification
+        if cv_cfg.enabled and dp_cfg.cross_check_source != "feature_extractor":
+            log.warning(
+                "[Stage123-GeCo2] %s: dynamic_prototype.cluster_verification.enabled=true but "
+                "cross_check_source=%s -- cluster_verification needs 'feature_extractor' (the "
+                "same embedding space `feats` already provides per candidate) -- offer_topk() "
+                "will fall back to topk_fusion/plain selection for the rest of this run.",
+                sample_id, dp_cfg.cross_check_source,
+            )
+            self._warned_cluster_verification_unsupported = True
         log.info(
             "[Stage123-GeCo2] %s: dynamic_prototype tracker built (max_tokens=%d, "
             "min_consecutive_hits=%d, consecutive_hits_iou=%.2f, cross_check_source=%s, "
@@ -1164,6 +1185,38 @@ class GeCo2DynamicPrototypeTracker:
         if not self.dp_cfg.enabled or not boxes:
             return
         tk_cfg = self.dp_cfg.topk_fusion
+        cv_cfg = self.dp_cfg.cluster_verification
+        if cv_cfg.enabled:
+            if tk_cfg.enabled and not self._warned_cluster_topk_conflict:
+                log.warning(
+                    "[Stage123-GeCo2] %s: both dynamic_prototype.cluster_verification.enabled "
+                    "and topk_fusion.enabled are true -- cluster_verification wins, topk_fusion "
+                    "is ignored for the rest of this run.", self.sample_id,
+                )
+                self._warned_cluster_topk_conflict = True
+            if self.dp_cfg.cross_check_source != "feature_extractor":
+                if not self._warned_cluster_verification_unsupported:
+                    log.warning(
+                        "[Stage123-GeCo2] %s: dynamic_prototype.cluster_verification.enabled=true "
+                        "but cross_check_source=%s -- cluster_verification needs 'feature_extractor' "
+                        "(the same embedding space `feats` already provides per candidate here) -- "
+                        "falling back to topk_fusion/plain selection for the rest of this run.",
+                        self.sample_id, self.dp_cfg.cross_check_source,
+                    )
+                    self._warned_cluster_verification_unsupported = True
+            else:
+                ref_feats = self._ref_feats_for_cluster()
+                if ref_feats is None:
+                    if not self._warned_cross_unavailable:
+                        log.warning(
+                            "[Stage123-GeCo2] %s: dynamic_prototype.cluster_verification.enabled=true "
+                            "but no prototype.npz found at %s -- falling back to topk_fusion/plain "
+                            "selection for the rest of this run.", self.sample_id, self._cross_prototype_path,
+                        )
+                        self._warned_cross_unavailable = True
+                else:
+                    self._offer_topk_cluster(frame_bgr, boxes, feats, ref_feats, frame_idx)
+                    return
         if not tk_cfg.enabled or self.dp_cfg.cross_check_source != "feature_extractor" or self._cross_prototype is None:
             self.offer(frame_bgr, boxes[0], precomputed_feature=feats[0], frame_idx=frame_idx)
             return
@@ -1291,6 +1344,95 @@ class GeCo2DynamicPrototypeTracker:
             len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
 
+    def _offer_topk_cluster(
+        self, frame_bgr: np.ndarray, boxes: list[Box], feats: np.ndarray,
+        ref_feats: np.ndarray, frame_idx: int | None,
+    ) -> None:
+        """dynamic_prototype.cluster_verification (opt-in, offer_topk() only):
+        DAVE (arXiv:2404.16622) module (ii)-style alternative to topk_fusion's
+        Z-score fusion -- see ClusterVerificationConfig's own docstring
+        (config.py) for the shared mechanism. Clusters EVERY surviving
+        candidate's feature_extractor embedding (`feats`) together with the
+        current exemplar set (`ref_feats`); only candidates that cluster with
+        an exemplar are even considered. Needs no warm-up window and has no
+        cold-start fallback to "just trust boxes[0]" -- the decision only
+        ever depends on THIS keyframe's own candidates + the current
+        exemplar set, never on accumulated history, so it's exactly as
+        trustworthy on keyframe 1 as on keyframe 1000.
+
+        If NOTHING verifies this keyframe, returns early (no confirmer
+        offer, no dynamic-token update) -- reports absent rather than
+        falling back to GeCo2's own unverified top pick, which is the
+        direct fix for topk_fusion's own cold-start behavior (trusting
+        boxes[0] blindly until its Z-score window warms up).
+        """
+        from aero_eyes.utils.cluster_verify import cluster_verify_candidates
+
+        self._n_offers += 1
+        self._n_cluster_offers += 1
+
+        def _fallback_keep_mask(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
+            # Too few candidates this keyframe for clustering to find
+            # meaningful structure -- fall back to today's plain cosine gate.
+            del ref_feats_frame  # _cosine_from_feature already pools against self._cross_per_ref_features
+            self._n_cluster_fallback += 1
+            sims = np.array([self._cosine_from_feature(f) for f in cand_feats_frame])
+            return sims >= self._effective_cross_check_threshold()
+
+        keep_mask, method_label = cluster_verify_candidates(
+            feats, ref_feats, self.dp_cfg.cluster_verification, fallback_keep_mask_fn=_fallback_keep_mask,
+        )
+        verified_idxs = np.where(keep_mask)[0]
+        if verified_idxs.size == 0:
+            self._n_cluster_unverified += 1
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype (cluster_verification, %s) -- 0/%d "
+                "candidates verified this keyframe, reporting absent.",
+                self.sample_id, method_label, len(boxes),
+            )
+            return
+
+        # GeCo2's own raw score breaks ties WITHIN the verified set -- still
+        # useful for ranking once TP/FP has already been decided by
+        # clustering, just not trusted alone for the TP/FP decision itself.
+        geco2_scores = np.array([boxes[i].score for i in verified_idxs], dtype=np.float64)
+        chosen_idx = int(verified_idxs[int(np.argmax(geco2_scores))])
+        if chosen_idx != 0:
+            self._n_topk_fused_selected_non_top1 += 1
+
+        chosen_box = boxes[chosen_idx]
+        confirmed = self._confirmer.offer(chosen_box)
+        if confirmed is None:
+            return  # not yet min_consecutive_hits in a row on the CHOSEN candidate
+        self._n_confirmed += 1
+
+        new_tokens = self.detector.encode_exemplars(
+            [frame_bgr], [(confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2)],
+        )
+
+        if self.dp_cfg.freeze_when_full and len(self._dynamic_tokens) >= self.dp_cfg.max_tokens:
+            self._n_frozen_rejected += 1
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype (cluster_verification) candidate at "
+                "frame region (%.0f,%.0f,%.0f,%.0f) [chosen_idx=%d/%d, %s] passed verification "
+                "but freeze_when_full -- %d/%d slots already full, set stays as-is.",
+                self.sample_id, confirmed.x1, confirmed.y1, confirmed.x2, confirmed.y2,
+                chosen_idx, len(boxes), method_label, len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+            )
+            return
+
+        self._n_appended += 1
+        self._dynamic_tokens.append(new_tokens)
+        if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
+            self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
+        self._save_debug_viz(frame_bgr, confirmed, frame_idx, f"cluster_verified({method_label})")
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype (cluster_verification, %s) appended a token "
+            "(frame=%s, chosen_idx=%d/%d) -- %d/%d dynamic token(s) active",
+            self.sample_id, method_label, frame_idx, chosen_idx, len(boxes),
+            len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+        )
+
     def _save_debug_viz(self, frame_bgr: np.ndarray, box: Box, frame_idx: int | None, label: str) -> None:
         """Gated by cfg.runtime.save_visualizations (same convention every
         other stage's viz uses) -- saves the crop + full-frame context for
@@ -1335,6 +1477,15 @@ class GeCo2DynamicPrototypeTracker:
                 "absolute cosine floor", self.sample_id, self._n_topk_offers,
                 self._n_topk_warmup, self._n_topk_intra_frame_baseline,
                 self._n_topk_fused_selected_non_top1, self._n_topk_floor_rejected,
+            )
+        if self.dp_cfg.cluster_verification.enabled and self._n_cluster_offers > 0:
+            log.info(
+                "[Stage123-GeCo2] %s: dynamic_prototype cluster_verification summary "
+                "(cluster_method=%s) -- %d offer_topk() call(s), %d keyframe(s) verified NOTHING "
+                "(reported absent), %d fell back to the plain cosine gate (too few candidates), "
+                "%d chose a candidate OTHER than GeCo2's own top pick",
+                self.sample_id, self.dp_cfg.cluster_verification.cluster_method, self._n_cluster_offers,
+                self._n_cluster_unverified, self._n_cluster_fallback, self._n_topk_fused_selected_non_top1,
             )
 
     def _get_ref_self_sim(self) -> float | None:
@@ -1500,6 +1651,28 @@ class GeCo2DynamicPrototypeTracker:
             pooling = self.cfg.accuracy.cheap_boosters.multi_ref_pooling
             return float(sims.max()) if pooling == "max" else float(sims.mean())
         return float(feat @ self._cross_prototype)
+
+    def _ref_feats_for_cluster(self) -> np.ndarray | None:
+        """Exemplar feature set for dynamic_prototype.cluster_verification
+        (_offer_topk_cluster) -- the same per_ref_features primitive
+        stage3.py's own cluster verification uses, in the SAME
+        feature_extractor space `feats` (offer_topk's own argument) already
+        lives in. Prefers the 3 individual reference-image vectors
+        (multi_reference_embedding) over the single fused prototype, same
+        preference _cosine_from_feature already applies. Returns None (caller
+        falls back to topk_fusion/plain selection, with a one-time warning)
+        when neither is available -- e.g. cross_check_source="hiera", where
+        _cross_prototype is never populated at all."""
+        use_multi_ref = (
+            self.cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+            and self.cfg.accuracy.cheap_boosters.multi_reference_embedding
+            and self._cross_per_ref_features
+        )
+        if use_multi_ref:
+            return np.stack(self._cross_per_ref_features, axis=0)
+        if self._cross_prototype is not None:
+            return self._cross_prototype[None, :]
+        return None
 
 
 class _GeCo2Args:

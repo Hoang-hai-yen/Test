@@ -562,11 +562,19 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # ENTIRE video's candidates just as much as a batch threshold would, so
     # it's skipped entirely (not just its role in the threshold below) when
     # adaptive_threshold_online is active, to keep all_sims itself causal.
-    if s3.adaptive_threshold and s3.adaptive_threshold_online and s3.dynamic_prototype.enabled:
+    # verification_method="cluster" is causal for the same reason (each
+    # keyframe's decision only ever reads that keyframe's own candidates +
+    # per_ref_features as currently populated) -- skipped there too.
+    _dp_incompatible_reason = None
+    if s3.verification_method == "cluster":
+        _dp_incompatible_reason = "verification_method='cluster'"
+    elif s3.adaptive_threshold and s3.adaptive_threshold_online:
+        _dp_incompatible_reason = "adaptive_threshold_online=true"
+    if _dp_incompatible_reason and s3.dynamic_prototype.enabled:
         log.warning(
-            "[Stage3] %s: adaptive_threshold_online=true is incompatible with "
-            "stage3.dynamic_prototype (also a whole-video batch mechanism) -- "
-            "skipping dynamic_prototype rounds entirely this run.", sample_id,
+            "[Stage3] %s: %s is incompatible with stage3.dynamic_prototype "
+            "(also a whole-video batch mechanism) -- skipping dynamic_prototype "
+            "rounds entirely this run.", sample_id, _dp_incompatible_reason,
         )
     else:
         prototype, all_sims, per_ref_features = run_dynamic_prototype_rounds(
@@ -613,7 +621,63 @@ def run_stage3(cfg, sample_id: str) -> Path:
     )
 
     # ---- Compute effective threshold + filter ----
-    if s3.adaptive_threshold and s3.adaptive_threshold_online:
+    if s3.verification_method == "cluster":
+        # DAVE (arXiv:2404.16622) module (ii)-style per-keyframe exemplar-
+        # cluster verification, in place of a global scalar threshold -- see
+        # ClusterVerificationConfig's own docstring (aero_eyes/config.py)
+        # for the full rationale. Naturally causal: each keyframe's decision
+        # below only ever reads that keyframe's own candidates (all_feats
+        # sliced by frame_idx) + per_ref_features as currently populated --
+        # no dependency on any other keyframe's similarity scores, unlike
+        # every branch of compute_adaptive_threshold/OnlineAdaptiveThreshold.
+        from collections import defaultdict as _defaultdict
+
+        from aero_eyes.utils.cluster_verify import cluster_verify_candidates
+
+        frame_to_indices: dict[int, list[int]] = _defaultdict(list)
+        for i, fi in enumerate(all_frame_idxs):
+            frame_to_indices[fi].append(i)
+
+        ref_feats_for_cluster = (
+            np.stack(per_ref_features, axis=0) if use_multi_ref else prototype[None, :]
+        )
+
+        def _fallback_keep_mask(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
+            # Too few candidates this keyframe for clustering to find
+            # meaningful structure -- fall back to a plain fixed cosine
+            # cutoff (s3.match_threshold) against these same features,
+            # same "too little data for a shape method" precedent otsu/gmm
+            # use for adaptive_threshold_min_samples.
+            sims_per_ref_frame = [
+                _score_against_ref(cand_feats_frame, rf, s3.similarity) for rf in ref_feats_frame
+            ]
+            sims_frame = _pool_sims(sims_per_ref_frame, multi_ref_pooling)
+            return sims_frame >= s3.match_threshold
+
+        keep_mask = np.zeros(len(all_sims), dtype=bool)
+        method_counts: dict[str, int] = _defaultdict(int)
+        for fi in sorted(frame_to_indices):
+            idxs = frame_to_indices[fi]
+            frame_keep, method_label = cluster_verify_candidates(
+                all_feats[idxs], ref_feats_for_cluster, s3.cluster_verification,
+                fallback_keep_mask_fn=_fallback_keep_mask,
+            )
+            method_counts[method_label] += 1
+            for local_i, global_i in enumerate(idxs):
+                keep_mask[global_i] = frame_keep[local_i]
+
+        effective_threshold = None
+        selected = [
+            (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
+            for i in range(len(all_sims)) if keep_mask[i]
+        ]
+        log.info(
+            "[Stage3] %s: verification_method=cluster (cluster_method=%s) -> %d / %d "
+            "candidates verified across %d keyframe(s) (method breakdown: %s)",
+            sample_id, s3.cluster_verification.cluster_method, len(selected), len(all_sims),
+            len(frame_to_indices), dict(method_counts),
+        )
+    elif s3.adaptive_threshold and s3.adaptive_threshold_online:
         # Real-time-deployment-compatible path: decide each keyframe's
         # candidates using ONLY strictly-earlier keyframes' own similarity
         # scores (see OnlineAdaptiveThreshold's own docstring) -- no single

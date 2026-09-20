@@ -404,6 +404,61 @@ class DynamicPrototypeConfig(BaseModel):
     min_frame_span: int = 30
 
 
+class ClusterVerificationConfig(BaseModel):
+    """DAVE (arXiv:2404.16622) module (ii)-style candidate verification:
+    instead of a global scalar threshold over a similarity distribution
+    (stage3.adaptive_threshold_method's z_score/otsu/gmm, or
+    stage123_geco2.dynamic_prototype.topk_fusion's Z-score fusion -- both
+    fragile because "how separated is TP from FP" varies per video/keyframe
+    and neither method's shape assumption holds universally), cluster EVERY
+    candidate's appearance feature together with the exemplar features
+    (per_ref_features -- the reference-photo embeddings) using pairwise
+    cosine similarity as the affinity/distance. A candidate is kept iff it
+    shares a cluster with at least one exemplar; every other cluster (and,
+    for hdbscan, every noise-labelled point) is an outlier and rejected.
+    No scalar threshold, no distributional-shape assumption -- the decision
+    is relative/structural (does this candidate sit in the same appearance
+    neighborhood as a KNOWN-real exemplar?) and uses ONLY the current
+    keyframe's own candidates + the current exemplar set, so it is
+    naturally causal/online (no whole-video batch, no warm-up window)
+    wherever it replaces a per-keyframe threshold decision.
+
+    Shared by stage3.verification_method="cluster" (Stage3Config below) and
+    stage123_geco2.dynamic_prototype.cluster_verification
+    (Geco2DynamicPrototypeConfig) -- same primitive, same knobs, two call
+    sites (aero_eyes/utils/cluster_verify.py::cluster_verify_candidates).
+
+    NOT YET VALIDATED against this project's own footage -- compare against
+    the z_score/otsu/gmm baseline (stage3) or topk_fusion baseline
+    (stage123_geco2) before trusting either cluster_method in production,
+    same as every other opt-in accuracy knob in this project.
+    """
+    enabled: bool = False
+    # "hdbscan" (default, RECOMMENDED): density-based, does NOT need the
+    #   number of clusters chosen up front, and natively labels low-density
+    #   points as noise (-1) instead of forcing every point into some
+    #   cluster -- directly targets "distribution shape varies per
+    #   video/keyframe" since it makes no shape assumption at all. Available
+    #   with no new dependency (sklearn.cluster.HDBSCAN, scikit-learn>=1.3).
+    # "spectral": matches DAVE's paper exactly (sklearn.cluster.
+    #   SpectralClustering on the cosine-similarity affinity matrix), but
+    #   needs spectral_n_clusters chosen up front -- itself a hyperparameter
+    #   as fragile as a z-score, which is exactly the class of problem this
+    #   whole mechanism exists to avoid. Kept as an option specifically so
+    #   it can be A/B'd against hdbscan on this project's own footage
+    #   instead of assuming the paper's own choice transfers here.
+    cluster_method: Literal["hdbscan", "spectral"] = "hdbscan"
+    min_cluster_size: int = 2   # hdbscan only
+    min_samples: Optional[int] = None   # hdbscan only; None = sklearn default (= min_cluster_size)
+    spectral_n_clusters: int = 2   # spectral only
+    # Below this many candidates this keyframe, clustering can't find
+    # meaningful density/spectral structure -- falls back to whichever
+    # threshold-based path the caller provides (same "too little data for a
+    # shape method" precedent stage3's own otsu/gmm use for
+    # adaptive_threshold_min_samples).
+    min_candidates_for_cluster: int = 4
+
+
 class Stage3Config(BaseModel):
     # Dev/debug convenience: candidates.json's companion candidates.feats.npz
     # is written by Stage 2 (see aero_eyes/stages/stage2.py::
@@ -558,6 +613,29 @@ class Stage3Config(BaseModel):
     adaptive_threshold_online_window: int = 200
     calibrate: CalibrateConfig = CalibrateConfig()
     dynamic_prototype: DynamicPrototypeConfig = DynamicPrototypeConfig()
+    # "threshold" (default, unchanged): accept/reject via match_threshold or
+    #   adaptive_threshold above (z_score/otsu/gmm, batch or online).
+    # "cluster": DAVE (arXiv:2404.16622) module (ii)-style per-keyframe
+    #   exemplar-cluster verification instead -- see
+    #   ClusterVerificationConfig's own docstring for the full rationale.
+    #   Groups this video's candidates by keyframe and, for each keyframe
+    #   independently, clusters that keyframe's own candidate features
+    #   together with per_ref_features (the exemplar features); a candidate
+    #   is kept iff it clusters with an exemplar. No scalar threshold at
+    #   all, so adaptive_threshold/adaptive_threshold_online/match_threshold
+    #   above are ignored in this mode. Naturally causal (each keyframe's
+    #   decision only reads that keyframe's own candidates + the current
+    #   exemplar set) -- for a fully causal run also leave dynamic_prototype
+    #   above disabled (it's still a whole-video batch mechanism); a warning
+    #   is logged and cluster wins if both are enabled together.
+    verification_method: Literal["threshold", "cluster"] = "threshold"
+    # NOTE: verification_method above (not cluster_verification.enabled) is
+    # what switches this stage into cluster mode -- cluster_verification's
+    # own `enabled` field is not consulted here (only its cluster_method/
+    # min_cluster_size/etc. fields are); it exists as a shared model with
+    # stage123_geco2.dynamic_prototype.cluster_verification, where `enabled`
+    # IS the switch (mirroring that field's topk_fusion sibling).
+    cluster_verification: ClusterVerificationConfig = ClusterVerificationConfig()
 
 
 class BuiltinTrackerConfig(BaseModel):
@@ -1799,6 +1877,25 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     # tokens, since pass 2 would then be identical to pass 1.
     second_pass: bool = False
     topk_fusion: Geco2DynamicPrototypeTopKFusionConfig = Geco2DynamicPrototypeTopKFusionConfig()
+    # DAVE (arXiv:2404.16622) module (ii)-style alternative to topk_fusion
+    # above: instead of Z-scoring cosine+geco2 scores against a running
+    # window/intra-frame baseline (topk_fusion's fused_score, which needs
+    # min_window_for_zscore keyframes to warm up and falls back to blindly
+    # trusting boxes[0] until then), cluster this keyframe's own candidate
+    # feature_extractor embeddings together with the exemplar embeddings
+    # (cross_check_per_ref_features) and only ever consider candidates that
+    # cluster with an exemplar -- see ClusterVerificationConfig's own
+    # docstring for the shared mechanism (also used by
+    # stage3.verification_method="cluster"). Needs no warm-up: the very
+    # first keyframe can verify and accept a candidate, since the decision
+    # only ever depends on THIS keyframe's own candidates + the current
+    # exemplar set, never on accumulated history -- directly removes
+    # topk_fusion's cold-start problem instead of adding another guard
+    # against it. Mutually exclusive with topk_fusion above -- if both are
+    # enabled, cluster_verification wins and a warning is logged.
+    # NOT YET VALIDATED -- compare against the topk_fusion baseline (see
+    # scripts/compare_cluster_vs_zscore_verification.py) before trusting it.
+    cluster_verification: ClusterVerificationConfig = ClusterVerificationConfig()
 
 
 class Stage123Geco2Config(BaseModel):
