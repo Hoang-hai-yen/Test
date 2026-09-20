@@ -34,6 +34,7 @@ from aero_eyes.models.geco2_finetune_data import (  # noqa: E402
     RefImageCache,
     assert_no_test_leakage,
     build_present_absent_pools,
+    jitter_box,
     sample_ref_downscale_factor,
     split_train_val,
     validate_training_video_ids,
@@ -305,3 +306,87 @@ def test_dataset_requires_nonempty_video_ids(cfg):
     ref_cache = RefImageCache(cfg, [FIXTURE_ID])
     with pytest.raises(ValueError):
         Geco2FinetuneDataset(cfg, [], ref_cache, steps_per_epoch=10)
+
+
+# ---------------------------------------------------------------------------
+# jitter_box
+# ---------------------------------------------------------------------------
+
+def test_jitter_box_noop_at_zero():
+    rng = np.random.default_rng(0)
+    box = (10.0, 20.0, 30.0, 50.0)
+    assert jitter_box(rng, box, 0.0) == box
+
+
+def test_jitter_box_perturbs_within_expected_bounds():
+    rng = np.random.default_rng(0)
+    box = (100.0, 100.0, 200.0, 160.0)  # w=100, h=60
+    for _ in range(200):
+        x1, y1, x2, y2 = jitter_box(rng, box, jitter=0.2)
+        w, h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        # Scale within [0.8, 1.2] of original.
+        assert 100.0 * 0.8 <= w <= 100.0 * 1.2 + 1e-6
+        assert 60.0 * 0.8 <= h <= 60.0 * 1.2 + 1e-6
+        # Center shifted by at most 0.2 * original w/h.
+        assert abs(cx - 150.0) <= 100.0 * 0.2 + 1e-6
+        assert abs(cy - 130.0) <= 60.0 * 0.2 + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Geco2FinetuneDataset.max_dynamic_exemplars
+# ---------------------------------------------------------------------------
+
+def test_dataset_dynamic_exemplars_off_by_default(cfg):
+    ref_cache = RefImageCache(cfg, [FIXTURE_ID])
+    ds = Geco2FinetuneDataset(cfg, [FIXTURE_ID], ref_cache, steps_per_epoch=20, seed=1)
+    for i in range(len(ds)):
+        sample = ds[i]
+        assert len(sample.ref_images) == 3
+        assert len(sample.ref_boxes) == 3
+        assert sample.num_dynamic_exemplars == 0
+    assert ds.dynamic_exemplar_count == 0
+
+
+def test_dataset_dynamic_exemplars_adds_extra_when_enabled(cfg):
+    ref_cache = RefImageCache(cfg, [FIXTURE_ID])
+    ds = Geco2FinetuneDataset(
+        cfg, [FIXTURE_ID], ref_cache, steps_per_epoch=60, max_dynamic_exemplars=2, seed=3,
+    )
+    counts_seen = set()
+    running_total = 0
+    for i in range(len(ds)):
+        sample = ds[i]
+        assert 0 <= sample.num_dynamic_exemplars <= 2
+        assert len(sample.ref_images) == 3 + sample.num_dynamic_exemplars
+        assert len(sample.ref_boxes) == 3 + sample.num_dynamic_exemplars
+        # The extra exemplars' boxes must be real (present-frame GT), not None.
+        for extra_box in sample.ref_boxes[3:]:
+            assert extra_box is not None
+        counts_seen.add(sample.num_dynamic_exemplars)
+        running_total += sample.num_dynamic_exemplars
+    # Over 60 steps with Uniform{0,1,2}, expect to see some variation, not a
+    # single fixed count every time.
+    assert len(counts_seen) > 1
+    assert ds.dynamic_exemplar_count == running_total
+
+
+def test_dataset_dynamic_exemplars_never_reuse_the_query_frame(cfg):
+    """An extra exemplar must come from a DIFFERENT present frame than the
+    current step's own query frame -- otherwise the model could trivially
+    match itself instead of learning genuine appearance invariance."""
+    ref_cache = RefImageCache(cfg, [FIXTURE_ID])
+    ds = Geco2FinetuneDataset(
+        cfg, [FIXTURE_ID], ref_cache, steps_per_epoch=60, max_dynamic_exemplars=2, seed=5,
+    )
+    checked_any = False
+    for i in range(len(ds)):
+        sample = ds[i]
+        if not sample.is_present or sample.num_dynamic_exemplars == 0:
+            continue
+        checked_any = True
+        for extra_img in sample.ref_images[3:]:
+            assert not np.array_equal(extra_img, sample.frame_bgr), (
+                "extra exemplar must not be the current query frame itself"
+            )
+    assert checked_any, "test setup produced no present+dynamic-exemplar step to check"

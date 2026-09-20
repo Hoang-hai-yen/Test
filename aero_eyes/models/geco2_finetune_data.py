@@ -170,6 +170,28 @@ def sample_brightness_contrast(
     return brightness, contrast
 
 
+def jitter_box(
+    rng: np.random.Generator, box: tuple[float, float, float, float], jitter: float,
+) -> tuple[float, float, float, float]:
+    """Randomly shift the box's center by up to `jitter` * its own width/
+    height, and rescale it by a factor in [1-jitter, 1+jitter] -- used to
+    make a GT-sourced dynamic exemplar (see max_dynamic_exemplars) NOT a
+    pixel-perfect crop, approximating the imprecision of a real inference-
+    time confirmed detection box (which passed consecutive-hit + cross-
+    check, but is a MODEL prediction, not ground truth). jitter=0.0 (the
+    default) is a no-op, returning `box` unchanged.
+    """
+    if jitter <= 0.0:
+        return box
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    cx = (x1 + x2) / 2.0 + rng.uniform(-jitter, jitter) * w
+    cy = (y1 + y2) / 2.0 + rng.uniform(-jitter, jitter) * h
+    scale = rng.uniform(1.0 - jitter, 1.0 + jitter)
+    hw, hh = (w * scale) / 2.0, (h * scale) / 2.0
+    return (cx - hw, cy - hh, cx + hw, cy + hh)
+
+
 def _apply_query_downscale(img: np.ndarray, downscale_factor: float) -> np.ndarray:
     """Shrink-then-upscale-BACK-to-original-size detail-loss degradation
     for the QUERY frame. Deliberately NOT _apply_ref_downscale (which
@@ -314,6 +336,11 @@ class FinetuneSample:
     ref_boxes: list[tuple[float, float, float, float] | None]
     frame_bgr: np.ndarray
     gt_box: Box | None
+    # How many of ref_images/ref_boxes (beyond the 3 fixed reference
+    # photos) are extra dynamic-style exemplars this step -- see
+    # Geco2FinetuneDataset's own max_dynamic_exemplars docstring. 0 when
+    # that feature is off (the only value possible before it existed).
+    num_dynamic_exemplars: int = 0
 
 
 class Geco2FinetuneDataset(Dataset):
@@ -346,6 +373,8 @@ class Geco2FinetuneDataset(Dataset):
         brightness_range: tuple[float, float] = (0.0, 0.0),
         contrast_range: tuple[float, float] = (1.0, 1.0),
         query_downscale_range: tuple[float, float] = (1.0, 1.0),
+        max_dynamic_exemplars: int = 0,
+        dynamic_exemplar_box_jitter: float = 0.0,
         seed: int | None = None,
     ):
         if not video_ids:
@@ -374,6 +403,44 @@ class Geco2FinetuneDataset(Dataset):
         # before it reaches the model) -- not yet known to help, hence a
         # separate opt-in range rather than folding it into an existing one.
         self.query_downscale_lo, self.query_downscale_hi = query_downscale_range
+        # Opt-in (0 = old behavior, exactly the fixed 3 reference photos
+        # every step): at inference, stage123_geco2.dynamic_prototype
+        # appends extra exemplar tokens CROPPED FROM THE QUERY VIDEO ITSELF
+        # while it runs -- a token count/composition the base checkpoint
+        # never saw during ITS OWN training (only ever exactly 3 studio ref
+        # photos), which empirically degrades recall even for a single
+        # extra, genuinely-correct token: GECO2/models/transformer.py's
+        # PrototypeAttentionBlock is a real cross-attention (image features
+        # as query, ALL exemplar tokens as key/value) run over EVERY
+        # spatial location, so any change to the exemplar SET reshapes the
+        # attention distribution for the WHOLE frame, not just scores for
+        # one box -- no inference-time threshold/topk/NMS tuning can undo
+        # that. Fixing it needs the model to have seen variable-count,
+        # partly-video-sourced exemplar sets during training. When > 0,
+        # each step samples n_extra ~ Uniform{0, ..., max_dynamic_exemplars}
+        # extra exemplars, each a crop from a DIFFERENT present frame of
+        # the SAME video (never the current query frame) at its own GT box
+        # -- set close to your inference-time dynamic_prototype.max_tokens
+        # for train/inference symmetry.
+        #
+        # Deviates from this module's own stated principle (see
+        # docs/GECO2_FINETUNE_PLAN.md: "GT is used here only as the
+        # training loss target... never fed into building the reference-
+        # image exemplar, precisely because real inference will never have
+        # it either"): at INFERENCE, dynamic_prototype's extra tokens come
+        # from the model's OWN confirmed prediction, not GT -- a genuinely
+        # noise-free GT crop is the OPTIMISTIC case, so this is a
+        # deliberate approximation, not the ideal (self-supervised,
+        # bootstrapped-from-the-model's-own-predictions) version of this
+        # augmentation. dynamic_exemplar_box_jitter below exists to narrow
+        # that train/inference gap a little without the cost of running
+        # inference mid-training-step.
+        self.max_dynamic_exemplars = max_dynamic_exemplars
+        # Randomly perturbs each dynamic exemplar's GT box (jitter_box) so
+        # it isn't a pixel-perfect crop -- approximates a real confirmed
+        # detection box's own imprecision. 0.0 (default) = exact GT box.
+        self.dynamic_exemplar_box_jitter = dynamic_exemplar_box_jitter
+        self.dynamic_exemplar_count = 0  # realized total, for per-epoch logging (mirrors present_count/absent_count)
         self.rng = np.random.default_rng(seed)
 
         self._gt: dict[str, dict[int, Box]] = {}
@@ -449,10 +516,36 @@ class Geco2FinetuneDataset(Dataset):
         frame_bgr = _apply_query_downscale(frame_bgr, query_factor)
         gt_box = self._gt[video_id].get(frame_idx)
 
+        # Extra dynamic-style exemplar(s) (opt-in, see max_dynamic_exemplars
+        # docstring in __init__): crop(s) from OTHER present frames of this
+        # SAME video, at their own GT box -- never the current query frame
+        # itself (that would let the model trivially match itself instead
+        # of learning genuine appearance invariance).
+        num_dynamic_exemplars = 0
+        if self.max_dynamic_exemplars > 0:
+            n_extra = int(self.rng.integers(0, self.max_dynamic_exemplars + 1))
+            present_pool = [f for f in self._pools[video_id][0] if f != frame_idx]
+            n_extra = min(n_extra, len(present_pool))
+            if n_extra > 0:
+                extra_idxs = self.rng.choice(present_pool, size=n_extra, replace=False)
+                for extra_idx in extra_idxs:
+                    extra_idx = int(extra_idx)
+                    extra_frame = read_frame(video_path, extra_idx)
+                    extra_box = self._gt[video_id][extra_idx]
+                    extra_box_t = jitter_box(
+                        self.rng, (extra_box.x1, extra_box.y1, extra_box.x2, extra_box.y2),
+                        self.dynamic_exemplar_box_jitter,
+                    )
+                    ref_images.append(extra_frame)
+                    ref_boxes.append(extra_box_t)
+                    num_dynamic_exemplars += 1
+            self.dynamic_exemplar_count += num_dynamic_exemplars
+
         return FinetuneSample(
             video_id=video_id, frame_idx=frame_idx, is_present=is_present,
             ref_images=ref_images, ref_boxes=ref_boxes,
             frame_bgr=frame_bgr, gt_box=gt_box,
+            num_dynamic_exemplars=num_dynamic_exemplars,
         )
 
 

@@ -208,6 +208,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "default (1,1) is a no-op; try e.g. 0.1..1.0 and compare val_loss / "
                          "downstream check_cosine_effect.py against a run without it before "
                          "trusting this.")
+    p.add_argument("--max-dynamic-exemplars", type=int, default=0,
+                    help="Opt-in (0=off, exactly the fixed 3 reference photos every step, "
+                         "unchanged from before this existed): each step adds "
+                         "Uniform{0,...,N} extra exemplar(s) cropped from OTHER present frames of "
+                         "the SAME video at their own GT box, alongside the 3 fixed ref photos. "
+                         "Addresses a real gap: stage123_geco2.dynamic_prototype appends exemplar "
+                         "tokens cropped from the query video AT INFERENCE, a token count/"
+                         "composition this checkpoint never saw during ITS OWN training (always "
+                         "exactly 3 studio photos) -- empirically this measurably hurts recall even "
+                         "for a single extra, genuinely-correct token, because GECO2/models/"
+                         "transformer.py's PrototypeAttentionBlock cross-attends EVERY spatial "
+                         "location against the WHOLE exemplar set, so changing that set reshapes "
+                         "attention for the entire frame, not just one box -- no inference-time "
+                         "threshold/topk/NMS tuning can undo that. Set close to your inference-time "
+                         "dynamic_prototype.max_tokens for train/inference symmetry. NOT YET "
+                         "VALIDATED -- compare val_loss / downstream recall against a run without "
+                         "it before trusting this.")
+    p.add_argument("--dynamic-exemplar-box-jitter", type=float, default=0.0,
+                    help="Randomly perturbs each --max-dynamic-exemplars crop's GT box (center "
+                         "shift + rescale, both up to this fraction) instead of using it exactly -- "
+                         "a real inference-time dynamic_prototype token comes from the model's OWN "
+                         "confirmed prediction, not GT, so an exact GT crop is the noise-free best "
+                         "case; this narrows that gap a little without the cost of running "
+                         "inference mid-training-step. 0.0 (default) = exact GT box. Only matters "
+                         "when --max-dynamic-exemplars > 0.")
     p.add_argument("--lr-patience", type=int, default=3,
                     help="Epochs with no val_loss improvement before ReduceLROnPlateau halves LR -- "
                          "added after the first finetune attempt showed train+val loss oscillating "
@@ -284,6 +309,8 @@ def main():
         brightness_range=(args.brightness_lo, args.brightness_hi),
         contrast_range=(args.contrast_lo, args.contrast_hi),
         query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
+        max_dynamic_exemplars=args.max_dynamic_exemplars,
+        dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
         seed=args.seed,
     )
     val_ds = Geco2FinetuneDataset(
@@ -292,6 +319,8 @@ def main():
         brightness_range=(args.brightness_lo, args.brightness_hi),
         contrast_range=(args.contrast_lo, args.contrast_hi),
         query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
+        max_dynamic_exemplars=args.max_dynamic_exemplars,
+        dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
         seed=args.seed + 1,
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
