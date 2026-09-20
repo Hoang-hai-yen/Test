@@ -25,3 +25,8 @@ tests/fixtures/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local planning docs (not meant to be committed)
+docs/GECO2_scale_domain_gap_plan.md
+docs/GECO2_auto_scale_calibration_guide.md
+docs/GECO2_scale_fusion_track_b_guide.md

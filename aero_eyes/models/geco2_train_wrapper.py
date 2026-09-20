@@ -40,6 +40,12 @@ log = logging.getLogger(__name__)
 # suspect positional encoding is the bottleneck).
 FINETUNE_PREFIXES = (
     "adapt_features.", "class_embed.", "class_embed_aux.", "bbox_embed.", "bbox_embed_aux.",
+    # Track B (docs/GECO2_scale_domain_gap_plan.md): only present on the
+    # model at all when build_training_model(..., num_ref_scale_variants>1)
+    # attached it -- see that function's own docstring. Freely listed here
+    # unconditionally since named_parameters() simply won't yield any
+    # "scale_fusion_gates.*" names otherwise.
+    "scale_fusion_gates.",
 )
 
 
@@ -59,10 +65,24 @@ class _GeCo2TrainArgs:
         self.training = training
 
 
-def build_training_model(cfg, device: torch.device | str | None = None) -> torch.nn.Module:
+def build_training_model(
+    cfg, device: torch.device | str | None = None,
+    num_ref_scale_variants: int = 1, scale_gate_hidden_dim: int = 64,
+) -> torch.nn.Module:
     """Build models/counter.py::CNT(training=True), load the base GeCo2
     checkpoint, and apply the freeze/finetune split. Returns the model on
     `device` (or cfg.device() if not given).
+
+    num_ref_scale_variants > 1 (Track B, opt-in): attaches
+    `model.scale_fusion_gates` (aero_eyes.models.geco2_scale_fusion.
+    build_scale_fusion_gates) BEFORE the freeze loop below, so its
+    parameters are automatically picked up by the `name.startswith(
+    FINETUNE_PREFIXES)` check (FINETUNE_PREFIXES includes
+    "scale_fusion_gates."). A freshly-initialized submodule -- the base
+    checkpoint has no matching keys, which the missing-key logging below
+    reports cleanly as an expected gap, not an error. Dynamically attaching
+    a submodule post-construction is an established pattern in this
+    codebase (see e.g. GeCo2Detector._mask_processor).
     """
     g = cfg.stage123_geco2
     _ensure_geco2_on_path(g.repo_path)
@@ -86,6 +106,14 @@ def build_training_model(cfg, device: torch.device | str | None = None) -> torch
         training=True,
     )
     model = build_model(args).to(device)
+
+    if num_ref_scale_variants > 1:
+        from aero_eyes.models.geco2_scale_fusion import build_scale_fusion_gates
+        model.scale_fusion_gates = build_scale_fusion_gates(g.emb_dim, scale_gate_hidden_dim).to(device)
+        log.info(
+            "Attached ScaleFusionGate (hidden_dim=%d) for num_ref_scale_variants=%d",
+            scale_gate_hidden_dim, num_ref_scale_variants,
+        )
 
     if not Path(g.weights_path).exists():
         raise FileNotFoundError(
@@ -233,6 +261,82 @@ def encode_exemplars_grad(
     )
 
 
+def encode_exemplars_grad_multiscale(
+    model: torch.nn.Module,
+    fusion_gates,  # nn.ModuleDict keyed "main"/"l1"/"l2" -- aero_eyes.models.geco2_scale_fusion.build_scale_fusion_gates
+    ref_images_bgr: list[np.ndarray],
+    ref_boxes: list[tuple[float, float, float, float] | None],
+    ref_group_ids: list[int],
+    query_context: dict[str, torch.Tensor],
+    image_size: float,
+    device: torch.device,
+) -> ExemplarTokens:
+    """Track B (docs/GECO2_scale_domain_gap_plan.md): same per-image
+    backbone + RoI-Align loop as encode_exemplars_grad, but groups the
+    resulting per-image tokens by ref_group_ids (aero_eyes.models.
+    geco2_finetune_data.FinetuneSample.ref_group_ids -- entries from the
+    SAME underlying reference photo share a group id) and fuses each group
+    into exactly ONE token via fusion_gates[level], conditioned on
+    query_context (this step's own query-image feature -- see
+    aero_eyes.models.geco2_scale_fusion.ScaleFusionGate's docstring for why
+    the query image is the only real signal for "how degraded should this
+    exemplar be").
+
+    Output token COUNT equals the number of DISTINCT groups, not
+    len(ref_images_bgr) -- identical in shape to encode_exemplars_grad's
+    output when every group has exactly 1 member (num_ref_scale_variants=1
+    with dynamic exemplars off), so C_base.forward/adapt_features needs no
+    changes either way.
+    """
+    from torchvision.ops import roi_align
+
+    per_image_tokens: dict[str, list[torch.Tensor]] = {"main": [], "l1": [], "l2": []}
+    for img, given_box in zip(ref_images_bgr, ref_boxes):
+        padded, scale = _load_and_pad_grad(img, image_size, device)
+        x = padded.unsqueeze(0)
+
+        if given_box is not None:
+            bx1, by1, bx2, by2 = given_box
+        else:
+            h_img, w_img = img.shape[:2]
+            bx1, by1, bx2, by2 = 0.0, 0.0, float(w_img), float(h_img)
+        px1, py1, px2, py2 = bx1 * scale, by1 * scale, bx2 * scale, by2 * scale
+
+        with torch.no_grad():
+            feats = model.backbone(x)
+        src = feats["vision_features"]
+        l1 = feats["backbone_fpn"][0]
+        l2 = feats["backbone_fpn"][1]
+        bs, _, w, h = src.shape
+        reduction = image_size / w
+
+        box = torch.tensor([[0.0, px1, py1, px2, py2]], device=device)
+
+        exemplar = roi_align(src, boxes=box, output_size=1, spatial_scale=1.0 / reduction, aligned=True)
+        per_image_tokens["main"].append(exemplar.permute(0, 2, 3, 1).reshape(bs, model.emb_dim))
+
+        exemplar_l1 = roi_align(l1, boxes=box, output_size=1, spatial_scale=1.0 / reduction * 2 * 2, aligned=True)
+        per_image_tokens["l1"].append(exemplar_l1.permute(0, 2, 3, 1).reshape(bs, model.emb_dim))
+
+        exemplar_l2 = roi_align(l2, boxes=box, output_size=1, spatial_scale=1.0 / reduction * 2, aligned=True)
+        per_image_tokens["l2"].append(exemplar_l2.permute(0, 2, 3, 1).reshape(bs, model.emb_dim))
+
+    unique_group_ids = sorted(set(ref_group_ids))
+    fused: dict[str, list[torch.Tensor]] = {"main": [], "l1": [], "l2": []}
+    for level in ("main", "l1", "l2"):
+        for gid in unique_group_ids:
+            member_idxs = [i for i, g in enumerate(ref_group_ids) if g == gid]
+            variant_tokens = torch.stack([per_image_tokens[level][i] for i in member_idxs], dim=1)  # [bs, K, D]
+            fused_token = fusion_gates[level](variant_tokens, query_context[level])  # [bs, D]
+            fused[level].append(fused_token.unsqueeze(1))  # [bs, 1, D]
+
+    return ExemplarTokens(
+        main=torch.cat(fused["main"], dim=1),
+        l1=torch.cat(fused["l1"], dim=1),
+        l2=torch.cat(fused["l2"], dim=1),
+    )
+
+
 @dataclass
 class TrainForwardOutput:
     main: dict            # {"pred_boxes": [1,N,4], "box_v": [1,N]}
@@ -244,12 +348,38 @@ class TrainForwardOutput:
     scale: float
 
 
+def query_backbone_pass(
+    model: torch.nn.Module, frame_bgr: np.ndarray, image_size: float, device: torch.device,
+) -> tuple[dict, float, dict[str, torch.Tensor]]:
+    """Runs the query-image half of the forward pass ONCE, returning
+    (feats, scale, query_context) for reuse by BOTH forward_train_step (the
+    box/centerness heads) and encode_exemplars_grad_multiscale (Track B's
+    ScaleFusionGate conditioning signal) -- avoids a second, redundant
+    backbone forward pass per training step whenever the fusion gate is in
+    use. query_context[level] is this frame's own global-average-pooled
+    backbone feature, [1, emb_dim] -- same operation
+    GeCo2Detector.frame_domain_embedding already performs for
+    domain_calibration at the SAME level, just without that function's
+    extra singleton token dimension (ScaleFusionGate wants [B, D], not
+    [B, 1, D]).
+    """
+    padded, scale = _load_and_pad_grad(frame_bgr, image_size, device)
+    x = padded.unsqueeze(0)
+    with torch.no_grad():
+        feats = model.backbone(x)
+    query_context = {
+        "main": feats["vision_features"].mean(dim=(2, 3)),
+        "l1": feats["backbone_fpn"][0].mean(dim=(2, 3)),
+        "l2": feats["backbone_fpn"][1].mean(dim=(2, 3)),
+    }
+    return feats, float(scale), query_context
+
+
 def forward_train_step(
     model: torch.nn.Module,
-    frame_bgr: np.ndarray,
+    feats: dict,
+    scale: float,
     prototype: ExemplarTokens,
-    image_size: float,
-    device: torch.device,
 ) -> TrainForwardOutput:
     """Gradient-enabled mirror of GeCo2Detector._forward_scores(), but ALSO
     computes the aux head (class_embed_aux/bbox_embed_aux on
@@ -258,14 +388,15 @@ def forward_train_step(
     needs it. Uses boxes_with_scores(..., validate=False) (median
     threshold -- training mode) for BOTH heads, not the inference max/8
     threshold.
+
+    Takes the query image's backbone `feats`/`scale` as already-computed
+    inputs (from query_backbone_pass) rather than a raw frame + doing its
+    own padding/backbone pass -- when Track B's ScaleFusionGate is in use,
+    query_backbone_pass's OWN output is also needed as the gate's
+    conditioning signal, so the backbone must only run once per step.
     """
     from utils.box_ops import boxes_with_scores  # GECO2/utils/box_ops.py
 
-    padded, scale = _load_and_pad_grad(frame_bgr, image_size, device)
-    x = padded.unsqueeze(0)
-
-    with torch.no_grad():
-        feats = model.backbone(x)
     src = feats["vision_features"]
 
     adapted_f, adapted_f_aux = model.adapt_features(

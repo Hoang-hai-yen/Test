@@ -108,12 +108,20 @@ def compute_step_loss(
 def run_epoch(model, loader, criterion, optimizer, args, image_size, device, train: bool):
     from aero_eyes.models.geco2_train_wrapper import (
         encode_exemplars_grad,
+        encode_exemplars_grad_multiscale,
         forward_train_step,
+        query_backbone_pass,
         set_train_mode,
     )
 
     set_train_mode(model, train)
     total_loss, n_present, n_absent, n_samples = 0.0, 0, 0, 0
+    # Track B (docs/GECO2_scale_domain_gap_plan.md): model.scale_fusion_gates
+    # only exists when build_training_model was called with
+    # num_ref_scale_variants > 1 (see main() below) -- gated on the SAME
+    # CLI flag here so this branch is only ever taken when that attachment
+    # actually happened.
+    use_multiscale = args.num_ref_scale_variants > 1
 
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
@@ -125,15 +133,30 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
                 else:
                     n_absent += 1
 
-                proto = encode_exemplars_grad(
-                    model, sample.ref_images, sample.ref_boxes, image_size, device,
-                )
-                out = forward_train_step(model, sample.frame_bgr, proto, image_size, device)
+                # Query-side backbone pass run ONCE, reused by both the
+                # detection heads below (forward_train_step) and, when
+                # multiscale fusion is on, the ScaleFusionGate's own
+                # conditioning signal (query_context) -- see
+                # query_backbone_pass's own docstring for why this must not
+                # be two separate backbone calls.
+                feats, scale, query_context = query_backbone_pass(model, sample.frame_bgr, image_size, device)
+
+                consistency_loss = None
+                if use_multiscale:
+                    proto, consistency_loss = encode_exemplars_grad_multiscale(
+                        model, model.scale_fusion_gates, sample.ref_images, sample.ref_boxes,
+                        sample.ref_group_ids, query_context, image_size, device,
+                    )
+                else:
+                    proto = encode_exemplars_grad(
+                        model, sample.ref_images, sample.ref_boxes, image_size, device,
+                    )
+                out = forward_train_step(model, feats, scale, proto)
 
                 # Reuses the SAME coordinate-conversion function the
                 # visualization sanity-check cell uses (see
                 # docs/GECO2_FINETUNE_PLAN.md point 7) -- the small
-                # duplicated resize_and_pad call vs. forward_train_step's
+                # duplicated resize_and_pad call vs. query_backbone_pass's
                 # own is a deliberate correctness-over-perf tradeoff: it
                 # guarantees the loss target and the visual check can never
                 # silently diverge.
@@ -144,6 +167,14 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
                     criterion, out, target_boxes, args.aux_weight, image_size,
                     aux_size_threshold_px=args.aux_size_threshold_px,
                 )
+                # Opt-in (default weight 0.0 = no effect): pulls scale-
+                # variant appearance tokens of the SAME reference image
+                # toward each other BEFORE the gate -- see
+                # aero_eyes/models/geco2_scale_fusion.py and
+                # docs/GECO2_scale_domain_gap_plan.md's cross-resolution
+                # re-identification literature note for the rationale.
+                if consistency_loss is not None and args.resolution_consistency_weight > 0.0:
+                    loss = loss + args.resolution_consistency_weight * consistency_loss
                 batch_losses.append(loss)
                 n_samples += 1
 
@@ -233,6 +264,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "case; this narrows that gap a little without the cost of running "
                          "inference mid-training-step. 0.0 (default) = exact GT box. Only matters "
                          "when --max-dynamic-exemplars > 0.")
+    p.add_argument("--num-ref-scale-variants", type=int, default=1,
+                    help="Track B (docs/GECO2_scale_domain_gap_plan.md), opt-in (1=old behavior, "
+                         "exactly one degraded copy per fixed reference photo per step, unchanged): "
+                         "when > 1, each of the 3 fixed reference photos gets this many "
+                         "INDEPENDENTLY-sampled --ref-downscale-lo/hi (+ brightness/contrast) "
+                         "variants in the SAME step, fused into one token per reference photo by a "
+                         "learned aero_eyes.models.geco2_scale_fusion.ScaleFusionGate conditioned on "
+                         "the query image's own backbone feature -- closes the train/inference "
+                         "mismatch left by ref_downscale_levels' inference-only flat concatenation "
+                         "(a configuration this checkpoint was never trained on otherwise). Consider "
+                         "also raising --query-downscale-lo below 1.0 for this recipe specifically: "
+                         "the gate can only learn 'prefer a blurrier variant when the query looks "
+                         "blurry' if the query is ever actually blurry during training. NOT YET "
+                         "VALIDATED -- compare val_loss (and, once a checkpoint exists, "
+                         "scripts/compare_auto_scale_vs_fixed.py) against num_ref_scale_variants=1.")
+    p.add_argument("--scale-gate-hidden-dim", type=int, default=64,
+                    help="Hidden layer width of each ScaleFusionGate (one per GeCo2 pyramid level) "
+                         "when --num-ref-scale-variants > 1. Kept small deliberately -- only ~7 "
+                         "distinct physical objects exist in the training set, see "
+                         "docs/GECO2_scale_domain_gap_plan.md Track B's own risk notes.")
+    p.add_argument("--resolution-consistency-weight", type=float, default=0.0,
+                    help="Opt-in (0.0=off, default): weight on an extra loss term that pulls "
+                         "--num-ref-scale-variants scale-variant appearance tokens of the SAME "
+                         "reference photo toward their own centroid (1 - cosine similarity, "
+                         "averaged) BEFORE the ScaleFusionGate -- encourages a resolution-invariant "
+                         "appearance embedding directly, instead of relying only on random-"
+                         "augmentation exposure to learn it implicitly (see the cross-resolution "
+                         "person re-identification literature note in "
+                         "docs/GECO2_scale_domain_gap_plan.md). No effect when "
+                         "--num-ref-scale-variants=1 (every group has exactly 1 member, nothing to "
+                         "penalize). NOT YET VALIDATED -- toggle independently of the gate itself "
+                         "when comparing runs.")
     p.add_argument("--lr-patience", type=int, default=3,
                     help="Epochs with no val_loss improvement before ReduceLROnPlateau halves LR -- "
                          "added after the first finetune attempt showed train+val loss oscillating "
@@ -298,7 +361,11 @@ def main():
         torch.cuda.set_device(device)
 
     from aero_eyes.models.geco2_train_wrapper import build_training_model
-    model = build_training_model(cfg, device=device)
+    model = build_training_model(
+        cfg, device=device,
+        num_ref_scale_variants=args.num_ref_scale_variants,
+        scale_gate_hidden_dim=args.scale_gate_hidden_dim,
+    )
 
     ref_cache = RefImageCache(cfg, video_ids)
 
@@ -311,6 +378,7 @@ def main():
         query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
         max_dynamic_exemplars=args.max_dynamic_exemplars,
         dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
+        num_ref_scale_variants=args.num_ref_scale_variants,
         seed=args.seed,
     )
     val_ds = Geco2FinetuneDataset(
@@ -321,6 +389,7 @@ def main():
         query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
         max_dynamic_exemplars=args.max_dynamic_exemplars,
         dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
+        num_ref_scale_variants=args.num_ref_scale_variants,
         seed=args.seed + 1,
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,

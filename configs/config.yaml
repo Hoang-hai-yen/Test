@@ -556,6 +556,46 @@ stage123_geco2:
   crop_context_margin: 0.5   # extra padding around the tight box, as a fraction of the box's own size
 
   # --------------------------------------------------------------------
+  # Per-sample automatic replacement for hand-tuning ref_downscale_factor
+  # AND crop_context_margin together: builds one candidate exemplar
+  # prototype per (crop_margin, downscale_factor) pair, scores each against
+  # a handful of frames sampled from THIS sample's own video (GT IoU if
+  # this sample has labels, else a self-supervised peakiness proxy), then
+  # quality-weighted-blends the appearance tokens (or hard-selects the
+  # best one). Overrides ref_downscale_factor/ref_downscale_levels above
+  # when enabled. Requires segmentation.enabled. See
+  # aero_eyes/models/geco2_auto_scale.py and AutoScaleCalibrationConfig's
+  # own docstring in aero_eyes/config.py for the full rationale --
+  # NOT YET VALIDATED, compare against a manually-tuned baseline first
+  # (scripts/compare_auto_scale_vs_fixed.py).
+  # --------------------------------------------------------------------
+  auto_scale_calibration:
+    enabled: false
+    candidate_crop_margins: [0.5, 1.0, 2.0, 4.0]
+    candidate_downscale_factors: [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03]
+    num_probe_frames: 12
+    selection_mode: soft   # "soft" | "hard"
+    quality_metric: auto   # "auto" | "gt_iou" | "self_supervised_margin"
+    temperature: 0.5
+    max_candidates: 12
+
+  # --------------------------------------------------------------------
+  # Track B: inference-side use of a checkpoint finetuned with
+  # `--num-ref-scale-variants > 1` (scripts/train_geco2_aeroeyes.py) --
+  # i.e. one with a trained scale_fusion_gates submodule. Builds one
+  # candidate exemplar per (ref image, factor in candidate_factors) --
+  # same mechanism as ref_downscale_levels -- then FUSES them with the
+  # trained, query-conditioned gate instead of flat-concatenating. See
+  # Geco2LearnedScaleFusionConfig's own docstring in aero_eyes/config.py.
+  # NOT YET VALIDATED -- no Track B checkpoint exists yet.
+  # --------------------------------------------------------------------
+  learned_scale_fusion:
+    enabled: false
+    candidate_factors: [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03]
+    num_context_frames: 5
+    scale_gate_hidden_dim: 64
+
+  # --------------------------------------------------------------------
   # Fixes the ground-to-aerial SIZE mismatch ref_downscale_factor cannot
   # fix (see note above): builds a synthetic canvas per reference image,
   # centered on the MobileSAM tight mask box, sized so the object occupies

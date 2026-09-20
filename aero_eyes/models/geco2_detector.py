@@ -121,9 +121,33 @@ class GeCo2Detector:
             reduction=g.reduction,
         )
         self.model = build_model(args).to(self.device)
+
+        # Track B (docs/GECO2_scale_domain_gap_plan.md): attach BEFORE
+        # load_state_dict so a checkpoint that actually has
+        # "scale_fusion_gates.*" keys (trained via
+        # scripts/train_geco2_aeroeyes.py --num-ref-scale-variants>1) loads
+        # them correctly -- a freshly-initialized (untrained) gate
+        # otherwise, which encode_exemplars_fused will still run but
+        # uselessly (see Geco2LearnedScaleFusionConfig's own docstring).
+        self.learned_scale_fusion_enabled = g.learned_scale_fusion.enabled
+        if self.learned_scale_fusion_enabled:
+            from aero_eyes.models.geco2_scale_fusion import build_scale_fusion_gates
+            self.model.scale_fusion_gates = build_scale_fusion_gates(
+                g.emb_dim, g.learned_scale_fusion.scale_gate_hidden_dim,
+            ).to(self.device)
+
         state_dict = torch.load(g.weights_path, map_location=self.device, weights_only=True)
         state_dict = state_dict.get("model", state_dict)
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        if self.learned_scale_fusion_enabled and not any(k.startswith("scale_fusion_gates.") for k in state_dict):
+            log.warning(
+                "stage123_geco2.learned_scale_fusion.enabled=true but '%s' has no "
+                "scale_fusion_gates.* weights -- this is not a Track B checkpoint "
+                "(trained with --num-ref-scale-variants>1). encode_exemplars_fused "
+                "will run with an UNTRAINED, randomly-initialized gate, which is "
+                "useless -- results will be meaningless until a real Track B "
+                "checkpoint is loaded.", g.weights_path,
+            )
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing:
             # Group by top-level submodule (e.g. "sam_mask.*") so it's obvious
@@ -251,6 +275,114 @@ class GeCo2Detector:
             "main": torch.cat(main_tokens, dim=1),
             "l1": torch.cat(l1_tokens, dim=1),
             "l2": torch.cat(l2_tokens, dim=1),
+        }
+
+    # ------------------------------------------------------------------
+    # Track B (docs/GECO2_scale_domain_gap_plan.md): inference-side use of
+    # a checkpoint finetuned with scripts/train_geco2_aeroeyes.py
+    # --num-ref-scale-variants>1 (has a trained scale_fusion_gates
+    # submodule). See Geco2LearnedScaleFusionConfig's own docstring.
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def encode_exemplars_fused(
+        self,
+        ref_images_bgr: list[np.ndarray],
+        ref_boxes: list[tuple[float, float, float, float] | None],
+        ref_group_ids: list[int],
+        context_frames_bgr: list[np.ndarray],
+    ) -> dict[str, torch.Tensor]:
+        """No-grad mirror of aero_eyes.models.geco2_train_wrapper.
+        encode_exemplars_grad_multiscale, using self.model.scale_fusion_gates
+        (only attached when stage123_geco2.learned_scale_fusion.enabled --
+        see __init__). Never uses shape tokens -- Track B checkpoints are
+        trained without them (docs/GECO2_FINETUNE_PLAN.md point 1),
+        mixing them into the per-group fusion below is undefined.
+
+        ref_group_ids: same length as ref_images_bgr/ref_boxes, grouping
+        entries from the SAME underlying reference photo (e.g. built by
+        stage123_geco2.py from learned_scale_fusion.candidate_factors, one
+        entry per (ref image, factor) -- mirrors ref_downscale_levels'
+        existing candidate-building mechanism, just fused via the trained
+        gate afterward instead of flat-concatenated).
+
+        context_frames_bgr: a handful of frames sampled from THIS sample's
+        own video, averaged into ONE proxy query-context per pyramid level
+        -- the gate's conditioning signal. An average (not a true per-frame
+        fusion) trades per-frame adaptivity for keeping this as a one-time,
+        cacheable prototype build like encode_exemplars/build_auto_scaled_
+        prototype -- see Geco2LearnedScaleFusionConfig's own docstring for
+        the rationale and the flagged follow-up (a genuinely per-frame
+        version would need to move this fusion inside detect_frame's own
+        per-keyframe loop instead).
+        """
+        if self.use_shape_token:
+            raise ValueError(
+                "encode_exemplars_fused requires stage123_geco2.use_shape_token=false -- "
+                "Track B checkpoints are trained without shape tokens (see "
+                "docs/GECO2_FINETUNE_PLAN.md point 1); mixing them in here is undefined."
+            )
+        if not self.learned_scale_fusion_enabled:
+            raise ValueError(
+                "encode_exemplars_fused requires stage123_geco2.learned_scale_fusion.enabled=true "
+                "(GeCo2Detector.__init__ only attaches model.scale_fusion_gates in that case)."
+            )
+        if not context_frames_bgr:
+            raise ValueError("encode_exemplars_fused requires at least one context frame")
+
+        m = self.model
+        from torchvision.ops import roi_align
+
+        per_image_tokens: dict[str, list[torch.Tensor]] = {"main": [], "l1": [], "l2": []}
+        for img, given_box in zip(ref_images_bgr, ref_boxes):
+            padded, scale = self._load_and_pad(img)
+            x = padded.unsqueeze(0).to(self.device)
+
+            if given_box is not None:
+                bx1, by1, bx2, by2 = given_box
+            else:
+                h_img, w_img = img.shape[:2]
+                bx1, by1, bx2, by2 = 0.0, 0.0, float(w_img), float(h_img)
+            px1, py1, px2, py2 = bx1 * scale, by1 * scale, bx2 * scale, by2 * scale
+
+            feats = m.backbone(x)
+            src = feats["vision_features"]
+            l1 = feats["backbone_fpn"][0]
+            l2 = feats["backbone_fpn"][1]
+            bs, _, w, h = src.shape
+            reduction = self.image_size / w
+            box = torch.tensor([[0.0, px1, py1, px2, py2]], device=self.device)
+
+            exemplar = roi_align(src, boxes=box, output_size=1, spatial_scale=1.0 / reduction, aligned=True)
+            per_image_tokens["main"].append(exemplar.permute(0, 2, 3, 1).reshape(bs, m.emb_dim))
+            exemplar_l1 = roi_align(l1, boxes=box, output_size=1,
+                                     spatial_scale=1.0 / reduction * 2 * 2, aligned=True)
+            per_image_tokens["l1"].append(exemplar_l1.permute(0, 2, 3, 1).reshape(bs, m.emb_dim))
+            exemplar_l2 = roi_align(l2, boxes=box, output_size=1,
+                                     spatial_scale=1.0 / reduction * 2, aligned=True)
+            per_image_tokens["l2"].append(exemplar_l2.permute(0, 2, 3, 1).reshape(bs, m.emb_dim))
+
+        context_sums: dict[str, torch.Tensor] = {}
+        for frame_bgr in context_frames_bgr:
+            emb = self.frame_domain_embedding(frame_bgr)  # {"main": [1,1,D], ...}, CPU tensors
+            for level, v in emb.items():
+                v = v.squeeze(1).to(self.device)  # [1, D]
+                context_sums[level] = v if level not in context_sums else context_sums[level] + v
+        query_context = {level: v / len(context_frames_bgr) for level, v in context_sums.items()}
+
+        unique_group_ids = sorted(set(ref_group_ids))
+        fused: dict[str, list[torch.Tensor]] = {"main": [], "l1": [], "l2": []}
+        for level in ("main", "l1", "l2"):
+            for gid in unique_group_ids:
+                member_idxs = [i for i, g in enumerate(ref_group_ids) if g == gid]
+                variant_tokens = torch.stack([per_image_tokens[level][i] for i in member_idxs], dim=1)  # [bs, K, D]
+                fused_token = m.scale_fusion_gates[level](variant_tokens, query_context[level])  # [bs, D]
+                fused[level].append(fused_token.unsqueeze(1).cpu())
+
+        return {
+            "main": torch.cat(fused["main"], dim=1),
+            "l1": torch.cat(fused["l1"], dim=1),
+            "l2": torch.cat(fused["l2"], dim=1),
         }
 
     # ------------------------------------------------------------------

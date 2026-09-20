@@ -9,7 +9,7 @@ compiled MultiScaleDeformableAttention extension built.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -341,6 +341,16 @@ class FinetuneSample:
     # Geco2FinetuneDataset's own max_dynamic_exemplars docstring. 0 when
     # that feature is off (the only value possible before it existed).
     num_dynamic_exemplars: int = 0
+    # Same length as ref_images/ref_boxes -- groups entries that come from
+    # the SAME underlying reference photo (Track B: num_ref_scale_variants
+    # > 1 produces multiple independently-degraded copies of one fixed ref
+    # per step, e.g. [0,0,0,1,1,1,2,2,2] for 3 refs x 3 variants). Each
+    # dynamic exemplar (if any) gets its OWN unique id -- no scale-grouping
+    # there, see Geco2FinetuneDataset.__getitem__. Empty list (the only
+    # value possible before num_ref_scale_variants existed) means "one
+    # group per entry, in order" -- callers that don't care about Track B's
+    # scale-fusion grouping can ignore this field entirely.
+    ref_group_ids: list[int] = field(default_factory=list)
 
 
 class Geco2FinetuneDataset(Dataset):
@@ -375,10 +385,13 @@ class Geco2FinetuneDataset(Dataset):
         query_downscale_range: tuple[float, float] = (1.0, 1.0),
         max_dynamic_exemplars: int = 0,
         dynamic_exemplar_box_jitter: float = 0.0,
+        num_ref_scale_variants: int = 1,
         seed: int | None = None,
     ):
         if not video_ids:
             raise ValueError("video_ids must be non-empty")
+        if num_ref_scale_variants < 1:
+            raise ValueError(f"num_ref_scale_variants must be >= 1, got {num_ref_scale_variants}")
         self.cfg = cfg
         self.video_ids = list(video_ids)
         self.ref_cache = ref_cache
@@ -441,6 +454,18 @@ class Geco2FinetuneDataset(Dataset):
         # detection box's own imprecision. 0.0 (default) = exact GT box.
         self.dynamic_exemplar_box_jitter = dynamic_exemplar_box_jitter
         self.dynamic_exemplar_count = 0  # realized total, for per-epoch logging (mirrors present_count/absent_count)
+        # Track B (docs/GECO2_scale_domain_gap_plan.md): opt-in (1 = old
+        # behavior, exactly one degraded copy per fixed ref image per step,
+        # unchanged). When > 1, each of the 3 fixed reference images gets
+        # this many INDEPENDENTLY-sampled (ref_downscale_factor,
+        # brightness, contrast) variants in the SAME step, grouped via
+        # FinetuneSample.ref_group_ids -- lets a downstream ScaleFusionGate
+        # (aero_eyes/models/geco2_scale_fusion.py) learn to fuse/select
+        # across scale-variants of the SAME object, closing the train/
+        # inference mismatch ref_downscale_levels' inference-only flat
+        # concatenation left open (see that config field's own docstring in
+        # aero_eyes/config.py).
+        self.num_ref_scale_variants = num_ref_scale_variants
         self.rng = np.random.default_rng(seed)
 
         self._gt: dict[str, dict[int, Box]] = {}
@@ -487,19 +512,25 @@ class Geco2FinetuneDataset(Dataset):
         native_imgs, native_boxes = self.ref_cache.get(video_id)
         ref_images: list[np.ndarray] = []
         ref_boxes: list[tuple[float, float, float, float] | None] = []
-        for img, box in zip(native_imgs, native_boxes):
-            factor = sample_ref_downscale_factor(self.rng, self.ref_downscale_lo, self.ref_downscale_hi)
-            downscaled = _apply_ref_downscale(img, factor)
-            # Brightness/contrast only changes pixel VALUES, never geometry --
-            # sampled independently per ref image, same as the downscale
-            # factor, but applied after it (order doesn't matter for a
-            # geometry-vs-pixel-value pair of ops, but keeps downscale's own
-            # blur computed from the ORIGINAL pixel values, not re-lit ones).
-            brightness, contrast = sample_brightness_contrast(
-                self.rng, self.brightness_range, self.contrast_range,
-            )
-            ref_images.append(apply_brightness_contrast(downscaled, brightness, contrast))
-            ref_boxes.append(tuple(c * factor for c in box) if box is not None else None)
+        ref_group_ids: list[int] = []
+        for ref_idx, (img, box) in enumerate(zip(native_imgs, native_boxes)):
+            # num_ref_scale_variants > 1 (Track B, opt-in): independently
+            # re-sample this SAME ref image's degradation this many times,
+            # instead of once -- see __init__'s own docstring for why.
+            for _ in range(self.num_ref_scale_variants):
+                factor = sample_ref_downscale_factor(self.rng, self.ref_downscale_lo, self.ref_downscale_hi)
+                downscaled = _apply_ref_downscale(img, factor)
+                # Brightness/contrast only changes pixel VALUES, never geometry --
+                # sampled independently per ref image, same as the downscale
+                # factor, but applied after it (order doesn't matter for a
+                # geometry-vs-pixel-value pair of ops, but keeps downscale's own
+                # blur computed from the ORIGINAL pixel values, not re-lit ones).
+                brightness, contrast = sample_brightness_contrast(
+                    self.rng, self.brightness_range, self.contrast_range,
+                )
+                ref_images.append(apply_brightness_contrast(downscaled, brightness, contrast))
+                ref_boxes.append(tuple(c * factor for c in box) if box is not None else None)
+                ref_group_ids.append(ref_idx)
 
         video_path = self._video_paths[video_id]
         frame_bgr = read_frame(video_path, frame_idx)
@@ -527,6 +558,10 @@ class Geco2FinetuneDataset(Dataset):
             present_pool = [f for f in self._pools[video_id][0] if f != frame_idx]
             n_extra = min(n_extra, len(present_pool))
             if n_extra > 0:
+                # Each dynamic exemplar is its own group (no scale-fusion
+                # grouping) -- start numbering after every fixed-ref group
+                # id already used above (0..len(native_imgs)-1).
+                next_group_id = len(native_imgs)
                 extra_idxs = self.rng.choice(present_pool, size=n_extra, replace=False)
                 for extra_idx in extra_idxs:
                     extra_idx = int(extra_idx)
@@ -538,6 +573,8 @@ class Geco2FinetuneDataset(Dataset):
                     )
                     ref_images.append(extra_frame)
                     ref_boxes.append(extra_box_t)
+                    ref_group_ids.append(next_group_id)
+                    next_group_id += 1
                     num_dynamic_exemplars += 1
             self.dynamic_exemplar_count += num_dynamic_exemplars
 
@@ -546,6 +583,7 @@ class Geco2FinetuneDataset(Dataset):
             ref_images=ref_images, ref_boxes=ref_boxes,
             frame_bgr=frame_bgr, gt_box=gt_box,
             num_dynamic_exemplars=num_dynamic_exemplars,
+            ref_group_ids=ref_group_ids,
         )
 
 

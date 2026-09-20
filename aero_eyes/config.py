@@ -1195,6 +1195,136 @@ class DomainCalibrationConfig(BaseModel):
     strength: float = 1.0  # 0 = no change, 1 = fully match the video's own mean token
 
 
+class AutoScaleCalibrationConfig(BaseModel):
+    """Per-sample automatic replacement for hand-tuning ref_downscale_factor
+    (and, jointly, crop_context_margin): builds one candidate exemplar
+    prototype per (crop_margin, downscale_factor) combination, scores each
+    candidate's quality against a handful of frames sampled from THIS
+    sample's own video, then does a quality-weighted SOFT BLEND of the
+    per-candidate appearance tokens (default) or hard-selects the single
+    best one. The blend happens BEFORE cross-attention, producing exactly
+    one token per ref per pyramid level -- identical in shape to today's
+    single-factor behavior, so nothing downstream changes and there is no
+    train/inference token-count mismatch (unlike ref_downscale_levels,
+    which flat-concatenates every scale into the K/V sequence -- a
+    configuration GeCo2 was never trained on; see
+    aero_eyes/models/geco2_finetune_data.py::sample_ref_downscale_factor).
+
+    Both axes matter, not just ref_downscale_factor's blur/detail axis:
+    reading GECO2/utils/data.py::resize_and_pad shows the exemplar's
+    canvas-relative SIZE (controlled here via crop_context_margin, same
+    mechanism as Stage123Geco2Config.crop_to_object) also changes the
+    backbone's receptive-field/self-attention context around the object,
+    independent of blur -- and this project's own docs/
+    GECO2_baseline_scale_calibration_results*.md sweeps (16 videos, two
+    disjoint sets) already show no single fixed size works across videos
+    (optimal ratio to the object's true size ranges ~1.1x-2.9x depending on
+    the object). Requires segmentation.enabled (crop_context_margin needs a
+    tight mask box, same as crop_to_object).
+
+    Mutually exclusive with ref_downscale_factor/ref_downscale_levels: when
+    enabled, this OVERRIDES both (a warning is logged if either is set to a
+    non-default value) -- see aero_eyes/stages/stage123_geco2.py::
+    build_exemplar_prototype.
+
+    NOT YET VALIDATED -- compare against your best manually-tuned
+    ref_downscale_factor per sample (scripts/compare_auto_scale_vs_fixed.py)
+    before trusting this in production.
+    """
+    enabled: bool = False
+    # Candidate crop_context_margin values (see Stage123Geco2Config.
+    # crop_context_margin's own docstring) -- larger margin = object
+    # occupies a SMALLER fraction of the final canvas.
+    candidate_crop_margins: list[float] = [0.5, 1.0, 2.0, 4.0]
+    # Candidate ref_downscale_factor values (see Stage123Geco2Config.
+    # ref_downscale_factor's own docstring) -- log-spaced by convention,
+    # matching sample_ref_downscale_factor's log-uniform training
+    # distribution.
+    candidate_downscale_factors: list[float] = [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03]
+    # Frames sampled (deterministically, evenly spaced via np.linspace --
+    # NOT randomly, so re-running with an unchanged config/video reproduces
+    # an identical calibration and stays safe under the existing
+    # project.use_cache contract) from the sample's own video to score each
+    # candidate. One-time cost per sample, folded into the cached
+    # prototype file: up to max_candidates * num_probe_frames extra query-
+    # side backbone passes, plus max_candidates * num_references extra
+    # ref-side backbone passes.
+    num_probe_frames: int = 12
+    # "soft" (default, recommended): quality-weighted average of every
+    #   candidate's appearance token -- see class docstring.
+    # "hard": one-hot select the single best-scoring candidate (closest
+    #   analog to manually picking one (crop_margin, factor) pair, but
+    #   chosen automatically per sample instead of by hand).
+    selection_mode: Literal["hard", "soft"] = "soft"
+    # "auto" (default): use gt_iou when cfg.data.gt.global_file has GT for
+    #   this sample_id, else fall back to self_supervised_margin. Forcing
+    #   "gt_iou" is only meaningful for offline dev/calibration on labeled
+    #   data -- real deployment on an unlabeled video always falls back.
+    # "gt_iou": mean IoU between the top-1 predicted box and GT, over this
+    #   sample's own GT-present frames.
+    # "self_supervised_margin": mean over probe frames of
+    #   (max(raw_scores) - mean(raw_scores)) / (std(raw_scores) + eps) -- a
+    #   well-matched exemplar scale should produce one strong, spatially
+    #   localized peak. KNOWN RISK: a confidently-wrong high-scoring
+    #   background patch can also produce a high, peaky margin -- this is a
+    #   heuristic proxy, not a correctness guarantee. Prefer gt_iou
+    #   whenever any GT exists.
+    quality_metric: Literal["auto", "gt_iou", "self_supervised_margin"] = "auto"
+    # Softmax temperature applied to per-candidate z-scored quality when
+    # selection_mode="soft" -- lower = closer to hard selection, higher =
+    # closer to a uniform blend across all candidates.
+    temperature: float = 0.5
+    # Caps len(candidate_crop_margins) * len(candidate_downscale_factors) --
+    # the full grid can get expensive fast; candidates are sampled evenly
+    # from the grid (not truncated from one end) when the product exceeds
+    # this, with a warning logged.
+    max_candidates: int = 12
+    eps: float = 1e-6
+
+
+class Geco2LearnedScaleFusionConfig(BaseModel):
+    """Track B (docs/GECO2_scale_domain_gap_plan.md): inference-side use of
+    a checkpoint finetuned with `--num-ref-scale-variants > 1`
+    (scripts/train_geco2_aeroeyes.py) -- i.e. one that actually has a
+    trained `scale_fusion_gates` submodule (aero_eyes/models/
+    geco2_scale_fusion.py::ScaleFusionGate, one per pyramid level).
+
+    Mirrors ref_downscale_levels' mechanism for BUILDING candidate
+    exemplars (one entry per (ref image, factor in candidate_factors)) but
+    FUSES them with the trained, query-conditioned gate instead of flat-
+    concatenating into the K/V sequence -- see GeCo2Detector.
+    encode_exemplars_fused. candidate_factors should cover roughly the same
+    range the checkpoint was trained on (--ref-downscale-lo/hi).
+
+    The gate needs a QUERY-image feature to condition on, but this
+    happens once per sample (like encode_exemplars), before any specific
+    query frame is known -- num_context_frames sample frames from the
+    sample's own video are averaged into one proxy query context (same
+    "sample a few frames, average" pattern as domain_calibration), trading
+    true per-frame adaptivity for keeping the existing "build the
+    prototype once, reuse across the whole video" architecture. Revisit
+    with a genuinely per-frame version (fusing inside the per-keyframe
+    loop instead) if this proxy underperforms.
+
+    Mutually exclusive with ref_downscale_factor/ref_downscale_levels/
+    auto_scale_calibration/scale_calibration -- overrides them all when
+    enabled. Requires a checkpoint that actually has scale_fusion_gates
+    weights (stage123_geco2.weights_path) -- a base (non-Track-B) checkpoint
+    has none, so this always starts from a freshly-initialized (untrained,
+    useless) gate in that case; a startup warning is logged if no
+    "scale_fusion_gates." keys are found in the loaded checkpoint.
+
+    NOT YET VALIDATED -- no Track B checkpoint has been trained/evaluated
+    yet (requires a GPU, see scripts/train_geco2_aeroeyes.py). Compare
+    against auto_scale_calibration and the manually-tuned baseline via
+    scripts/compare_auto_scale_vs_fixed.py before trusting this.
+    """
+    enabled: bool = False
+    candidate_factors: list[float] = [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03]
+    num_context_frames: int = 5
+    scale_gate_hidden_dim: int = 64
+
+
 class ColorPostfilterConfig(BaseModel):
     """Cheap post-detection filter for GeCo2's blind spot: it's a few-shot
     COUNTING model matching shape/texture via its vision backbone -- it has
@@ -1769,6 +1899,8 @@ class Stage123Geco2Config(BaseModel):
     # box). See aero_eyes/utils/geometry.py::crop_to_object.
     crop_to_object: bool = False
     crop_context_margin: float = 0.5
+    auto_scale_calibration: AutoScaleCalibrationConfig = AutoScaleCalibrationConfig()
+    learned_scale_fusion: Geco2LearnedScaleFusionConfig = Geco2LearnedScaleFusionConfig()
     scale_calibration: ScaleCalibrationConfig = ScaleCalibrationConfig()
     domain_calibration: DomainCalibrationConfig = DomainCalibrationConfig()
     dynamic_prototype: Geco2DynamicPrototypeConfig = Geco2DynamicPrototypeConfig()

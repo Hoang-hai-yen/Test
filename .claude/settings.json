@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_geco2_ref_downscale.py -v)"
+    ]
+  }
+}

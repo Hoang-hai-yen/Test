@@ -20,6 +20,7 @@ Viz:    <work_dir>/<sample_id>/viz/stage123_geco2/ (when save_visualizations=tru
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -180,7 +181,126 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
 
     seg_cfg = g.segmentation
     sc_cfg = g.scale_calibration
-    if seg_cfg.enabled:
+    asc_cfg = g.auto_scale_calibration
+
+    if asc_cfg.enabled:
+        # Track A (see docs/GECO2_scale_domain_gap_plan.md): per-sample
+        # automatic replacement for hand-tuning ref_downscale_factor AND
+        # crop_context_margin -- takes over entirely instead of composing
+        # with scale_calibration/crop_to_object/ref_downscale_* (it does
+        # its own internal crop_to_object + _apply_ref_downscale sweep per
+        # candidate), so this is a separate top-level branch rather than
+        # threaded through the manual-tuning branches below.
+        if not seg_cfg.enabled:
+            raise ValueError(
+                "stage123_geco2.auto_scale_calibration.enabled requires "
+                "segmentation.enabled (needs a tight mask box to crop/scale around)."
+            )
+        if sc_cfg.enabled or g.crop_to_object or g.ref_downscale_levels or g.ref_downscale_factor != 1.0:
+            log.warning(
+                "[Stage123-GeCo2] %s: auto_scale_calibration.enabled overrides "
+                "scale_calibration/crop_to_object/ref_downscale_factor/ref_downscale_levels -- "
+                "their configured values are ignored this run.", sample_id,
+            )
+        from aero_eyes.models.geco2_auto_scale import build_auto_scaled_prototype
+        from aero_eyes.models.segmentation import build_segmenter
+
+        segmenter = build_segmenter(seg_cfg, cfg)
+        masks = []
+        for img in ref_imgs:
+            mask = segmenter.segment(img)
+            if seg_cfg.center_crop_fallback:
+                mask_ratio = float(mask.sum()) / float(mask.size)
+                if mask_ratio < seg_cfg.min_valid_mask_ratio or mask_ratio > seg_cfg.max_valid_mask_ratio:
+                    from aero_eyes.utils.geometry import center_box_mask
+                    log.warning(
+                        "[Stage123-GeCo2] %s: MobileSAM mask area implausible (%.1f%% of frame), "
+                        "using center-crop fallback (ratio=%.2f) instead of passthrough.",
+                        sample_id, mask_ratio * 100.0, seg_cfg.center_fallback_ratio,
+                    )
+                    mask = center_box_mask(img.shape, seg_cfg.center_fallback_ratio)
+            masks.append(mask)
+        raw_boxes = [mask_bbox(m) for m in masks]
+        bg_imgs = [apply_background_mode(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
+                   for img, m in zip(ref_imgs, masks)]
+        if cfg.runtime.save_visualizations:
+            vizmod.save_stage1_refs(bg_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+
+        video_path = _locate_video(cfg, sample_id)
+        prototype, debug_info = build_auto_scaled_prototype(
+            cfg, sample_id, detector, bg_imgs, raw_boxes, video_path,
+        )
+        debug_path = work_dir / "geco2_auto_scale_calibration.json"
+        debug_path.write_text(json.dumps(debug_info, indent=2))
+        log.info(
+            "[Stage123-GeCo2] %s: auto_scale_calibration selected weights=%s over %d "
+            "candidate(s) (metric=%s) -- see %s",
+            sample_id, [round(w, 3) for w in debug_info["weights"]],
+            len(debug_info["candidates"]), debug_info["metric_used"], debug_path,
+        )
+    elif g.learned_scale_fusion.enabled:
+        # Track B (see docs/GECO2_scale_domain_gap_plan.md): inference-side
+        # use of a checkpoint finetuned with --num-ref-scale-variants>1
+        # (has a trained scale_fusion_gates submodule). Builds one
+        # candidate exemplar per (ref image, factor) -- same mechanism as
+        # ref_downscale_levels below -- then fuses them with the trained
+        # gate instead of flat-concatenating. Also a separate top-level
+        # branch (like auto_scale_calibration) for the same reason: it
+        # takes over entirely instead of composing with the manual-tuning
+        # branches below.
+        lsf_cfg = g.learned_scale_fusion
+        if not seg_cfg.enabled:
+            raise ValueError(
+                "stage123_geco2.learned_scale_fusion.enabled requires "
+                "segmentation.enabled (needs a tight mask box to build candidates around)."
+            )
+        if g.use_shape_token:
+            raise ValueError(
+                "stage123_geco2.learned_scale_fusion.enabled requires use_shape_token=false -- "
+                "Track B checkpoints are trained without shape tokens (see "
+                "docs/GECO2_FINETUNE_PLAN.md point 1)."
+            )
+        if sc_cfg.enabled or g.crop_to_object or g.ref_downscale_levels or g.ref_downscale_factor != 1.0:
+            log.warning(
+                "[Stage123-GeCo2] %s: learned_scale_fusion.enabled overrides "
+                "scale_calibration/crop_to_object/ref_downscale_factor/ref_downscale_levels -- "
+                "their configured values are ignored this run.", sample_id,
+            )
+        from aero_eyes.models.segmentation import build_segmenter
+
+        segmenter = build_segmenter(seg_cfg, cfg)
+        masks = [segmenter.segment(img) for img in ref_imgs]
+        raw_boxes = [mask_bbox(m) for m in masks]
+        bg_imgs = [apply_background_mode(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
+                   for img, m in zip(ref_imgs, masks)]
+        if cfg.runtime.save_visualizations:
+            vizmod.save_stage1_refs(bg_imgs, masks, work_dir / "viz" / "stage123_geco2" / "refs")
+
+        multiscale_imgs: list[np.ndarray] = []
+        multiscale_boxes: list[tuple[float, float, float, float] | None] = []
+        group_ids: list[int] = []
+        for ref_idx, (img, b) in enumerate(zip(bg_imgs, raw_boxes)):
+            for f in lsf_cfg.candidate_factors:
+                multiscale_boxes.append(tuple(c * f for c in b) if b is not None else None)
+                multiscale_imgs.append(_apply_ref_downscale(img, f))
+                group_ids.append(ref_idx)
+
+        video_path = _locate_video(cfg, sample_id)
+        info = video_info(video_path)
+        total_frames = info["total_frames"]
+        from aero_eyes.models.geco2_auto_scale import sample_uniform_frame_indices
+        context_idxs = sample_uniform_frame_indices(total_frames, lsf_cfg.num_context_frames)
+        context_frames = [read_frame(video_path, i) for i in context_idxs]
+
+        prototype = detector.encode_exemplars_fused(
+            multiscale_imgs, multiscale_boxes, group_ids, context_frames,
+        )
+        log.info(
+            "[Stage123-GeCo2] %s: learned_scale_fusion -- %d ref image(s) x %d factor(s), "
+            "context averaged over %d frame(s)",
+            sample_id, len(bg_imgs), len(lsf_cfg.candidate_factors), len(context_frames),
+        )
+    elif seg_cfg.enabled:
         from aero_eyes.models.segmentation import build_segmenter
         segmenter = build_segmenter(seg_cfg, cfg)
         masks = []
@@ -348,26 +468,33 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                 sample_id, num_orig_refs, len(levels), len(ref_imgs), levels,
             )
 
-    # Debug viz: the ACTUAL final images/boxes about to be encoded, after
-    # every step above (mask, background-fill, crop_to_object,
-    # scale_calibration, ref_downscale_factor/levels -- or none of those,
-    # if segmentation is disabled) -- every EARLIER viz call above only
-    # shows an intermediate stage, none of them show what encode_exemplars
-    # itself actually receives. Saved unconditionally right before the
-    # call so this always reflects reality regardless of which branch ran.
-    if cfg.runtime.save_visualizations:
-        from aero_eyes.utils.viz import draw_box
-        out_dir = work_dir / "viz" / "stage123_geco2" / "refs_final"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for i, img in enumerate(ref_imgs):
-            cv2.imwrite(str(out_dir / f"ref_final_{i:02d}.jpg"), img)
-            box_i = ref_boxes[i] if ref_boxes is not None else None
-            if box_i is not None:
-                annotated = img.copy()
-                draw_box(annotated, Box(*box_i), "RoI-Align region", (0, 255, 0))
-                cv2.imwrite(str(out_dir / f"ref_final_{i:02d}_box.jpg"), annotated)
+    # Debug viz + the final encode_exemplars call -- skipped when
+    # auto_scale_calibration or learned_scale_fusion already built
+    # `prototype` itself above (their own per-candidate images/boxes are
+    # saved separately -- geco2_auto_scale_calibration.json for the former;
+    # ref_imgs/ref_boxes here still hold the ORIGINAL unprocessed refs in
+    # both cases, not what was actually encoded).
+    if not asc_cfg.enabled and not g.learned_scale_fusion.enabled:
+        # Debug viz: the ACTUAL final images/boxes about to be encoded, after
+        # every step above (mask, background-fill, crop_to_object,
+        # scale_calibration, ref_downscale_factor/levels -- or none of those,
+        # if segmentation is disabled) -- every EARLIER viz call above only
+        # shows an intermediate stage, none of them show what encode_exemplars
+        # itself actually receives. Saved unconditionally right before the
+        # call so this always reflects reality regardless of which branch ran.
+        if cfg.runtime.save_visualizations:
+            from aero_eyes.utils.viz import draw_box
+            out_dir = work_dir / "viz" / "stage123_geco2" / "refs_final"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for i, img in enumerate(ref_imgs):
+                cv2.imwrite(str(out_dir / f"ref_final_{i:02d}.jpg"), img)
+                box_i = ref_boxes[i] if ref_boxes is not None else None
+                if box_i is not None:
+                    annotated = img.copy()
+                    draw_box(annotated, Box(*box_i), "RoI-Align region", (0, 255, 0))
+                    cv2.imwrite(str(out_dir / f"ref_final_{i:02d}_box.jpg"), annotated)
 
-    prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
+        prototype = detector.encode_exemplars(ref_imgs, ref_boxes=ref_boxes)
 
     dc_cfg = g.domain_calibration
     if dc_cfg.enabled:

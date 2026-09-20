@@ -47,6 +47,8 @@ def _make_cfg(tmp_path: Path, sample_id: str, ref_downscale_factor: float, seg_e
             prototype_cache_name="geco2_prototype.pt",
             segmentation=SimpleNamespace(enabled=seg_enabled),
             scale_calibration=SimpleNamespace(enabled=False),
+            auto_scale_calibration=SimpleNamespace(enabled=False),
+            learned_scale_fusion=SimpleNamespace(enabled=False),
             ref_downscale_factor=ref_downscale_factor,
             ref_downscale_levels=ref_downscale_levels,
             crop_to_object=False,
