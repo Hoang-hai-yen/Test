@@ -424,6 +424,61 @@ stage3:
     # 1.0 = only the single best-matching candidate; lower keeps near-ties.
     fallback_relative_ratio: 0.9
 
+  # --------------------------------------------------------------------
+  # Precision-focused ADD-ON to verification_method="threshold" above
+  # (never combined with verification_method="cluster", which already IS
+  # the primary decision there). Built from this project's own real A/B
+  # testing on footage: standalone per-keyframe cluster verification
+  # (verification_method="cluster") UNDERPERFORMED both batch and online
+  # adaptive_threshold (TP/FP retention margin +10.5pp vs +61.4pp/+74.5pp)
+  # -- most keyframes in a single-object tracking video contain NO real
+  # instance of the target at all (unlike DAVE's own FSC147 benchmark
+  # where every image guarantees real instances), so a purely per-keyframe
+  # decision has no way to tell "this whole keyframe is background
+  # clutter" the way a threshold computed over many keyframes' aggregate
+  # statistics can. adaptive_threshold_online (multi-keyframe running
+  # window) BEAT the whole-video batch threshold in that same test (F1
+  # 0.706 vs 0.684) -- multi-keyframe context is the winning ingredient.
+  #
+  # This add-on borrows that ingredient instead of repeating cluster's
+  # per-keyframe-isolation mistake: it clusters each keyframe's
+  # THRESHOLD-SURVIVING candidates against the 3 original exemplars PLUS a
+  # rolling window of RECENTLY-ACCEPTED (already threshold-passed AND
+  # already secondary-filter-passed) candidate features from EARLIER
+  # keyframes -- trusted appearance anchors accumulated causally, never
+  # looking at future keyframes. A threshold-survivor that does NOT
+  # cluster with any exemplar OR any recently-trusted candidate is
+  # rejected -- catching a confuser that clears the (global-context)
+  # threshold bar but doesn't structurally resemble any confirmed-real
+  # appearance seen so far. Can only ever REJECT candidates the threshold
+  # already accepted (a precision-vs-recall tradeoff), never add recall
+  # back -- see docs/GECO2_cluster_verification_guide.md for the full
+  # experimental history behind this design.
+  #
+  # NOT YET VALIDATED -- compare against verification_method="threshold"
+  # alone (same adaptive_threshold/adaptive_threshold_online settings)
+  # before trusting it.
+  # --------------------------------------------------------------------
+  cluster_secondary_filter:
+    enabled: false
+    # Recently-accepted candidate features kept as extra trusted anchors,
+    # FIFO, alongside the 3 original exemplars -- purely causal. Larger =
+    # more context (closer to adaptive_threshold_online's own window) but
+    # more compute per keyframe and slower to "forget" a drifted look.
+    window_size: 50
+    # Reuses the SAME shared cluster_verification knobs as
+    # stage3.cluster_verification above (its own `enabled` is not
+    # consulted here -- this section's `enabled` is the switch).
+    cluster_verification:
+      enabled: false
+      cluster_method: hdbscan
+      min_cluster_size: 2
+      min_samples: null
+      spectral_egv_threshold: 0.132
+      min_candidates_for_cluster: 4
+      max_candidates_for_cluster: 500
+      fallback_relative_ratio: 0.9
+
 # ----------------------------------------------------------------------------
 # STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
 # Only used when pipeline.detector == "geco2". Ignores stage1/stage2/stage3

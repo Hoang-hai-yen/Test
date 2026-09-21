@@ -503,6 +503,35 @@ class ClusterVerificationConfig(BaseModel):
     fallback_relative_ratio: float = 0.9
 
 
+class ClusterSecondaryFilterConfig(BaseModel):
+    """stage3.cluster_secondary_filter -- precision-focused ADD-ON to
+    verification_method="threshold" (never combined with
+    verification_method="cluster", which already IS the primary decision
+    there). See Stage3Config.cluster_secondary_filter's own placement
+    docstring for the full empirical rationale (why standalone per-keyframe
+    clustering lost to threshold-based verification on this project's own
+    footage, and why THIS design borrows threshold's winning ingredient --
+    multi-keyframe aggregate context -- instead of repeating the same
+    per-keyframe-isolation mistake).
+    """
+    enabled: bool = False
+    # How many recently-accepted (threshold-passed AND secondary-filter-
+    # passed) candidate features to keep as extra trusted anchors, FIFO,
+    # in addition to the 3 original exemplars -- purely causal (only ever
+    # holds EARLIER keyframes' own accepted features). Larger = more
+    # context (closer in spirit to adaptive_threshold_online's own
+    # window), but also more compute per keyframe (affinity matrix grows)
+    # and slower to "forget" an appearance that's no longer representative
+    # if the target's own look drifts significantly over the video.
+    window_size: int = 50
+    # Reuses the SAME shared primitive/knobs as stage3.verification_method
+    # ="cluster" and stage123_geco2.dynamic_prototype.cluster_verification
+    # -- see ClusterVerificationConfig's own docstring. `enabled` on this
+    # sub-config is not consulted (this section's own `enabled` above is
+    # the switch); only cluster_method/min_cluster_size/etc. are read.
+    cluster_verification: ClusterVerificationConfig = ClusterVerificationConfig()
+
+
 class Stage3Config(BaseModel):
     # Dev/debug convenience: candidates.json's companion candidates.feats.npz
     # is written by Stage 2 (see aero_eyes/stages/stage2.py::
@@ -680,6 +709,53 @@ class Stage3Config(BaseModel):
     # stage123_geco2.dynamic_prototype.cluster_verification, where `enabled`
     # IS the switch (mirroring that field's topk_fusion sibling).
     cluster_verification: ClusterVerificationConfig = ClusterVerificationConfig()
+    # --------------------------------------------------------------------
+    # Precision-focused ADD-ON to verification_method="threshold" (never
+    # combined with verification_method="cluster", which already IS the
+    # primary decision there) -- built from what this project's own real
+    # A/B testing on footage found:
+    #   - verification_method="cluster" alone (module (ii) DAVE-style,
+    #     deciding each keyframe in total isolation) empirically
+    #     UNDERPERFORMED both batch and online adaptive_threshold on this
+    #     project's own footage (TP/FP retention margin +10.5pp vs +61.4pp
+    #     / +74.5pp) -- see docs/GECO2_cluster_verification_guide.md. Root
+    #     cause: most keyframes in a single-object tracking video contain
+    #     NO real instance of the target at all (unlike DAVE's own FSC147
+    #     benchmark, where every image guarantees real instances) -- a
+    #     purely per-keyframe decision has no way to tell "this whole
+    #     keyframe's candidates are all mediocre background clutter" the
+    #     way a threshold computed over many keyframes' aggregate
+    #     statistics naturally can.
+    #   - adaptive_threshold_online (a running window across many
+    #     keyframes) actually BEAT the whole-video batch threshold in that
+    #     same test (F1 0.706 vs 0.684) -- multi-keyframe AGGREGATE context
+    #     is what made both threshold variants work; per-keyframe isolation
+    #     is what made standalone clustering fail.
+    # This add-on applies clustering as a SECONDARY filter on top of an
+    # already-threshold-passing candidate set, but gives it the SAME kind
+    # of multi-keyframe context that made the threshold approaches win:
+    # instead of clustering each keyframe's candidates against ONLY the 3
+    # original exemplars (module (ii) DAVE-style), it clusters against the
+    # 3 original exemplars PLUS a rolling window of RECENTLY-ACCEPTED
+    # (already threshold-passed AND already secondary-filter-passed)
+    # candidate features from EARLIER keyframes -- trusted appearance
+    # anchors that accumulate causally as the video is processed, never
+    # looking at future keyframes. A threshold-passing candidate that does
+    # NOT cluster with any exemplar OR any recently-trusted candidate is
+    # rejected -- catching a confuser that happens to clear the (global-
+    # context) threshold bar but doesn't structurally resemble any
+    # confirmed-real appearance seen so far.
+    # Safe by construction: below cluster_verification.min_candidates_for_
+    # cluster threshold-passing candidates in a keyframe (too little
+    # evidence either way), this filter is a no-op for that keyframe (keeps
+    # the threshold's own decision unchanged) rather than guessing.
+    # NOT YET VALIDATED -- compare against verification_method="threshold"
+    # alone (with the exact same adaptive_threshold/adaptive_threshold_
+    # online settings) before trusting it; this is a precision-vs-recall
+    # tradeoff (it can only ever REJECT candidates the threshold already
+    # accepted, never add recall back).
+    # --------------------------------------------------------------------
+    cluster_secondary_filter: ClusterSecondaryFilterConfig = ClusterSecondaryFilterConfig()
 
 
 class BuiltinTrackerConfig(BaseModel):

@@ -760,6 +760,64 @@ def run_stage3(cfg, sample_id: str) -> Path:
         log.info("[Stage3] %s: threshold=%.3f → %d / %d candidates pass",
                  sample_id, effective_threshold, len(selected), len(all_sims))
 
+    # ---- Optional: cluster-based SECONDARY precision filter ----
+    # Only ever narrows an already-threshold-passing set (verification_method
+    # must be "threshold", never "cluster" -- that path already IS the
+    # primary decision). See ClusterSecondaryFilterConfig's own docstring
+    # for the full empirical rationale.
+    csf_cfg = s3.cluster_secondary_filter
+    if csf_cfg.enabled and s3.verification_method == "threshold":
+        from collections import defaultdict as _defaultdict
+        from collections import deque as _deque
+
+        from aero_eyes.utils.cluster_verify import cluster_verify_candidates
+
+        idx_by_frame: dict[int, list[int]] = _defaultdict(list)
+        for i in range(len(all_sims)):
+            if keep_mask[i]:
+                idx_by_frame[all_frame_idxs[i]].append(i)
+
+        ref_feats_base = (
+            np.stack(per_ref_features, axis=0) if use_multi_ref else prototype[None, :]
+        )
+
+        def _keep_everyone(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
+            # Too few threshold-survivors this keyframe to add meaningful
+            # cluster evidence either way -- trust the threshold's own
+            # decision unchanged rather than guessing.
+            return np.ones(cand_feats_frame.shape[0], dtype=bool)
+
+        trusted_window: _deque = _deque(maxlen=csf_cfg.window_size)
+        n_before = sum(len(v) for v in idx_by_frame.values())
+        n_rejected = 0
+        for fi in sorted(idx_by_frame):
+            idxs = idx_by_frame[fi]
+            ref_feats_for_frame = (
+                np.concatenate([ref_feats_base, np.stack(trusted_window, axis=0)], axis=0)
+                if trusted_window else ref_feats_base
+            )
+            frame_keep, _ = cluster_verify_candidates(
+                all_feats[idxs], ref_feats_for_frame, csf_cfg.cluster_verification,
+                fallback_keep_mask_fn=_keep_everyone,
+            )
+            for local_i, global_i in enumerate(idxs):
+                if frame_keep[local_i]:
+                    trusted_window.append(all_feats[global_i])
+                else:
+                    keep_mask[global_i] = False
+                    n_rejected += 1
+
+        selected = [
+            (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
+            for i in range(len(all_sims)) if keep_mask[i]
+        ]
+        log.info(
+            "[Stage3] %s: cluster_secondary_filter (cluster_method=%s, window_size=%d) "
+            "rejected %d / %d threshold-passing candidate(s) -> %d remain",
+            sample_id, csf_cfg.cluster_verification.cluster_method, csf_cfg.window_size,
+            n_rejected, n_before, len(selected),
+        )
+
     # ---- Apply global_topk cap (after threshold, not instead of it) ----
     global_topk = s3.global_topk
     if global_topk is not None and len(selected) > global_topk:

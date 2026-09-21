@@ -182,14 +182,43 @@ def cluster_verify_candidates(
     if noise_label is not None:
         ref_labels.discard(noise_label)
 
-    if not ref_labels:
-        # Every exemplar itself landed in the noise cluster (hdbscan only) --
-        # no known-real neighborhood to verify against this keyframe. Trust
-        # nothing rather than guess, consistent with this mechanism's
-        # "verified or absent" philosophy.
+    if noise_label is not None and bool(np.all(labels == noise_label)):
+        # EVERY point -- candidates AND exemplars alike -- landed in the
+        # noise cluster. Confirmed empirically (not just theoretical): a
+        # SINGLE homogeneous, tightly-clustered group with NO second
+        # population to contrast against (e.g. a keyframe where every
+        # candidate genuinely matches, no confuser present at all) can make
+        # HDBSCAN label everything noise even at min_cluster_size=2 -- it
+        # has no density VARIATION to anchor a resolvable cluster on, which
+        # is different from "the exemplars are outliers relative to a real
+        # candidate cluster" (handled below). Treating this the same way
+        # as that case would be exactly backwards: "no evidence of any
+        # outlier structure at all" should NOT be read as "reject
+        # everyone" -- it means clustering was INCONCLUSIVE here, so fall
+        # back to whatever policy the caller supplies for "too little
+        # evidence to cluster meaningfully" (same fallback_keep_mask_fn
+        # used below min_candidates_for_cluster), not a confident reject.
         log.debug(
-            "[cluster_verify] all %d exemplar(s) labelled noise by %s -- "
-            "0/%d candidates verified this keyframe",
+            "[cluster_verify] %s labelled ALL %d point(s) (candidates + exemplars) as noise -- "
+            "inconclusive, not a genuine outlier signal -- falling back",
+            method_label, n + k,
+        )
+        if fallback_keep_mask_fn is None:
+            return np.zeros(n, dtype=bool), method_label
+        keep_mask = fallback_keep_mask_fn(cand_feats, ref_feats)
+        return keep_mask, f"{method_label}_fallback_inconclusive"
+
+    if not ref_labels:
+        # Exemplars themselves landed in the noise cluster while some
+        # CANDIDATES got a real (non-noise) cluster label -- unlike the
+        # all-noise case above, this means clustering DID find resolvable
+        # structure, just not one the exemplars belong to. No known-real
+        # neighborhood to verify against this keyframe -- trust nothing
+        # rather than guess, consistent with this mechanism's "verified or
+        # absent" philosophy.
+        log.debug(
+            "[cluster_verify] all %d exemplar(s) labelled noise by %s (candidates DID form a "
+            "real cluster) -- 0/%d candidates verified this keyframe",
             k, method_label, n,
         )
         return np.zeros(n, dtype=bool), method_label

@@ -177,6 +177,59 @@ def test_all_exemplars_labelled_noise_keeps_nothing():
     assert not keep_mask.any()
 
 
+def test_all_points_labelled_noise_falls_back_instead_of_rejecting():
+    """Regression test for a real bug found while building
+    cluster_secondary_filter: a SINGLE homogeneous, tightly-clustered group
+    with NO second population to contrast against (confirmed empirically --
+    even a very tight blob of candidates + exemplars with NO outlier
+    present at all) can make HDBSCAN label EVERY point noise, since there
+    is no density variation to anchor a resolvable cluster on. This is
+    fundamentally different from "exemplars are noise but candidates DID
+    form a real cluster" (test_all_exemplars_labelled_noise_keeps_nothing
+    above, where rejecting is correct) -- here, clustering found ZERO
+    structure at all, which is not evidence of an outlier and must not be
+    read as one. Must fall back rather than confidently reject everyone."""
+    rng = np.random.default_rng(7)
+    d = 16
+    view = np.zeros(d)
+    view[0] = 1.0
+    # A single tight, homogeneous population -- candidates AND exemplars
+    # all genuinely alike, no confuser anywhere in the mix.
+    cand = _make_unit(view[None, :] + 0.02 * rng.normal(size=(6, d)))
+    ref = _make_unit(view[None, :] + 0.02 * rng.normal(size=(3, d)))
+
+    cfg = ClusterVerificationConfig(enabled=True, cluster_method="hdbscan", min_cluster_size=2)
+    calls = []
+
+    def fallback(cand_feats, ref_feats):
+        calls.append((cand_feats.shape, ref_feats.shape))
+        return np.ones(cand_feats.shape[0], dtype=bool)
+
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg, fallback_keep_mask_fn=fallback)
+
+    assert method_label == "cluster_hdbscan_fallback_inconclusive"
+    assert len(calls) == 1, "fallback must have been invoked instead of confidently rejecting"
+    assert keep_mask.all()
+
+
+def test_all_points_labelled_noise_without_fallback_still_rejects():
+    """No fallback provided -- can't safely resolve the inconclusive case
+    either way, so it falls back to the same conservative reject as
+    before (no regression for callers that don't supply one)."""
+    rng = np.random.default_rng(8)
+    d = 16
+    view = np.zeros(d)
+    view[0] = 1.0
+    cand = _make_unit(view[None, :] + 0.02 * rng.normal(size=(6, d)))
+    ref = _make_unit(view[None, :] + 0.02 * rng.normal(size=(3, d)))
+
+    cfg = ClusterVerificationConfig(enabled=True, cluster_method="hdbscan", min_cluster_size=2)
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg)
+
+    assert method_label == "cluster_hdbscan"
+    assert not keep_mask.any()
+
+
 # ---------------------------------------------------------------------------
 # _self_tuning_n_clusters -- ported from DAVE's own reference implementation
 # (models/dave.py::COTR.eigenDecomposition in the cloned DAVE repo), not
