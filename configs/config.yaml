@@ -105,7 +105,7 @@ stage1:
   crop_to_object: false
   crop_context_margin: 0.5
   feature_extractor:
-    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dinov2+clip concat)
+    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dino+clip concat, see ensemble_dino_model below)
     dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
                               # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
     # "With registers" DINOv2 (dinov2_{variant}_reg on torch.hub / HF
@@ -145,6 +145,15 @@ stage1:
     # siglip_variant: used only when model=siglip. Open access on HuggingFace,
     # no token needed. Vision encoder only (no text tower loaded).
     siglip_variant: base     # base (768-d) | large (1024-d) | so400m (1152-d, slow)
+    # Which DINO family model=ensemble concatenates with CLIP -- dinov2
+    # (default, unchanged) or dinov3 (reuses dinov3_variant/dinov3_source/
+    # dinov3_pretrain_dataset/dinov3_kaggle_model_id above, no separate
+    # copies). dinov3+CLIP is NOT YET VALIDATED -- proposed to test whether
+    # CLIP's semantic/categorical training objective helps distinguish a
+    # real object from texturally-similar background clutter (e.g. dry
+    # leaves) that DINOv3 alone confuses with the target -- see
+    # docs/GECO2_precision_techniques_reference.md.
+    ensemble_dino_model: dinov2   # dinov2 | dinov3
     weights: null            # null = load from torch.hub / hf
     image_size: 224
     # Optional small trained head on top of the frozen backbone above (see
@@ -160,6 +169,37 @@ stage1:
       weights_path: null
       output_dim: 256   # must match --output-dim used when training weights_path
       hidden_dim: null  # must match --hidden-dim used when training weights_path (null = single Linear)
+    # Opt-in preprocessing for CANDIDATE crops (video detections), NOT the
+    # reference photos (segmentation above already masks those separately).
+    # Addresses a real asymmetry found during this project's own error
+    # analysis (scripts/diagnose_verification_errors.py): the reference
+    # exemplar embedding is already background-masked, but a candidate
+    # crop pulled from the video never was -- it always includes whatever
+    # real background surrounds the box (e.g. ground clutter, dry leaves),
+    # which can leak into and dominate its embedding. Reuses the exact
+    # same shape/model choices/background_mode as `segmentation` above
+    # (`enabled` here is its own switch).
+    # COST WARNING: runs a full segmentation inference call PER CANDIDATE
+    # CROP per keyframe (no batched-inference path) -- can be a
+    # substantial slowdown with many candidates per keyframe.
+    # NOT YET VALIDATED -- see docs/GECO2_precision_techniques_reference.md.
+    candidate_background_masking:
+      enabled: false
+      model: mobilesam   # mobilesam | fastsam | sam2 -- see segmentation.model's own comment
+      weights: null
+      fallback_if_missing: passthrough
+      min_area_frac: 0.05
+      max_area_frac: 0.95
+      score_ratio_floor: 0.85
+      max_border_touch_frac: 0.02
+      reject_implausible_mask: true
+      use_point_prompt: true
+      background_mode: mean_fill   # mean_fill | keep_real | blur -- see segmentation.background_mode's own comment
+      blur_sigma: 25.0
+      center_crop_fallback: false
+      min_valid_mask_ratio: 0.03
+      max_valid_mask_ratio: 0.92
+      center_fallback_ratio: 0.75
   prototype:
     # How the 3 per-reference feature sets are fused.
     fusion: mean             # mean | max | concat_then_pca
@@ -256,7 +296,19 @@ stage3:
   # topk_per_keyframe cap.
   min_box_area_enabled: false
   min_box_area: 12
-  similarity: cosine         # cosine | l1 | l2  (l1/l2 = negated distance, higher still = more similar)
+  # cosine | l1 | l2 (l1/l2 = negated distance, higher still = more similar) | rmd
+  # (Relative Mahalanobis Distance: MahalanobisDist(x, background) -
+  # MahalanobisDist(x, exemplar), fit once per video from ALL of this
+  # video's own candidate features via sklearn.covariance.LedoitWolf --
+  # "how much closer to the exemplar than to this video's own generic
+  # background, in whitened space", removing the raw-magnitude domain-gap
+  # effect plain cosine can't separate from genuine identity signal. Drop-
+  # in score replacement -- threshold/cluster/margin/dynamic_prototype all
+  # consume whatever this produces unchanged, but rmd's SCALE differs from
+  # cosine's [-1,1], so match_threshold/adaptive_min_floor need re-tuning
+  # (or use adaptive_threshold, which re-derives its own cutoff either way).
+  # NOT YET VALIDATED -- compare against cosine on your own footage first.
+  similarity: cosine
   match_threshold: 0.55      # calibratable; candidates below are dropped (used unless adaptive_threshold below)
   nms_iou: 0.5               # NMS across overlapping SAHI tiles
   topk_per_keyframe: 5       # keep at most K detections per keyframe
@@ -326,6 +378,58 @@ stage3:
   # footage before trusting it for a live feed.
   adaptive_threshold_online: false
   adaptive_threshold_online_window: 200
+  # Alternatives to the "window_stat" (z_score/otsu/gmm on the running
+  # window, unchanged) dispatch above -- only take effect when
+  # adaptive_threshold_online is also true.
+  # "aci": Adaptive Conformal Inference (Gibbs & Candes, NeurIPS 2021) --
+  #   single-scalar gradient-step threshold update. HIGH CONFIDENCE this
+  #   matches the paper's own update-step formula (given explicitly in
+  #   research_notes/Precision verification online tracking/
+  #   conformal_online_thresholding.md); adapted as a running percentile
+  #   into the window's own similarity distribution, with the update's own
+  #   sign flipped vs. the paper's literal formula to match this pipeline's
+  #   opposite score polarity (accept if similarity >= threshold, not <=)
+  #   -- see stage3.py's ACIOnlineThreshold docstring for the full
+  #   rationale.
+  # "saffron": SAFFRON (Ramdas, Zrnic, Wainwright, Jordan, PMLR v80/ICML
+  #   2018, arXiv:1802.09098, read directly from its own PDF) -- targets
+  #   (false accepts)/(total accepts) directly. FAITHFUL port of the
+  #   paper's own Sec. 2.3 algorithm -- see online_fdr below and
+  #   SaffronInspiredOnlineFDR's own docstring (stage3.py) for the exact
+  #   bookkeeping; only its p-value heuristic (there's no real statistical
+  #   model here to derive one from) is a project-specific adaptation.
+  # "corruption_compensated": F-ROCP (arXiv:2605.20515, "Online Conformal
+  #   Prediction with Corrupted Feedback", read directly from its own PDF)
+  #   wrapped around "aci" above. FAITHFUL port of the paper's own
+  #   Algorithm 1 (only its further AC-ROCP active-compensation extension
+  #   is deliberately NOT ported -- see corruption_compensated below and
+  #   CorruptionCompensatedThresholdConfig's own docstring for why it has
+  #   no coherent mapping onto a no-ground-truth setting).
+  # NOT YET VALIDATED, any of the four -- compare against "window_stat" on
+  # your own footage before trusting one.
+  adaptive_threshold_online_method: window_stat   # window_stat | aci | saffron | corruption_compensated
+  aci_target_error_rate: 0.1
+  aci_step_size: 0.05
+  online_fdr:
+    enabled: false
+    target_fdr: 0.1              # target (false accepts) / (total accepts) -- SAFFRON's own alpha
+    initial_wealth_fraction: 0.5 # W_0 = target_fdr * this (must stay < 1)
+    lam: 0.5                     # p-value candidacy cutoff -- the paper's own default, best in their experiments
+    # gamma_j is proportional to j^-gamma_exponent -- the paper's own more
+    # "aggressive" (larger exponent) sequences outperformed LORD's
+    # asymptotically-optimal one in their own experiments (Sec. 4.1).
+    gamma_exponent: 2.0
+    # Each candidate's "p-value" (a project-specific heuristic, NOT from
+    # the paper) = fraction of this many of the most recent candidates'
+    # own similarity scores that are AT LEAST this high.
+    p_value_window: 200
+  corruption_compensated:
+    enabled: false
+    # No knobs of its own: F-ROCP wraps ACIOnlineThreshold's percentile
+    # update unchanged (reuses aci_target_error_rate/aci_step_size above),
+    # replacing the observed accept-rate signal with a certain one
+    # whenever the percentile has hit 0 or 100 -- see
+    # CorruptionCompensatedThreshold's own docstring (stage3.py).
   # Optional auto-calibration of match_threshold on a labelled subset.
   calibrate:
     enabled: false
@@ -478,6 +582,99 @@ stage3:
       min_candidates_for_cluster: 4
       max_candidates_for_cluster: 500
       fallback_relative_ratio: 0.9
+    # Corroboration gate on WINDOW ADMISSION (docs/GECO2_precision_
+    # improvements_plan.md Phase 1 item 2) -- reuses aero_eyes.utils.
+    # detection_confirm.DetectionConfirmer, the SAME consecutive-hit
+    # utility stage4.confirm_detections and GeCo2DynamicPrototypeTracker
+    # already use. Suspected root cause of this filter not meaningfully
+    # improving precision in real-footage testing: every threshold-passing
+    # candidate was admitted into the trusted window unconditionally, so a
+    # single borderline false positive could poison the window and get
+    # treated as a trusted anchor for later keyframes. When enabled, a
+    # candidate that survives the per-keyframe cluster check must ALSO
+    # agree spatially (IoU >= window_admission_iou_threshold) across
+    # window_admission_min_consecutive_hits consecutive keyframes before
+    # being appended to the window -- DAM4SAM/KeepTrack's "gate memory
+    # writes on reliability, never blend" pattern. <=1 reproduces today's
+    # unconditional-admission behavior unchanged.
+    # NOT YET VALIDATED -- compare against the ungated version first.
+    window_admission_min_consecutive_hits: 2
+    window_admission_iou_threshold: 0.5
+
+  # Margin-over-runner-up (WildFusion, arXiv:2608.02469, docs/GECO2_
+  # precision_improvements_plan.md Phase 1 item 1). A candidate that
+  # clears the accept threshold/cluster check is only actually kept if it
+  # ALSO has a clear similarity margin over this keyframe's own runner-up
+  # candidate -- catches the case where two candidates in the same
+  # keyframe both clear the accept bar but only one is real. A keyframe
+  # with only 1 surviving candidate has no runner-up and is never
+  # affected; a keyframe with >=2 survivors whose top candidate fails the
+  # margin check is AMBIGUOUS -- the whole keyframe's selection is dropped
+  # (reported absent) rather than guessing.
+  # NOT YET VALIDATED -- like cluster_secondary_filter, this can only ever
+  # REJECT candidates an earlier stage already accepted (a precision-vs-
+  # recall tradeoff), never add recall back.
+  margin_verification:
+    enabled: false
+    tau_margin: 0.05
+  # KeepTrack-style (arXiv:2103.16556, docs/GECO2_precision_improvements_
+  # plan.md Phase 3 item 6) multi-candidate identity tracking across
+  # keyframes -- an alternative/additional precision filter to
+  # cluster_secondary_filter and margin_verification. Keeps the top-K
+  # threshold-surviving candidates + features per keyframe and solves a
+  # bipartite match between CONSECUTIVE keyframes' candidate sets
+  # (scipy.optimize.linear_sum_assignment) with cost = 1 - cosine_sim (+
+  # an optional spatial-distance term, spatial_weight). Tracks "identity
+  # chains" across keyframes; a keyframe's accepted candidate is whichever
+  # belongs to the LONGEST currently-active chain (>= min_chain_length),
+  # not whichever has the single highest appearance score this frame -- a
+  # confuser that outscores the real target in ONE frame doesn't win if it
+  # has no supporting chain across several others.
+  # NOT YET VALIDATED -- run scripts/diagnose_verification_errors.py's FP-
+  # self-clustering report first: if false positives are DIFFUSE (not a
+  # few recurring confusers), this larger structural investment is less
+  # likely to pay off than a better score (similarity=rmd above).
+  identity_chain_filter:
+    enabled: false
+    top_k_per_keyframe: 5
+    min_chain_length: 2
+    spatial_weight: 0.0   # 0 = pure appearance cost; >0 blends in normalized center-distance cost
+    # A candidate only extends a chain if its match cost is below this --
+    # i.e. requires cosine similarity > 1 - max_match_cost (default 0.5 ->
+    # cosine > 0.5) at spatial_weight=0. Orthogonal/unrelated features
+    # (cosine <= 0, cost >= 1.0) must never be treated as the same identity.
+    max_match_cost: 0.5
+
+  # Hard-negative "negative prototype" filter -- not from a paper, built
+  # from this project's own real-footage error analysis
+  # (scripts/diagnose_verification_errors.py): on one sample, a SINGLE
+  # recurring confuser class (a patch of dry leaves whose DINO embedding
+  # happens to sit close to the target's own) accounted for 47.8% of all
+  # false positives. Unlike similarity=rmd above (a DIFFUSE "generic
+  # background" reference fit from ALL candidates), this builds a SHARP,
+  # TARGETED anti-exemplar directly from whatever this pipeline's own
+  # decisions have already been rejecting -- no manual curation, no need
+  # to know what the confuser actually is. Maintains a causal, FIFO
+  # rolling window of recently-REJECTED candidate features; a threshold-
+  # surviving candidate is rejected if its cosine similarity to its
+  # closest match in that window exceeds its own cosine similarity to the
+  # positive exemplar set by at least tau_negative_margin. A recurring
+  # confuser naturally accumulates many similar members (future instances
+  # reliably match it); one-off noise contributes only isolated points
+  # that rarely match again -- this distinction emerges on its own.
+  # NOT YET VALIDATED -- like every other secondary filter above, can only
+  # ever REJECT a candidate an earlier stage already accepted.
+  negative_prototype_filter:
+    enabled: false
+    window_size: 200
+    # Below this many accumulated negative-window members, skip the check
+    # entirely -- not enough evidence yet to trust a coincidental match.
+    min_window_for_check: 20
+    # Reject if (max cosine to negative window) - (max cosine to positive
+    # exemplar set) >= this. 0.0 = reject as soon as the negative match is
+    # AT LEAST as good as the positive one; raise for a more conservative
+    # (recall-preserving) filter.
+    tau_negative_margin: 0.0
 
 # ----------------------------------------------------------------------------
 # STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
@@ -937,6 +1134,19 @@ stage123_geco2:
       min_candidates_for_cluster: 4
       max_candidates_for_cluster: 500   # see stage3.cluster_verification's own comment
       fallback_relative_ratio: 0.9
+    # Margin-over-runner-up (WildFusion-style) -- see stage3.margin_
+    # verification's own comment for the shared mechanism (MarginVerification
+    # Config). Applied inside offer_topk's verified-candidate selection: among
+    # candidates verified this keyframe (cluster_verification) or all
+    # surviving candidates (topk_fusion/cold-start), the winner is only
+    # actually offered to the confirmer if its similarity margin over the
+    # runner-up (in cosine-identity space) clears tau_margin -- a keyframe
+    # with only 1 candidate, or a clear winner, is unaffected.
+    # NOT YET VALIDATED -- can only ever REJECT a candidate an earlier gate
+    # already accepted, never add recall back.
+    margin_verification:
+      enabled: false
+      tau_margin: 0.05
 
   # --------------------------------------------------------------------
   # DIAGNOSTIC/ABLATION: box size feeds the exemplar prototype through TWO

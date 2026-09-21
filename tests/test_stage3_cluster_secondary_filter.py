@@ -199,3 +199,38 @@ def test_no_effect_when_verification_method_is_cluster(secondary_filter_setup, t
     # secondary filter entirely (asserting only that this combination is
     # safe, not any particular keep/reject outcome).
     run_stage3(cfg, "sample1")
+
+
+def test_window_admission_requires_corroboration(secondary_filter_setup, tmp_path, caplog):
+    """A candidate that clears cluster_secondary_filter's own check but
+    appears in only ONE keyframe must NOT be admitted into the trusted
+    window when window_admission_min_consecutive_hits > 1 -- addresses the
+    suspected root cause of this filter not meaningfully improving
+    precision in real-footage testing (an unconditionally-admitted
+    borderline candidate treated as a trusted anchor for later keyframes).
+    Uses a single candidate (n=1, below min_candidates_for_cluster) so the
+    fallback path trivially verifies it -- isolates this test to the
+    confirmer gate alone, independent of clustering reliability."""
+    work_dir, ref, fused_ref, make_tp, make_confuser = secondary_filter_setup
+    tp_feat = make_tp(1)[0]
+    _write_candidates_with_features({10: [_det(10, 0.0, tp_feat)]}, work_dir / "candidates.json")
+
+    # min_consecutive_hits=1 (no-op gate): the single offer confirms immediately.
+    overrides_gate1 = _base_overrides(tmp_path) + [
+        "stage3.cluster_secondary_filter.window_admission_min_consecutive_hits=1",
+    ]
+    cfg1 = load_config("configs/config.yaml", overrides=overrides_gate1)
+    with caplog.at_level(logging.INFO):
+        run_stage3(cfg1, "sample1")
+    assert "1 admitted into the trusted window" in caplog.text
+    caplog.clear()
+
+    # min_consecutive_hits=2: the SAME single occurrence must NOT be confirmed.
+    (work_dir / "detections.json").unlink()
+    overrides_gate2 = _base_overrides(tmp_path) + [
+        "stage3.cluster_secondary_filter.window_admission_min_consecutive_hits=2",
+    ]
+    cfg2 = load_config("configs/config.yaml", overrides=overrides_gate2)
+    with caplog.at_level(logging.INFO):
+        run_stage3(cfg2, "sample1")
+    assert "0 admitted into the trusted window" in caplog.text

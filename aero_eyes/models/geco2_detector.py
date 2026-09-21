@@ -1026,6 +1026,10 @@ class GeCo2DynamicPrototypeTracker:
         self._n_cluster_fallback = 0
         self._warned_cluster_topk_conflict = False
         self._warned_cluster_verification_unsupported = False
+        # dynamic_prototype.margin_verification (opt-in, offer_topk() and
+        # _offer_topk_cluster() both) -- see MarginVerificationConfig's own
+        # docstring.
+        self._n_margin_rejected = 0
         if tk_cfg.enabled and dp_cfg.cross_check_source != "feature_extractor":
             log.warning(
                 "[Stage123-GeCo2] %s: dynamic_prototype.topk_fusion.enabled=true but "
@@ -1270,6 +1274,20 @@ class GeCo2DynamicPrototypeTracker:
             self._topk_cosine_history.append(float(cosines[chosen_idx]))
             self._topk_geco2_history.append(float(geco2_scores[chosen_idx]))
 
+        if self.dp_cfg.margin_verification.enabled and len(boxes) >= 2:
+            selection_scores = fused if baseline is not None else cosines
+            top_two = np.sort(selection_scores)[::-1][:2]
+            margin = float(top_two[0] - top_two[1])
+            if margin < self.dp_cfg.margin_verification.tau_margin:
+                self._n_margin_rejected += 1
+                log.debug(
+                    "[Stage123-GeCo2] %s: dynamic_prototype (topk_fusion) keyframe frame=%s "
+                    "AMBIGUOUS -- top candidate's margin over runner-up (%.4f) < tau_margin "
+                    "(%.4f), reporting absent instead of guessing.",
+                    self.sample_id, frame_idx, margin, self.dp_cfg.margin_verification.tau_margin,
+                )
+                return
+
         chosen_box = boxes[chosen_idx]
         confirmed = self._confirmer.offer(chosen_box)
         if confirmed is None:
@@ -1409,6 +1427,25 @@ class GeCo2DynamicPrototypeTracker:
         if chosen_idx != 0:
             self._n_topk_fused_selected_non_top1 += 1
 
+        if self.dp_cfg.margin_verification.enabled and verified_idxs.size >= 2:
+            # Margin is evaluated in IDENTITY space (cosine against the
+            # exemplar set), not geco2_scores -- geco2_scores only breaks
+            # ties within the already-cluster-verified set and says
+            # nothing about identity ambiguity between two verified
+            # candidates.
+            cosines_verified = np.array([self._cosine_from_feature(feats[i]) for i in verified_idxs])
+            top_two = np.sort(cosines_verified)[::-1][:2]
+            margin = float(top_two[0] - top_two[1])
+            if margin < self.dp_cfg.margin_verification.tau_margin:
+                self._n_margin_rejected += 1
+                log.debug(
+                    "[Stage123-GeCo2] %s: dynamic_prototype (cluster_verification) keyframe "
+                    "frame=%s AMBIGUOUS -- top verified candidate's cosine margin over runner-up "
+                    "(%.4f) < tau_margin (%.4f), reporting absent instead of guessing.",
+                    self.sample_id, frame_idx, margin, self.dp_cfg.margin_verification.tau_margin,
+                )
+                return
+
         chosen_box = boxes[chosen_idx]
         confirmed = self._confirmer.offer(chosen_box)
         if confirmed is None:
@@ -1495,6 +1532,13 @@ class GeCo2DynamicPrototypeTracker:
                 "%d chose a candidate OTHER than GeCo2's own top pick",
                 self.sample_id, self.dp_cfg.cluster_verification.cluster_method, self._n_cluster_offers,
                 self._n_cluster_unverified, self._n_cluster_fallback, self._n_topk_fused_selected_non_top1,
+            )
+        if self.dp_cfg.margin_verification.enabled:
+            log.info(
+                "[Stage123-GeCo2] %s: dynamic_prototype margin_verification summary -- %d "
+                "keyframe(s) rejected as ambiguous (top candidate's margin over runner-up < "
+                "tau_margin=%.4f)", self.sample_id, self._n_margin_rejected,
+                self.dp_cfg.margin_verification.tau_margin,
             )
 
     def _get_ref_self_sim(self) -> float | None:

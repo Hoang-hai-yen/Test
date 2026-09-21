@@ -29,13 +29,44 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
-def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.ndarray:
+def _fit_rmd_background(all_feats: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Fits a shared, regularized covariance (Ledoit-Wolf shrinkage --
+    candidate count can be less than embedding dimensionality, where a
+    plain sample covariance would be singular/unstable) from ALL candidate
+    features this video produced -- the background/generic distribution,
+    since most candidates are background/FP by construction. Returns
+    (mu_background, precision_background); the precision matrix (inverse
+    covariance) is what Mahalanobis distance actually needs, computed once
+    here rather than re-inverting per call. See Stage3Config.similarity's
+    "rmd" docstring for the full rationale."""
+    from sklearn.covariance import LedoitWolf
+
+    lw = LedoitWolf().fit(all_feats)
+    return lw.location_, lw.precision_
+
+
+def _mahalanobis_sq(feats: np.ndarray, mu: np.ndarray, precision: np.ndarray) -> np.ndarray:
+    """Squared Mahalanobis distance of every row of feats [N,D] to mu [D],
+    under the given precision (inverse covariance) matrix [D,D]. Squared
+    (not sqrt) since only relative comparisons matter downstream and every
+    consumer here (threshold, cluster, margin) is monotonic in the score."""
+    diff = feats - mu[None, :]
+    return np.einsum("ni,ij,nj->n", diff, precision, diff)
+
+
+def _score_against_ref(
+    feats: np.ndarray, ref: np.ndarray, metric: str,
+    background: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
     """Score every row of feats [N,D] against a single reference vector [D].
 
     Higher score always means "more similar" regardless of metric, so the
     rest of Stage 3 (threshold filtering, adaptive threshold, ranking) works
     unchanged no matter which metric is selected. For distance metrics
     (l1/l2) this means returning the negated distance.
+
+    background: (mu_background, precision_background) from
+    _fit_rmd_background -- REQUIRED when metric == "rmd", ignored otherwise.
     """
     if metric == "cosine":
         return feats @ ref
@@ -43,7 +74,18 @@ def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.nd
         return -np.linalg.norm(feats - ref[None, :], axis=1)
     if metric == "l1":
         return -np.sum(np.abs(feats - ref[None, :]), axis=1)
-    raise ValueError(f"Unknown stage3.similarity metric '{metric}'. Must be 'cosine', 'l1', or 'l2'.")
+    if metric == "rmd":
+        if background is None:
+            raise ValueError(
+                "stage3.similarity='rmd' requires background stats (mu_background, "
+                "precision_background) -- see _fit_rmd_background; none were provided."
+            )
+        mu_bg, precision_bg = background
+        # "how much closer to the exemplar than to generic background, in
+        # whitened space" -- higher = more similar, consistent with every
+        # other metric here.
+        return _mahalanobis_sq(feats, mu_bg, precision_bg) - _mahalanobis_sq(feats, ref, precision_bg)
+    raise ValueError(f"Unknown stage3.similarity metric '{metric}'. Must be 'cosine', 'l1', 'l2', or 'rmd'.")
 
 
 def _pool_sims(sims_per_ref: list, pooling: str) -> np.ndarray:
@@ -274,6 +316,203 @@ class OnlineAdaptiveThreshold:
         self.history.extend(frame_sims.tolist())
 
 
+class ACIOnlineThreshold:
+    """Adaptive Conformal Inference (Gibbs & Candes, NeurIPS 2021) --
+    single-scalar gradient-step threshold update. The UPDATE MECHANISM
+    (gradient step toward a target rate, size proportional to a step_size
+    hyperparameter) is HIGH CONFIDENCE, taken directly from the paper's own
+    formula given explicitly in research_notes/Precision verification
+    online tracking/conformal_online_thresholding.md:
+
+        alpha_{t+1} = alpha_t + step_size * (target_error_rate - err_t)
+
+    Adapted here as a RUNNING PERCENTILE into the window's own similarity
+    distribution (so the implied threshold is always well-defined
+    regardless of the metric's scale -- cosine, RMD, ...). One deliberate
+    SIGN ADAPTATION vs. the paper's own literal formula: classic conformal
+    regression accepts points with a NONCONFORMITY score <= threshold
+    (higher nonconformity = worse fit, so a HIGHER threshold is MORE
+    permissive); this pipeline accepts candidates with a SIMILARITY score
+    >= threshold (the opposite polarity -- higher similarity = better
+    match, so a HIGHER threshold is STRICTER, not more permissive). Naively
+    reusing the paper's own sign under this flipped polarity would push the
+    threshold the WRONG direction whenever the accept rate drifts off
+    target; observe() below applies (err_t - target_error_rate), the
+    correctly-flipped version for our score polarity, not the paper's
+    literal (target_error_rate - err_t). This flip, and the err_t proxy
+    itself (there is no ground truth at inference time -- see observe()'s
+    own docstring), are the parts with lower confidence than the core
+    gradient-step mechanism.
+    """
+
+    def __init__(self, s3):
+        from collections import deque
+
+        self.s3 = s3
+        self.history: deque = deque(maxlen=s3.adaptive_threshold_online_window)
+        # Percentile (0-100) into the window's own distribution -- starts
+        # at a permissive prior (top 2x the target error rate), same
+        # "don't over-commit before there's evidence" spirit as
+        # adaptive_min_floor's own cold-start role.
+        self.percentile = 100.0 * (1.0 - min(0.5, 2.0 * s3.aci_target_error_rate))
+
+    def threshold_for_next_frame(self) -> tuple[float, str]:
+        if len(self.history) < self.s3.adaptive_threshold_min_samples:
+            floor = self.s3.adaptive_min_floor if self.s3.similarity == "cosine" else float("-inf")
+            return floor, "aci_cold_start"
+        sims = np.array(self.history)
+        threshold = float(np.percentile(sims, np.clip(self.percentile, 0.0, 100.0)))
+        return threshold, "aci"
+
+    def observe(self, frame_sims: np.ndarray, accepted_mask: np.ndarray) -> None:
+        """accepted_mask: which of frame_sims were accepted at the
+        threshold threshold_for_next_frame() just returned -- ACI's own
+        update needs to know whether this frame's decision, under the
+        target error rate, looks like it was "wrong" (see class docstring)."""
+        if frame_sims.size > 0:
+            err_t = 1.0 if float(accepted_mask.mean()) > self.s3.aci_target_error_rate else 0.0
+            # Sign flipped vs. the paper's own (target - err_t): see class
+            # docstring's "SIGN ADAPTATION" note -- our score polarity
+            # (accept if similarity >= threshold) is the opposite of
+            # classic conformal regression's (accept if nonconformity <=
+            # threshold), so a too-permissive frame (err_t=1) must RAISE
+            # our percentile/threshold, not lower it.
+            self.percentile += 100.0 * self.s3.aci_step_size * (err_t - self.s3.aci_target_error_rate)
+            self.percentile = float(np.clip(self.percentile, 0.0, 100.0))
+        self.history.extend(frame_sims.tolist())
+
+
+class SaffronInspiredOnlineFDR:
+    """SAFFRON (Ramdas, Zrnic, Wainwright, Jordan, PMLR v80 / ICML 2018,
+    arXiv:1802.09098 -- docs/1802.09098v2.pdf, read directly) -- see
+    OnlineFDRConfig's own docstring (aero_eyes/config.py) for the mapping
+    and its one project-specific adaptation (the p-value heuristic).
+
+    FAITHFUL PORT of Section 2.3's algorithm for constant lambda:
+        alpha_t = min{lam, (1-lam) * [
+            W0 * gamma(t - C_{0+}(t)) +
+            (target_fdr - W0) * gamma(t - tau_1 - C_{1+}(t)) +
+            sum_{j>=2} target_fdr * gamma(t - tau_j - C_{j+}(t))
+        ]},
+    where tau_j is the (1-indexed) time of the j-th ACCEPTANCE (the
+    paper's own "rejection" -- tau_0 := 0), C_{j+}(t) is the number of
+    SAFFRON "candidates" (p-value <= lam) seen strictly between tau_j and
+    t, and gamma_j = j^-gamma_exponent, normalized to sum to 1 over
+    j=1,2,... via the Riemann zeta function. This single formula also
+    reduces exactly to the paper's own separately-stated alpha_1 at t=1
+    (only epoch 0 exists then), so no special-cased first step is needed.
+
+    Tests each candidate INDIVIDUALLY (unlike every other online mechanism
+    here, which computes one scalar threshold per keyframe) -- SAFFRON's
+    own alpha_t is inherently a per-hypothesis significance level, not a
+    per-keyframe threshold.
+    """
+
+    def __init__(self, cfg, p_value_window: int):
+        from collections import deque
+
+        from scipy.special import zeta
+
+        self.cfg = cfg
+        self.lam = cfg.lam
+        self.W0 = cfg.target_fdr * cfg.initial_wealth_fraction
+        self.target_fdr = cfg.target_fdr
+        self.gamma_exponent = cfg.gamma_exponent
+        self._gamma_normalizer = float(zeta(cfg.gamma_exponent, 1))
+        self.history: deque = deque(maxlen=p_value_window)
+        self.t = 0  # number of candidates tested so far
+        self._cumulative_candidates = 0  # SAFFRON "candidates" (p-value <= lam) seen so far
+        self._epoch_taus: list[int] = [0]  # tau_0=0, then tau_1, tau_2, ... appended on each acceptance
+        self._epoch_candidate_snapshots: list[int] = [0]  # cumulative-candidate count AT each tau_j
+        # Kept for introspection/back-compat with earlier callers that
+        # inspected .wealth as a coarse "budget remaining" signal --
+        # SAFFRON's real accounting is the multi-epoch sum above, not a
+        # single scalar, but W0 - (net spend so far) is a reasonable proxy.
+        self.wealth = self.W0
+
+    def _gamma(self, j: int) -> float:
+        if j < 1:
+            return 0.0
+        return (j ** (-self.gamma_exponent)) / self._gamma_normalizer
+
+    def _p_value(self, sim: float) -> float:
+        """Project-specific heuristic (NOT from the paper) -- see
+        OnlineFDRConfig's own docstring's "ONE PROJECT-SPECIFIC ADAPTATION"."""
+        if len(self.history) == 0:
+            return 0.5  # cold start: no history yet, no evidence either way
+        hist = np.array(self.history)
+        return float((hist >= sim).mean())  # fraction of recent history AT LEAST this high
+
+    def test(self, sim: float) -> tuple[bool, float]:
+        """Returns (accept, alpha_t_used) for one candidate."""
+        t = self.t + 1
+        p_value = self._p_value(sim)
+
+        total = 0.0
+        for j, (tau_j, snapshot) in enumerate(zip(self._epoch_taus, self._epoch_candidate_snapshots)):
+            c_j_plus = self._cumulative_candidates - snapshot
+            exponent = t - tau_j - c_j_plus
+            coeff = self.W0 if j == 0 else (self.target_fdr - self.W0) if j == 1 else self.target_fdr
+            total += coeff * self._gamma(exponent)
+        alpha_t = min(self.lam, (1.0 - self.lam) * total)
+
+        accepted = bool(p_value <= alpha_t)
+        is_candidate = bool(p_value <= self.lam)
+
+        if accepted:
+            self._epoch_taus.append(t)
+            self._epoch_candidate_snapshots.append(self._cumulative_candidates)
+            self.wealth = max(0.0, self.wealth - alpha_t + self.target_fdr)
+        else:
+            self.wealth = max(0.0, self.wealth - alpha_t)
+        if is_candidate:
+            self._cumulative_candidates += 1
+
+        self.t = t
+        self.history.append(sim)
+        return accepted, alpha_t
+
+
+class CorruptionCompensatedThreshold:
+    """F-ROCP (arXiv:2605.20515, "Online Conformal Prediction with
+    Corrupted Feedback", Wang/Zecchin/Simeone -- docs/2605.20515v1.pdf,
+    read directly) wrapped around ACIOnlineThreshold's own percentile
+    update -- see CorruptionCompensatedThresholdConfig's own docstring
+    (aero_eyes/config.py) for the full mapping and HONESTY NOTE on scope
+    (only F-ROCP's filtering is ported, not AC-ROCP's active compensation).
+    """
+
+    def __init__(self, s3):
+        self.aci = ACIOnlineThreshold(s3)
+
+    def threshold_for_next_frame(self) -> tuple[float, str]:
+        threshold, label = self.aci.threshold_for_next_frame()
+        if label == "aci_cold_start":
+            return threshold, "corruption_compensated_cold_start"
+        if self.aci.percentile <= 0.0:
+            return threshold, "corruption_compensated_permissive_boundary"
+        if self.aci.percentile >= 100.0:
+            return threshold, "corruption_compensated_strict_boundary"
+        return threshold, "corruption_compensated_in_range"
+
+    def observe(self, frame_sims: np.ndarray, was_probe: bool, accepted_mask: np.ndarray) -> None:
+        del was_probe  # no active-training probes in this F-ROCP-only port -- see class/config docstring
+        if frame_sims.size == 0:
+            self.aci.observe(frame_sims, accepted_mask)
+            return
+        if self.aci.percentile <= 0.0:
+            # Boundary certainty (F-ROCP's own core idea, Sec. IV-A): at
+            # the maximally permissive extreme, "this frame was too
+            # permissive" is a mathematical fact (the accept rate is
+            # trivially ~1), not something that needs measuring from this
+            # frame's own possibly tiny/noisy sample -- force it.
+            self.aci.observe(frame_sims, np.ones_like(accepted_mask))
+        elif self.aci.percentile >= 100.0:
+            self.aci.observe(frame_sims, np.zeros_like(accepted_mask))
+        else:
+            self.aci.observe(frame_sims, accepted_mask)
+
+
 def run_dynamic_prototype_rounds(
     sample_id: str,
     all_feats: np.ndarray,
@@ -286,6 +525,7 @@ def run_dynamic_prototype_rounds(
     dp,
     on_round=None,
     all_frame_idxs: list[int] | None = None,
+    background: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list]:
     """stage3.dynamic_prototype's iterative refinement loop (opt-in, no-op
     when dp.enabled is False): a fixed high-confidence cutoff only ever
@@ -316,6 +556,12 @@ def run_dynamic_prototype_rounds(
     all_frame_idxs: parallel to all_feats/all_sims (all_frame_idxs[i] is
     candidate i's frame index) -- required when dp.require_diverse_picks is
     True (see that field's own docstring); ignored otherwise.
+
+    background: (mu_background, precision_background) from
+    _fit_rmd_background -- REQUIRED when similarity_metric == "rmd" (RMD's
+    background stats must stay fixed across dynamic_prototype's own
+    re-scoring rounds, computed once from the pre-dynamic-prototype
+    all_feats); ignored for every other metric.
     """
     if not dp.enabled:
         return prototype, all_sims, per_ref_features
@@ -359,14 +605,133 @@ def run_dynamic_prototype_rounds(
 
         if use_multi_ref:
             per_ref_features.append(dynamic_feat)
-            sims_per_ref = [_score_against_ref(all_feats, ref_feat, similarity_metric) for ref_feat in per_ref_features]
+            sims_per_ref = [
+                _score_against_ref(all_feats, ref_feat, similarity_metric, background=background)
+                for ref_feat in per_ref_features
+            ]
             all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
         else:
             prototype = (1 - dp.alpha) * prototype + dp.alpha * dynamic_feat
             prototype = prototype / (np.linalg.norm(prototype) + 1e-8)
-            all_sims = _score_against_ref(all_feats, prototype, similarity_metric)
+            all_sims = _score_against_ref(all_feats, prototype, similarity_metric, background=background)
 
     return prototype, all_sims, per_ref_features
+
+
+def apply_identity_chain_filter(
+    all_feats: np.ndarray,
+    all_frame_idxs: list[int],
+    all_dets: list[Detection],
+    all_sims: np.ndarray,
+    keep_mask: np.ndarray,
+    cfg,
+) -> tuple[np.ndarray, int, int]:
+    """KeepTrack-style (arXiv:2103.16556) multi-candidate identity tracking
+    across keyframes -- see IdentityChainFilterConfig's own docstring
+    (aero_eyes/config.py) for the full rationale.
+
+    Groups already-threshold-passing candidates by keyframe (truncated to
+    cfg.top_k_per_keyframe per keyframe by similarity), then walks
+    keyframes in temporal order building "identity chains": at each step,
+    solves a bipartite match (scipy.optimize.linear_sum_assignment, exact
+    Hungarian solver) between the CURRENT active chains' tail candidates
+    and this keyframe's own candidates, cost = 1 - cosine_similarity (+
+    cfg.spatial_weight * normalized center-distance). A chain that finds
+    no acceptable match (cost > 1.0, i.e. the two features are more
+    dissimilar than similar) ends; an unmatched candidate starts a new
+    chain of length 1. After the whole video is processed, a candidate is
+    accepted (kept) iff the chain it ultimately belonged to reached
+    cfg.min_chain_length at any point.
+
+    NOT causal/online (like stage3.dynamic_prototype, not like
+    margin_verification/cluster_secondary_filter's own causal windows): a
+    chain's final length -- and therefore whether an EARLY keyframe in it
+    gets accepted -- can only be known after seeing LATER keyframes too.
+    This is a deliberate simplification for a first implementation (see
+    docs/GECO2_precision_improvements_plan.md Phase 3 item 6's own "needs
+    more design" framing) -- a genuinely causal variant would need to
+    retroactively accept a chain's past members the MOMENT it first
+    reaches min_chain_length, never looking further ahead than that.
+
+    Returns (new_keep_mask, n_chains_total, n_chains_kept).
+    """
+    from collections import defaultdict
+
+    from scipy.optimize import linear_sum_assignment
+
+    idx_by_frame: dict[int, list[int]] = defaultdict(list)
+    for i in range(len(all_sims)):
+        if keep_mask[i]:
+            idx_by_frame[all_frame_idxs[i]].append(i)
+
+    for fi in idx_by_frame:
+        idxs = idx_by_frame[fi]
+        idxs.sort(key=lambda i: all_sims[i], reverse=True)
+        idx_by_frame[fi] = idxs[: cfg.top_k_per_keyframe]
+
+    def _center(i: int) -> np.ndarray:
+        b = all_dets[i].box
+        return np.array([(b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0])
+
+    # Normalizes the spatial term onto roughly the same [0, ~2] scale as
+    # the cosine-distance appearance term, using this video's own median
+    # candidate box diagonal as the reference scale.
+    all_diagonals = [
+        ((all_dets[i].box.x2 - all_dets[i].box.x1) ** 2 + (all_dets[i].box.y2 - all_dets[i].box.y1) ** 2) ** 0.5
+        for idxs in idx_by_frame.values() for i in idxs
+    ]
+    scene_scale = max(float(np.median(all_diagonals)), 1e-6) if all_diagonals else 1.0
+
+    active_chains: list[dict] = []
+    finished_chains: list[dict] = []
+
+    for fi in sorted(idx_by_frame):
+        idxs = idx_by_frame[fi]
+        if not active_chains:
+            active_chains = [{"members": [i]} for i in idxs]
+            continue
+        if not idxs:
+            finished_chains.extend(active_chains)
+            active_chains = []
+            continue
+
+        cost = np.zeros((len(active_chains), len(idxs)))
+        for ci, chain in enumerate(active_chains):
+            tail_idx = chain["members"][-1]
+            tail_feat = all_feats[tail_idx]
+            tail_center = _center(tail_idx)
+            for cj, cand_i in enumerate(idxs):
+                appearance_cost = 1.0 - float(tail_feat @ all_feats[cand_i])
+                spatial_cost = (
+                    float(np.linalg.norm(tail_center - _center(cand_i))) / scene_scale
+                    if cfg.spatial_weight > 0 else 0.0
+                )
+                cost[ci, cj] = appearance_cost + cfg.spatial_weight * spatial_cost
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        matched_chains, matched_cands = set(), set()
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] <= cfg.max_match_cost:
+                active_chains[r]["members"].append(idxs[c])
+                matched_chains.add(r)
+                matched_cands.add(c)
+
+        new_active = [chain for ci, chain in enumerate(active_chains) if ci in matched_chains]
+        finished_chains.extend(chain for ci, chain in enumerate(active_chains) if ci not in matched_chains)
+        new_active.extend({"members": [cand_i]} for cj, cand_i in enumerate(idxs) if cj not in matched_cands)
+        active_chains = new_active
+
+    finished_chains.extend(active_chains)
+
+    new_keep_mask = np.zeros(len(keep_mask), dtype=bool)
+    n_chains_kept = 0
+    for chain in finished_chains:
+        if len(chain["members"]) >= cfg.min_chain_length:
+            n_chains_kept += 1
+            for i in chain["members"]:
+                new_keep_mask[i] = True
+
+    return new_keep_mask, len(finished_chains), n_chains_kept
 
 
 def run_stage3(cfg, sample_id: str) -> Path:
@@ -539,13 +904,24 @@ def run_stage3(cfg, sample_id: str) -> Path:
     all_dets = [e[1] for e in all_entries]
     all_feats = np.stack([e[2] for e in all_entries], axis=0)  # [N, D]
 
+    # RMD (Relative Mahalanobis Distance, opt-in via s3.similarity="rmd")
+    # background stats -- fit ONCE from this video's own full candidate
+    # pool (mostly background/FP by construction) before any per-ref
+    # scoring, so every consumer (main scoring, dynamic_prototype's own
+    # re-scoring rounds, the cluster-mode fallback) whitens against the
+    # SAME distribution. None for every other metric (ignored there).
+    background = _fit_rmd_background(all_feats) if s3.similarity == "rmd" else None
+
     # Compute similarity for every candidate at once (higher = more similar,
     # regardless of metric -- see _score_against_ref).
     if use_multi_ref:
-        sims_per_ref = [_score_against_ref(all_feats, ref_feat, s3.similarity) for ref_feat in per_ref_features]
+        sims_per_ref = [
+            _score_against_ref(all_feats, ref_feat, s3.similarity, background=background)
+            for ref_feat in per_ref_features
+        ]
         all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
     else:
-        all_sims = _score_against_ref(all_feats, prototype, s3.similarity)  # [N]
+        all_sims = _score_against_ref(all_feats, prototype, s3.similarity, background=background)  # [N]
 
     # Snapshot BEFORE dynamic_prototype runs -- the similarity distribution
     # against only the original reference photo(s), untouched by whatever
@@ -580,7 +956,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
         prototype, all_sims, per_ref_features = run_dynamic_prototype_rounds(
             sample_id, all_feats, all_sims, prototype, per_ref_features,
             use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
-            all_frame_idxs=all_frame_idxs,
+            all_frame_idxs=all_frame_idxs, background=background,
         )
 
     # Persist the dynamic_prototype-adapted state SEPARATELY from
@@ -654,7 +1030,8 @@ def run_stage3(cfg, sample_id: str) -> Path:
             # similarity (0.335) stayed under match_threshold's default
             # (0.55), silently zeroing out every fallback-path keyframe.
             sims_per_ref_frame = [
-                _score_against_ref(cand_feats_frame, rf, s3.similarity) for rf in ref_feats_frame
+                _score_against_ref(cand_feats_frame, rf, s3.similarity, background=background)
+                for rf in ref_feats_frame
             ]
             sims_frame = _pool_sims(sims_per_ref_frame, multi_ref_pooling)
             if sims_frame.size == 0:
@@ -690,25 +1067,56 @@ def run_stage3(cfg, sample_id: str) -> Path:
     elif s3.adaptive_threshold and s3.adaptive_threshold_online:
         # Real-time-deployment-compatible path: decide each keyframe's
         # candidates using ONLY strictly-earlier keyframes' own similarity
-        # scores (see OnlineAdaptiveThreshold's own docstring) -- no single
-        # scalar threshold describes the whole video, so effective_threshold
-        # is left as None (write_detections accepts that) and only the
-        # LAST window's threshold is logged, for a rough sense of where it
-        # ended up.
+        # scores -- no single scalar threshold describes the whole video,
+        # so effective_threshold is left as None (write_detections accepts
+        # that) and only the LAST window's threshold is logged, for a
+        # rough sense of where it ended up.
+        # adaptive_threshold_online_method picks WHICH online mechanism
+        # computes/applies that causal decision -- see each class's own
+        # docstring (OnlineAdaptiveThreshold / ACIOnlineThreshold /
+        # SaffronInspiredOnlineFDR / CorruptionCompensatedThreshold) for
+        # exactly what it does. "aci", "saffron" and "corruption_compensated"
+        # are all FAITHFUL ports of their cited papers' own algorithms; the
+        # lower-confidence parts are each one's own project-specific
+        # adaptation (documented in that class/config's own docstring), not
+        # the ported algorithm itself.
         from collections import defaultdict as _defaultdict
         frame_to_indices: dict[int, list[int]] = _defaultdict(list)
         for i, fi in enumerate(all_frame_idxs):
             frame_to_indices[fi].append(i)
 
-        online = OnlineAdaptiveThreshold(s3)
         keep_mask = np.zeros(len(all_sims), dtype=bool)
         last_threshold, last_stat_label = None, None
-        for fi in sorted(frame_to_indices):
-            idxs = frame_to_indices[fi]
-            last_threshold, last_stat_label = online.threshold_for_next_frame()
-            frame_sims = all_sims[idxs]
-            keep_mask[idxs] = frame_sims >= last_threshold
-            online.observe(frame_sims)
+        method = s3.adaptive_threshold_online_method
+
+        if method == "saffron":
+            saffron = SaffronInspiredOnlineFDR(s3.online_fdr, s3.online_fdr.p_value_window)
+            for fi in sorted(frame_to_indices):
+                idxs = frame_to_indices[fi]
+                for i in idxs:
+                    accepted, alpha_t = saffron.test(float(all_sims[i]))
+                    keep_mask[i] = accepted
+                    last_threshold, last_stat_label = alpha_t, "saffron"
+        else:
+            if method == "aci":
+                online = ACIOnlineThreshold(s3)
+            elif method == "corruption_compensated":
+                online = CorruptionCompensatedThreshold(s3)
+            else:
+                online = OnlineAdaptiveThreshold(s3)
+
+            for fi in sorted(frame_to_indices):
+                idxs = frame_to_indices[fi]
+                last_threshold, last_stat_label = online.threshold_for_next_frame()
+                frame_sims = all_sims[idxs]
+                frame_keep = frame_sims >= last_threshold
+                keep_mask[idxs] = frame_keep
+                if method == "aci":
+                    online.observe(frame_sims, frame_keep)
+                elif method == "corruption_compensated":
+                    online.observe(frame_sims, False, frame_keep)  # 2nd arg unused -- see CorruptionCompensatedThreshold.observe's own docstring
+                else:
+                    online.observe(frame_sims)
 
         effective_threshold = None
         selected = [
@@ -716,9 +1124,9 @@ def run_stage3(cfg, sample_id: str) -> Path:
             for i in range(len(all_sims)) if keep_mask[i]
         ]
         log.info(
-            "[Stage3] %s: adaptive_threshold_online (window=%d, min_samples=%d, "
-            "final threshold=%.3f, stat=%s) -> %d / %d candidates pass",
-            sample_id, s3.adaptive_threshold_online_window, s3.adaptive_threshold_min_samples,
+            "[Stage3] %s: adaptive_threshold_online (method=%s, window=%d, min_samples=%d, "
+            "final threshold/alpha=%.4f, stat=%s) -> %d / %d candidates pass",
+            sample_id, method, s3.adaptive_threshold_online_window, s3.adaptive_threshold_min_samples,
             last_threshold if last_threshold is not None else float("nan"), last_stat_label,
             len(selected), len(all_sims),
         )
@@ -760,6 +1168,56 @@ def run_stage3(cfg, sample_id: str) -> Path:
         log.info("[Stage3] %s: threshold=%.3f → %d / %d candidates pass",
                  sample_id, effective_threshold, len(selected), len(all_sims))
 
+    # ---- Optional: hard-negative "negative prototype" SECONDARY filter ----
+    # See NegativePrototypeFilterConfig's own docstring (config.py) for the
+    # full rationale. Placed BEFORE cluster_secondary_filter/identity_chain_
+    # filter below so its causal negative window gets the largest possible
+    # reject population as early as possible (most rejection happens at the
+    # primary threshold/cluster decision, not in later secondary filters).
+    npf_cfg = s3.negative_prototype_filter
+    if npf_cfg.enabled:
+        from collections import defaultdict as _defaultdict
+        from collections import deque as _deque
+
+        ref_feats_base_np = (
+            np.stack(per_ref_features, axis=0) if use_multi_ref else prototype[None, :]
+        )
+        idx_by_frame_np: dict[int, list[int]] = _defaultdict(list)
+        for i in range(len(all_sims)):
+            idx_by_frame_np[all_frame_idxs[i]].append(i)
+
+        negative_window: _deque = _deque(maxlen=npf_cfg.window_size)
+        n_before_np = int(keep_mask.sum())
+        n_rejected_np = 0
+        for fi in sorted(idx_by_frame_np):
+            for i in idx_by_frame_np[fi]:
+                if keep_mask[i] and len(negative_window) >= npf_cfg.min_window_for_check:
+                    # Own similarity computed fresh from raw cosine, NOT
+                    # all_sims[i] -- keeps both sides of this margin
+                    # comparable regardless of stage3.similarity (e.g. rmd
+                    # has a different scale entirely) -- see the config
+                    # docstring's own note on this.
+                    own_cosine = float(np.max(all_feats[i] @ ref_feats_base_np.T))
+                    neg_stack = np.stack(negative_window, axis=0)
+                    max_neg_cosine = float(np.max(all_feats[i] @ neg_stack.T))
+                    if max_neg_cosine - own_cosine >= npf_cfg.tau_negative_margin:
+                        keep_mask[i] = False
+                        n_rejected_np += 1
+                if not keep_mask[i]:
+                    negative_window.append(all_feats[i])
+
+        selected = [
+            (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
+            for i in range(len(all_sims)) if keep_mask[i]
+        ]
+        log.info(
+            "[Stage3] %s: negative_prototype_filter (window_size=%d, tau_negative_margin=%.3f) "
+            "rejected %d / %d threshold-passing candidate(s) -> %d remain (%d negative anchor(s) "
+            "accumulated by the end)",
+            sample_id, npf_cfg.window_size, npf_cfg.tau_negative_margin, n_rejected_np, n_before_np,
+            len(selected), len(negative_window),
+        )
+
     # ---- Optional: cluster-based SECONDARY precision filter ----
     # Only ever narrows an already-threshold-passing set (verification_method
     # must be "threshold", never "cluster" -- that path already IS the
@@ -771,6 +1229,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
         from collections import deque as _deque
 
         from aero_eyes.utils.cluster_verify import cluster_verify_candidates
+        from aero_eyes.utils.detection_confirm import DetectionConfirmer
 
         idx_by_frame: dict[int, list[int]] = _defaultdict(list)
         for i in range(len(all_sims)):
@@ -788,8 +1247,20 @@ def run_stage3(cfg, sample_id: str) -> Path:
             return np.ones(cand_feats_frame.shape[0], dtype=bool)
 
         trusted_window: _deque = _deque(maxlen=csf_cfg.window_size)
+        # Corroboration gate on WINDOW ADMISSION ONLY (does not affect the
+        # keep_mask accept/reject decision below) -- see
+        # ClusterSecondaryFilterConfig.window_admission_min_consecutive_hits'
+        # own docstring for why: an unconditionally-admitted borderline FP
+        # was the suspected reason this filter didn't meaningfully help in
+        # real-footage testing. min_consecutive_hits<=1 makes this a no-op
+        # (every offer confirms immediately), reproducing today's
+        # unconditional-admission behavior unchanged.
+        window_confirmer = DetectionConfirmer(
+            csf_cfg.window_admission_min_consecutive_hits, csf_cfg.window_admission_iou_threshold,
+        )
         n_before = sum(len(v) for v in idx_by_frame.values())
         n_rejected = 0
+        n_window_admitted = 0
         for fi in sorted(idx_by_frame):
             idxs = idx_by_frame[fi]
             ref_feats_for_frame = (
@@ -800,22 +1271,57 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 all_feats[idxs], ref_feats_for_frame, csf_cfg.cluster_verification,
                 fallback_keep_mask_fn=_keep_everyone,
             )
+            verified_global_idxs = []
             for local_i, global_i in enumerate(idxs):
                 if frame_keep[local_i]:
-                    trusted_window.append(all_feats[global_i])
+                    verified_global_idxs.append(global_i)
                 else:
                     keep_mask[global_i] = False
                     n_rejected += 1
+            if verified_global_idxs:
+                # This keyframe's single best-scoring verified candidate is
+                # what's "offered" to the confirmer -- same convention
+                # GeCo2DynamicPrototypeTracker.offer() already uses (one
+                # representative box per keyframe, not every survivor).
+                best_i = max(verified_global_idxs, key=lambda i: all_sims[i])
+                confirmed_box = window_confirmer.offer(all_dets[best_i].box)
+                if confirmed_box is not None:
+                    trusted_window.append(all_feats[best_i])
+                    n_window_admitted += 1
+            # No verified candidate this keyframe: the confirmer is simply
+            # not offered anything (same "gap keyframes don't reset the
+            # streak" convention GeCo2DynamicPrototypeTracker's own
+            # offer()-only-when-boxes-exist call site already uses).
 
         selected = [
             (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
             for i in range(len(all_sims)) if keep_mask[i]
         ]
         log.info(
-            "[Stage3] %s: cluster_secondary_filter (cluster_method=%s, window_size=%d) "
-            "rejected %d / %d threshold-passing candidate(s) -> %d remain",
+            "[Stage3] %s: cluster_secondary_filter (cluster_method=%s, window_size=%d, "
+            "window_admission_min_consecutive_hits=%d) rejected %d / %d threshold-passing "
+            "candidate(s) -> %d remain (%d admitted into the trusted window)",
             sample_id, csf_cfg.cluster_verification.cluster_method, csf_cfg.window_size,
-            n_rejected, n_before, len(selected),
+            csf_cfg.window_admission_min_consecutive_hits, n_rejected, n_before, len(selected),
+            n_window_admitted,
+        )
+
+    # ---- Identity-chain filter (KeepTrack-style, opt-in) ----
+    icf_cfg = s3.identity_chain_filter
+    if icf_cfg.enabled:
+        n_before_chain = int(keep_mask.sum())
+        keep_mask, n_chains_total, n_chains_kept = apply_identity_chain_filter(
+            all_feats, all_frame_idxs, all_dets, all_sims, keep_mask, icf_cfg,
+        )
+        selected = [
+            (all_frame_idxs[i], all_dets[i], float(all_sims[i]))
+            for i in range(len(all_sims)) if keep_mask[i]
+        ]
+        log.info(
+            "[Stage3] %s: identity_chain_filter (min_chain_length=%d, top_k_per_keyframe=%d) "
+            "-- %d/%d identity chain(s) reached min_chain_length -> %d / %d candidates remain",
+            sample_id, icf_cfg.min_chain_length, icf_cfg.top_k_per_keyframe,
+            n_chains_kept, n_chains_total, len(selected), n_before_chain,
         )
 
     # ---- Apply global_topk cap (after threshold, not instead of it) ----
@@ -830,6 +1336,36 @@ def run_stage3(cfg, sample_id: str) -> Path:
     frame_groups: dict[int, list[tuple[Detection, float]]] = defaultdict(list)
     for fi, det, sim in selected:
         frame_groups[fi].append((det, sim))
+
+    # ---- Margin-over-runner-up (WildFusion-style, opt-in) ----
+    # Only meaningful for a keyframe with >=2 survivors -- a single
+    # survivor has no runner-up to compare against and is left untouched.
+    mv_cfg = s3.margin_verification
+    if mv_cfg.enabled:
+        n_ambiguous = 0
+        for fi in list(frame_groups.keys()):
+            pairs = frame_groups[fi]
+            if len(pairs) < 2:
+                continue
+            pairs_sorted = sorted(pairs, key=lambda x: x[1], reverse=True)
+            margin = pairs_sorted[0][1] - pairs_sorted[1][1]
+            if margin < mv_cfg.tau_margin:
+                del frame_groups[fi]
+                n_ambiguous += 1
+            else:
+                # Margin clears the bar -- trust the winner ALONE (the
+                # runner-up, however close it individually cleared
+                # match_threshold, is not the accepted candidate here).
+                frame_groups[fi] = [pairs_sorted[0]]
+        if n_ambiguous:
+            log.info(
+                "[Stage3] %s: margin_verification (tau_margin=%.3f) dropped %d ambiguous "
+                "keyframe(s) (top candidate's margin over the runner-up too small to trust)",
+                sample_id, mv_cfg.tau_margin, n_ambiguous,
+            )
+        # Keep `selected` consistent with the pruned frame_groups -- used
+        # below for sample_reference_size.
+        selected = [(fi, d, s) for fi, pairs in frame_groups.items() for d, s in pairs]
 
     # box_refine.adaptive_context_margin.relative_to_sample_median: this
     # SAME object's own typical box size across every OTHER threshold-

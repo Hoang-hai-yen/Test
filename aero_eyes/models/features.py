@@ -13,7 +13,10 @@ Supported models:
   clip     — CLIP ViT-B/32, visual encoder (512-d)
   siglip   — SigLIP vision encoder (base/large/so400m), pooled output
              (768/1024/1152-d). Open access, no gating.
-  ensemble — DINOv2 + CLIP concatenated then L2-normalized (1280 or 896-d)
+  ensemble — DINOv2 (default) or DINOv3 + CLIP concatenated then
+             L2-normalized (dino_dim + clip_dim, e.g. 1280 for vitb14/
+             vitb16 + vit-b/32) -- see FeatureExtractorConfig.
+             ensemble_dino_model.
 
 All extractors return L2-normalized float32 feature vectors.
 """
@@ -402,9 +405,18 @@ class SiglipFeatureExtractor:
 # ---------------------------------------------------------------------------
 
 class EnsembleFeatureExtractor:
-    """Concatenates DINOv2 + CLIP features then L2-normalizes.
+    """Concatenates a DINO family model (DINOv2 or DINOv3) + CLIP features
+    then L2-normalizes.
 
-    dim = DINOv2_dim + CLIP_dim  (e.g. 768 + 512 = 1280 for vitb14 + vit-b/32)
+    dim = DINO_dim + CLIP_dim  (e.g. 768 + 512 = 1280 for DINOv2 vitb14 +
+    CLIP vit-b/32; DINOv3 vitb16 + CLIP vit-b/32 is also 768 + 512 = 1280).
+
+    dino_model="dinov3" is NOT YET VALIDATED -- see
+    FeatureExtractorConfig.ensemble_dino_model's own docstring
+    (aero_eyes/config.py) for the rationale (CLIP's semantic/categorical
+    training objective as a complement to DINO's texture-clustering one,
+    for cases where DINO alone confuses the target with texturally-similar
+    background clutter).
     """
 
     def __init__(
@@ -414,10 +426,24 @@ class EnsembleFeatureExtractor:
         device: str = "auto",
         image_size: int = 224,
         dinov2_use_registers: bool = False,
+        dino_model: str = "dinov2",
+        dinov3_variant: str = "vitb16",
+        dinov3_source: str = "huggingface",
+        dinov3_pretrain_dataset: str = "lvd1689m",
+        dinov3_kaggle_model_id: str | None = None,
     ):
-        self.dino = DINOv2FeatureExtractor(dinov2_variant, device, image_size, dinov2_use_registers)
+        if dino_model == "dinov3":
+            self.dino = DINOv3FeatureExtractor(
+                variant=dinov3_variant, device=device, source=dinov3_source,
+                pretrain_dataset=dinov3_pretrain_dataset, kaggle_model_id=dinov3_kaggle_model_id,
+                image_size=image_size,
+            )
+        elif dino_model == "dinov2":
+            self.dino = DINOv2FeatureExtractor(dinov2_variant, device, image_size, dinov2_use_registers)
+        else:
+            raise ValueError(f"Unknown ensemble dino_model '{dino_model}'. Must be 'dinov2' or 'dinov3'.")
         self.clip = CLIPFeatureExtractor(clip_variant, device)
-        log.info("Ensemble DINOv2+CLIP  dim=%d", self._dim())
+        log.info("Ensemble %s+CLIP  dim=%d", dino_model.upper(), self._dim())
 
     def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
         if not images:
@@ -440,6 +466,67 @@ class EnsembleFeatureExtractor:
 
     def _feature_dim(self) -> int:
         return self._dim()
+
+
+# ---------------------------------------------------------------------------
+# Candidate-crop background masking wrapper (opt-in, stage1.
+# feature_extractor.candidate_background_masking)
+# ---------------------------------------------------------------------------
+
+class MaskedCropFeatureExtractor:
+    """Wraps any base extractor's extract_crops(), running the SAME
+    segmentation + background-fill primitive stage1.segmentation already
+    uses for reference photos (aero_eyes.utils.geometry.
+    apply_background_mode) on each VIDEO CANDIDATE crop first -- see
+    FeatureExtractorConfig.candidate_background_masking's own docstring
+    (aero_eyes/config.py) for the asymmetry this addresses (reference
+    exemplars are background-masked; candidate crops never were).
+
+    Only extract_crops() is wrapped -- extract() passes straight through
+    to the base extractor unchanged, since that method takes ALREADY-
+    PREPARED images (e.g. reference photos, which get their own masking
+    earlier in a separate pipeline) with no box/frame to derive a fresh
+    mask from here.
+
+    A per-crop segmentation failure (exception, or the segmenter's own
+    "implausible mask" rejection re-raised) falls back to the UNMASKED
+    crop rather than dropping the candidate outright -- masking is a
+    quality improvement attempt, not a correctness requirement, and one
+    candidate's crop being harder to segment (e.g. tiny/degenerate box)
+    must not crash or silently vanish the whole batch.
+    """
+
+    def __init__(self, base, segmenter, background_mode: str, blur_sigma: float):
+        self.base = base
+        self.segmenter = segmenter
+        self.background_mode = background_mode
+        self.blur_sigma = blur_sigma
+
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        return self.base.extract(images, batch_size)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        from aero_eyes.utils.geometry import apply_background_mode
+
+        masked_crops = []
+        for b in boxes:
+            crop = crop_with_pad(frame_bgr, b, pad_ratio)
+            try:
+                mask = self.segmenter.segment(crop)
+                masked_crops.append(apply_background_mode(crop, mask, self.background_mode, self.blur_sigma))
+            except Exception:
+                log.debug("MaskedCropFeatureExtractor: segmentation failed on a candidate crop, using it unmasked", exc_info=True)
+                masked_crops.append(crop)
+        return self.base.extract(masked_crops, batch_size)
+
+    def _dim(self) -> int:
+        return self.base._dim()
+
+    def _feature_dim(self) -> int:
+        return self.base._feature_dim()
 
 
 # ---------------------------------------------------------------------------
@@ -537,11 +624,27 @@ def build_feature_extractor(cfg):
             device         = dev,
             image_size     = fe.image_size,
             dinov2_use_registers = fe.dinov2_use_registers,
+            dino_model              = fe.ensemble_dino_model,
+            dinov3_variant          = fe.dinov3_variant,
+            dinov3_source           = fe.dinov3_source,
+            dinov3_pretrain_dataset = fe.dinov3_pretrain_dataset,
+            dinov3_kaggle_model_id  = fe.dinov3_kaggle_model_id,
         )
     else:
         raise ValueError(
             f"Unknown feature extractor model '{fe.model}'. "
             "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
+        )
+
+    cbm = fe.candidate_background_masking
+    if cbm.enabled:
+        from aero_eyes.models.segmentation import build_segmenter
+        log.info(
+            "Feature extractor: wrapping %s with candidate-crop background masking "
+            "(model=%s, background_mode=%s)", fe.model, cbm.model, cbm.background_mode,
+        )
+        base = MaskedCropFeatureExtractor(
+            base, build_segmenter(cbm, cfg), cbm.background_mode, cbm.blur_sigma,
         )
 
     ph = fe.projection_head
