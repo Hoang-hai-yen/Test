@@ -16,6 +16,28 @@ exemplar -> true positive; otherwise -> outlier" rule. No scalar threshold,
 no distributional-shape assumption, and the decision only ever reads the
 arrays passed in -- callers get causal/online behavior for free by calling
 this once per keyframe instead of once per video.
+
+Checked directly against a cloned copy of DAVE's own reference
+implementation (models/dave.py in the DAVE repo, not just the paper text)
+to confirm fidelity:
+  - affinity = cosine similarity clipped to >= 0 (matches dst_mtx's
+    `dst_mtx[dst_mtx < 0] = 0`).
+  - "spectral" cluster count is estimated PER KEYFRAME via the self-tuning
+    eigengap heuristic on the affinity's normalized graph Laplacian
+    (_self_tuning_n_clusters below), matching eigenDecomposition -- NOT a
+    fixed hand-set n_clusters (an earlier version of this module used a
+    fixed spectral_n_clusters=2, confirmed against the real code to be a
+    deviation that could inject a spurious split on an actually-homogeneous
+    keyframe).
+  - a very large candidate set skips verification entirely rather than
+    paying for clustering at that scale (max_candidates_for_cluster,
+    matching DAVE's own `if len(feat_pairs) > 500: return ... unchanged`).
+DAVE's own IoU-based extra-inclusion rule (a candidate spatially
+overlapping an exemplar's OWN box location in the same image is always
+kept) is NOT ported -- it only makes sense when exemplars are annotated
+instances living INSIDE the image being counted (FSC147's setup); this
+project's exemplars are separate close-up reference photos with no spatial
+correspondence to any candidate box in a video frame.
 """
 from __future__ import annotations
 
@@ -24,6 +46,51 @@ import logging
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+
+def _self_tuning_n_clusters(affinity: np.ndarray, egv_threshold: float) -> int:
+    """Self-tuning spectral clustering cluster-count estimate (Zelnik-Manor
+    & Perona, "Self-Tuning Spectral Clustering", NeurIPS 2004) via the
+    eigengap heuristic on the affinity matrix's normalized graph Laplacian
+    -- ported to match DAVE's OWN reference implementation exactly
+    (models/dave.py::COTR.eigenDecomposition in the cloned DAVE repo, NOT
+    just the paper text): eigenvalues of the normalized Laplacian are
+    (near-)zero for each well-separated cluster, so the largest gap(s) in
+    the SORTED eigenvalue sequence indicate the natural cluster count.
+
+    One deliberate deviation from DAVE's own code: uses np.linalg.eigvalsh
+    (for real symmetric matrices -- the normalized Laplacian of a symmetric
+    cosine-similarity affinity always is) instead of DAVE's plain
+    np.linalg.eig, which does not guarantee real or sorted eigenvalues and
+    can pick up spurious tiny imaginary parts from floating-point
+    asymmetry. eigvalsh guarantees real, ascending-sorted eigenvalues,
+    which the eigengap heuristic's own math assumes -- this is a
+    correctness fix over the literal reference code, not a behavior change
+    to the algorithm it implements.
+
+    Returns 1 (no split -- every point ends up in the same cluster once fed
+    to SpectralClustering(n_clusters=1), i.e. every candidate verifies)
+    when no gap exceeds egv_threshold -- matching DAVE's own
+    `if len(k) > 1 or k[0] > 1` skip-clustering-entirely behavior for a
+    keyframe whose affinity structure looks homogeneous rather than
+    forcing a split onto it.
+    """
+    from scipy.sparse import csgraph
+
+    laplacian = csgraph.laplacian(affinity, normed=True)
+    eigenvalues = np.linalg.eigvalsh(laplacian)
+    diffs = np.diff(eigenvalues)
+    if diffs.size == 0:
+        return 1
+
+    # DAVE's own heuristic: look at the (up to) 5 largest gaps, keep only
+    # those exceeding the threshold (in gap-size-descending order), then
+    # use the LARGER cluster-count suggested by the top 2 surviving gaps.
+    top_gap_indices = np.argsort(diffs)[::-1][:5]
+    candidate_counts = [int(i) + 1 for i in top_gap_indices if diffs[i] > egv_threshold]
+    if not candidate_counts:
+        return 1
+    return max(candidate_counts[:2])
 
 
 def cluster_verify_candidates(
@@ -66,9 +133,20 @@ def cluster_verify_candidates(
         keep_mask = fallback_keep_mask_fn(cand_feats, ref_feats)
         return keep_mask, "cluster_fallback_threshold"
 
+    k = ref_feats.shape[0]
+    if cfg.max_candidates_for_cluster is not None and (n + k) > cfg.max_candidates_for_cluster:
+        # DAVE's own performance safeguard (models/dave.py::forward:
+        # "if len(feat_pairs) > 500: return ... generated_bboxes") -- a
+        # very large affinity matrix makes clustering (especially
+        # spectral's O(N^3) eigendecomposition) expensive; skip verification
+        # ENTIRELY and keep every candidate, rather than silently paying an
+        # unbounded cost or applying a shape-based method with no evidence
+        # it stays reliable at this scale. Not a quality decision -- purely
+        # "too expensive to even attempt this keyframe."
+        return np.ones(n, dtype=bool), "cluster_skipped_too_many_candidates"
+
     combined = np.concatenate([cand_feats, ref_feats], axis=0)  # [N+k, D]
     similarity = combined @ combined.T  # cosine, since inputs are L2-normalized
-    k = ref_feats.shape[0]
 
     if cfg.cluster_method == "hdbscan":
         from sklearn.cluster import HDBSCAN
@@ -90,7 +168,7 @@ def cluster_verify_candidates(
 
         # Spectral affinity must be a non-negative similarity, not a distance.
         affinity = np.clip(similarity, 0.0, None)
-        n_clusters = min(cfg.spectral_n_clusters, combined.shape[0])
+        n_clusters = min(_self_tuning_n_clusters(affinity, cfg.spectral_egv_threshold), combined.shape[0])
         labels = SpectralClustering(
             n_clusters=n_clusters, affinity="precomputed", random_state=0,
         ).fit_predict(affinity)

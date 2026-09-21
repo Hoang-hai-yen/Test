@@ -30,7 +30,8 @@ def _make_cfg(
     tk_defaults.update(topk_fusion_overrides or {})
     cv_defaults = dict(
         enabled=False, cluster_method="hdbscan", min_cluster_size=2, min_samples=None,
-        spectral_n_clusters=2, min_candidates_for_cluster=4,
+        spectral_egv_threshold=0.132, max_candidates_for_cluster=500,
+        min_candidates_for_cluster=4, fallback_relative_ratio=0.9,
     )
     cv_defaults.update(cluster_verification_overrides or {})
     dp_defaults = dict(

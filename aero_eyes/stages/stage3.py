@@ -644,15 +644,25 @@ def run_stage3(cfg, sample_id: str) -> Path:
 
         def _fallback_keep_mask(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
             # Too few candidates this keyframe for clustering to find
-            # meaningful structure -- fall back to a plain fixed cosine
-            # cutoff (s3.match_threshold) against these same features,
-            # same "too little data for a shape method" precedent otsu/gmm
-            # use for adaptive_threshold_min_samples.
+            # meaningful structure -- fall back to a threshold RELATIVE to
+            # this keyframe's own top similarity (fallback_relative_ratio),
+            # never a hand-set absolute cosine number like s3.match_threshold:
+            # on a video with a severe domain gap, EVERY candidate's raw
+            # cosine similarity (even the genuine match) can sit well below
+            # any plausible absolute cutoff -- confirmed in practice on this
+            # project's own footage, where a whole video's max candidate
+            # similarity (0.335) stayed under match_threshold's default
+            # (0.55), silently zeroing out every fallback-path keyframe.
             sims_per_ref_frame = [
                 _score_against_ref(cand_feats_frame, rf, s3.similarity) for rf in ref_feats_frame
             ]
             sims_frame = _pool_sims(sims_per_ref_frame, multi_ref_pooling)
-            return sims_frame >= s3.match_threshold
+            if sims_frame.size == 0:
+                return sims_frame.astype(bool)
+            relative_floor = float(sims_frame.max()) * s3.cluster_verification.fallback_relative_ratio
+            if s3.similarity == "cosine":
+                relative_floor = max(relative_floor, s3.adaptive_min_floor)
+            return sims_frame >= relative_floor
 
         keep_mask = np.zeros(len(all_sims), dtype=bool)
         method_counts: dict[str, int] = _defaultdict(int)

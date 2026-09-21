@@ -440,23 +440,67 @@ class ClusterVerificationConfig(BaseModel):
     #   cluster -- directly targets "distribution shape varies per
     #   video/keyframe" since it makes no shape assumption at all. Available
     #   with no new dependency (sklearn.cluster.HDBSCAN, scikit-learn>=1.3).
-    # "spectral": matches DAVE's paper exactly (sklearn.cluster.
-    #   SpectralClustering on the cosine-similarity affinity matrix), but
-    #   needs spectral_n_clusters chosen up front -- itself a hyperparameter
-    #   as fragile as a z-score, which is exactly the class of problem this
-    #   whole mechanism exists to avoid. Kept as an option specifically so
-    #   it can be A/B'd against hdbscan on this project's own footage
-    #   instead of assuming the paper's own choice transfers here.
+    # "spectral": matches DAVE's ACTUAL reference implementation
+    #   (models/dave.py::COTR.forward / eigenDecomposition in the cloned
+    #   DAVE repo, not just the paper text) -- spectral clustering on the
+    #   cosine-similarity affinity matrix, with the number of clusters
+    #   estimated PER KEYFRAME via the self-tuning spectral clustering
+    #   eigengap heuristic (Zelnik-Manor & Perona) on the affinity matrix's
+    #   normalized graph Laplacian -- see _self_tuning_n_clusters in
+    #   aero_eyes/utils/cluster_verify.py. NOT a fixed hand-set cluster
+    #   count (an earlier version of this field, spectral_n_clusters, WAS
+    #   fixed at 2 -- confirmed against the real DAVE code to be a
+    #   deviation from the paper's own method, since forcing 2 clusters on
+    #   an actually-homogeneous keyframe would inject a spurious split).
+    #   spectral_egv_threshold below controls this estimate.
     cluster_method: Literal["hdbscan", "spectral"] = "hdbscan"
     min_cluster_size: int = 2   # hdbscan only
     min_samples: Optional[int] = None   # hdbscan only; None = sklearn default (= min_cluster_size)
-    spectral_n_clusters: int = 2   # spectral only
+    # Eigengap threshold for the self-tuning cluster-count estimate (spectral
+    # only) -- 0.132 is DAVE's OWN default (utils/arg_parser.py --egv), kept
+    # identical here for fidelity to the reference implementation. Larger =
+    # stricter (fewer, more prominent gaps counted as real cluster
+    # boundaries, biasing toward "1 cluster, keep everything" more often);
+    # smaller = more sensitive (more borderline gaps trusted as real
+    # splits). If the eigengap heuristic finds no gap exceeding this
+    # threshold, no split is trustworthy -- keeps ALL candidates this
+    # keyframe (n_clusters=1 degenerates to "everyone in the same cluster
+    # as every exemplar"), matching DAVE's own `if len(k) > 1 or k[0] > 1`
+    # skip-clustering-entirely behavior for a keyframe that looks
+    # homogeneous rather than forcing a split onto it.
+    spectral_egv_threshold: float = 0.132
     # Below this many candidates this keyframe, clustering can't find
     # meaningful density/spectral structure -- falls back to whichever
     # threshold-based path the caller provides (same "too little data for a
     # shape method" precedent stage3's own otsu/gmm use for
     # adaptive_threshold_min_samples).
     min_candidates_for_cluster: int = 4
+    # Above this many total points (candidates + exemplars) this keyframe,
+    # skip clustering ENTIRELY and keep every candidate unchanged (no
+    # rejection) -- matches DAVE's own reference implementation exactly
+    # (models/dave.py::forward: "if len(feat_pairs) > 500: return ...
+    # generated_bboxes", a pure performance safeguard against expensive
+    # eigendecomposition/clustering on a very large affinity matrix, not a
+    # quality decision). None = no cap (spectral's O(N^3) eigendecomposition
+    # can get slow well before this project's own candidate counts would
+    # ever approach DAVE's default of 500 in practice, but the option
+    # exists for parity and for very loose stage2/legacy candidate pools).
+    max_candidates_for_cluster: Optional[int] = 500
+    # Fallback (below min_candidates_for_cluster) keeps candidates within
+    # this fraction of THIS KEYFRAME'S OWN top similarity -- i.e. always
+    # relative to what this tiny candidate set itself produced, never a
+    # hand-set absolute cosine number. This project's own footage has shown
+    # RAW cosine similarity can top out well below any plausible absolute
+    # cutoff (e.g. an entire video's max candidate-to-exemplar similarity at
+    # 0.335, comfortably under a match_threshold=0.55-style cutoff) due to
+    # the ground-to-aerial domain gap -- an absolute fallback threshold is
+    # not just "needs tuning per video" here, it can be OUTRIGHT UNREACHABLE
+    # for an entire video, silently rejecting every fallback-path keyframe
+    # (same class of bug this field exists to prevent). 1.0 = only the
+    # single best-matching candidate this keyframe; lower keeps more
+    # near-ties. Purely local to this keyframe (no batch/online state), so
+    # this stays exactly as causal as clustering itself.
+    fallback_relative_ratio: float = 0.9
 
 
 class Stage3Config(BaseModel):

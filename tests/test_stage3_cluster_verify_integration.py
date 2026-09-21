@@ -140,3 +140,68 @@ def test_dynamic_prototype_and_cluster_mode_mutual_exclusion_warns(cluster_stage
         "verification_method='cluster'" in rec.message and "dynamic_prototype" in rec.message
         for rec in caplog.records
     )
+
+
+def test_fallback_keeps_tp_even_when_far_below_match_threshold(tmp_path):
+    """Regression test for a real-world failure: on footage with a severe
+    domain gap, an ENTIRE video's candidate-to-exemplar cosine similarity
+    can stay well below stage3.match_threshold's default (0.55) -- observed
+    in practice at max=0.335 across a whole video. The fallback path (below
+    min_candidates_for_cluster) must judge candidates RELATIVE to this
+    keyframe's own top similarity, never against that absolute number, or
+    it silently rejects every fallback-path keyframe regardless of whether
+    a genuine match is present."""
+    rng = np.random.default_rng(7)
+    d = 32
+    noise = 0.02
+    view = np.zeros(d)
+    view[0] = 1.0
+    confuser = np.zeros(d)
+    confuser[1] = 1.0
+    ref = _make_unit(view[None, :] + noise * rng.normal(size=(3, d)))
+
+    work_dir = tmp_path / "sample1"
+    work_dir.mkdir(parents=True)
+    fused_prototype = ref.mean(axis=0)
+    fused_prototype /= np.linalg.norm(fused_prototype)
+    write_prototype(fused_prototype, {}, list(ref), work_dir / "prototype.npz")
+
+    # Simulate a severe domain gap: shrink the TP feature's alignment with
+    # the exemplar direction so its absolute cosine sits around 0.3 -- well
+    # under match_threshold's default (0.55) -- while still being clearly
+    # the BETTER of this keyframe's own 2 candidates (below
+    # min_candidates_for_cluster=4, so this hits the fallback path).
+    tp_feat = _make_unit((0.3 * view + 0.95 * confuser)[None, :])[0]  # cosine to `view` ~= 0.3
+    fp_feat = _make_unit((0.05 * view + 0.999 * confuser)[None, :])[0]  # cosine to `view` ~= 0.05
+
+    def _det(frame_idx, x, feat):
+        box = Box(x1=x, y1=10.0, x2=x + 20.0, y2=30.0)
+        det = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="detect")
+        det._feature = feat
+        return det
+
+    candidates = {10: [_det(10, 0.0, tp_feat), _det(10, 50.0, fp_feat)]}
+    _write_candidates_with_features(candidates, work_dir / "candidates.json")
+
+    cfg = load_config(
+        "configs/config.yaml",
+        overrides=[
+            f"project.work_dir={tmp_path}",
+            "project.use_cache=false",
+            "runtime.save_visualizations=false",
+            "stage3.verification_method=cluster",
+            "stage3.match_threshold=0.55",
+            "stage3.cluster_verification.min_candidates_for_cluster=4",
+            "stage3.cluster_verification.fallback_relative_ratio=0.9",
+        ],
+    )
+    # Sanity-check the premise: the TP's own absolute cosine must be well
+    # under match_threshold, so a fixed-threshold fallback would reject it.
+    tp_sim = float(tp_feat @ fused_prototype)
+    assert tp_sim < cfg.stage3.match_threshold, "test setup didn't actually simulate a domain gap"
+
+    det_path = run_stage3(cfg, "sample1")
+    detections = read_detections(det_path)
+
+    assert len(detections[10]) == 1
+    assert detections[10][0].box.x1 == 0.0, "the TP (better of the 2, despite low absolute cosine) must survive"

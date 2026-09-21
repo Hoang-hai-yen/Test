@@ -1373,11 +1373,20 @@ class GeCo2DynamicPrototypeTracker:
 
         def _fallback_keep_mask(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
             # Too few candidates this keyframe for clustering to find
-            # meaningful structure -- fall back to today's plain cosine gate.
+            # meaningful structure -- fall back to a threshold RELATIVE to
+            # this keyframe's own top cosine (fallback_relative_ratio), NOT
+            # cross_check_threshold's hand-set absolute number: on a video
+            # with a severe domain gap, raw cosine similarity can top out
+            # well below any plausible absolute cutoff for the ENTIRE video
+            # (confirmed in practice on this project's own footage), which
+            # would silently zero out every fallback-path keyframe exactly
+            # like it did for stage3.py's own equivalent fallback.
             del ref_feats_frame  # _cosine_from_feature already pools against self._cross_per_ref_features
             self._n_cluster_fallback += 1
             sims = np.array([self._cosine_from_feature(f) for f in cand_feats_frame])
-            return sims >= self._effective_cross_check_threshold()
+            if sims.size == 0:
+                return sims.astype(bool)
+            return sims >= float(sims.max()) * self.dp_cfg.cluster_verification.fallback_relative_ratio
 
         keep_mask, method_label = cluster_verify_candidates(
             feats, ref_feats, self.dp_cfg.cluster_verification, fallback_keep_mask_fn=_fallback_keep_mask,

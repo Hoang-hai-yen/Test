@@ -387,20 +387,42 @@ stage3:
     #   points as noise (-1) instead of forcing every point into some
     #   cluster -- directly targets "distribution shape varies per
     #   video/keyframe" since it makes no shape assumption at all.
-    # "spectral": matches DAVE's paper exactly (spectral clustering on the
-    #   cosine-similarity affinity matrix), but needs spectral_n_clusters
-    #   chosen up front -- itself a hyperparameter as fragile as a z-score.
-    #   Kept so it can be A/B'd against hdbscan on this project's own
-    #   footage instead of assuming the paper's own choice transfers here.
+    # "spectral": matches DAVE's ACTUAL reference implementation (checked
+    #   directly against a cloned copy of the DAVE repo, not just the paper
+    #   text) -- spectral clustering on the cosine-similarity affinity
+    #   matrix, with the cluster count estimated PER KEYFRAME via the
+    #   self-tuning eigengap heuristic (spectral_egv_threshold below), NOT a
+    #   fixed hand-set number -- see cluster_verify.py's
+    #   _self_tuning_n_clusters for the full rationale.
     cluster_method: hdbscan   # hdbscan | spectral
     min_cluster_size: 2       # hdbscan only
     min_samples: null         # hdbscan only; null = sklearn default (= min_cluster_size)
-    spectral_n_clusters: 2    # spectral only
+    # Eigengap threshold (spectral only) -- 0.132 is DAVE's OWN default
+    # (utils/arg_parser.py --egv in the DAVE repo), kept identical for
+    # fidelity. No gap exceeding this -> no split is trustworthy -> keeps
+    # ALL candidates this keyframe, matching DAVE's own skip-clustering-
+    # entirely behavior for a homogeneous-looking keyframe.
+    spectral_egv_threshold: 0.132
     # Below this many candidates this keyframe, clustering can't find
-    # meaningful density/spectral structure -- falls back to a plain fixed
-    # cosine cutoff (match_threshold) instead, same "too little data for a
-    # shape method" precedent otsu/gmm use for adaptive_threshold_min_samples.
+    # meaningful density/spectral structure -- falls back to a threshold
+    # RELATIVE to this keyframe's own top similarity (fallback_relative_ratio
+    # below), same "too little data for a shape method" precedent otsu/gmm
+    # use for adaptive_threshold_min_samples.
     min_candidates_for_cluster: 4
+    # Above this many total points (candidates + exemplars), skip clustering
+    # ENTIRELY and keep every candidate unchanged -- matches DAVE's own
+    # reference implementation exactly (a pure performance safeguard against
+    # expensive eigendecomposition/clustering on a very large affinity
+    # matrix, not a quality decision). null = no cap.
+    max_candidates_for_cluster: 500
+    # Fallback keeps candidates within this fraction of THIS KEYFRAME'S OWN
+    # top similarity -- NEVER a hand-set absolute cosine number: confirmed
+    # in practice on this project's own footage that raw cosine similarity
+    # can top out well below any plausible absolute cutoff for an ENTIRE
+    # video (domain gap), which silently zeroes out every fallback-path
+    # keyframe if the fallback uses a fixed threshold like match_threshold.
+    # 1.0 = only the single best-matching candidate; lower keeps near-ties.
+    fallback_relative_ratio: 0.9
 
 # ----------------------------------------------------------------------------
 # STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
@@ -850,10 +872,16 @@ stage123_geco2:
       cluster_method: hdbscan   # hdbscan | spectral -- see stage3.cluster_verification's own comment
       min_cluster_size: 2       # hdbscan only
       min_samples: null         # hdbscan only; null = sklearn default (= min_cluster_size)
-      spectral_n_clusters: 2    # spectral only
-      # Below this many surviving candidates this keyframe, falls back to
-      # today's plain cosine gate (cross_check_threshold) instead.
+      spectral_egv_threshold: 0.132   # spectral only -- see stage3.cluster_verification's own comment
+      # Below this many surviving candidates this keyframe, falls back to a
+      # threshold RELATIVE to this keyframe's own top cosine
+      # (fallback_relative_ratio below), NOT cross_check_threshold's
+      # hand-set absolute number -- see stage3.cluster_verification.
+      # fallback_relative_ratio's own comment for why an absolute cutoff
+      # can be outright unreachable on a video with a severe domain gap.
       min_candidates_for_cluster: 4
+      max_candidates_for_cluster: 500   # see stage3.cluster_verification's own comment
+      fallback_relative_ratio: 0.9
 
   # --------------------------------------------------------------------
   # DIAGNOSTIC/ABLATION: box size feeds the exemplar prototype through TWO

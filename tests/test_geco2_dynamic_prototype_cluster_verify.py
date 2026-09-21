@@ -135,23 +135,70 @@ def test_geco2_score_breaks_ties_within_verified_set():
     assert detector.calls[0][1] == [(boxes[0].x1, boxes[0].y1, boxes[0].x2, boxes[0].y2)]
 
 
-def test_falls_back_to_plain_cosine_gate_below_min_candidates_for_cluster():
+def test_falls_back_to_relative_cosine_gate_below_min_candidates_for_cluster():
+    """Fallback keeps candidates RELATIVE to this keyframe's own top cosine
+    (fallback_relative_ratio), never a hand-set absolute number -- confirmed
+    in practice that an absolute cutoff (e.g. cross_check_threshold-style)
+    can be unreachable on footage with a severe domain gap. Uses 2
+    candidates (still < min_candidates_for_cluster) so the assertion
+    actually exercises the RATIO, not just "the only candidate always
+    passes trivially"."""
     cfg = _make_cfg(
-        min_consecutive_hits=1, cross_check_threshold=0.5,
-        cluster_verification_overrides={"enabled": True, "min_candidates_for_cluster": 5},
+        min_consecutive_hits=1,
+        cluster_verification_overrides={
+            "enabled": True, "min_candidates_for_cluster": 5, "fallback_relative_ratio": 0.9,
+        },
     )
     detector = _FakeDetector()
     tracker = _make_tracker(cfg, detector=detector)
     tracker._cross_prototype = _unit(np.array([1.0, 0.0]))
     tracker._cross_per_ref_features = None
 
-    boxes = [Box(0, 0, 10, 10, score=0.5)]  # only 1 candidate < min_candidates_for_cluster=5
-    feats = np.array([_unit(np.array([0.9, 0.1]))])  # cosine ~0.99 >= cross_check_threshold=0.5
+    # 2 candidates < min_candidates_for_cluster=5. Both would fail a
+    # hand-set absolute cross_check_threshold=0.5 in a domain-gap scenario
+    # (simulated here by keeping raw cosines low), but boxes[0]'s cosine is
+    # within 90% of the frame's own top (boxes[1]'s) -- should be kept;
+    # boxes[1] itself IS the top, always kept.
+    boxes = [Box(0, 0, 10, 10, score=0.5), Box(20, 20, 30, 30, score=0.4)]
+    feats = np.array([
+        _unit(np.array([0.30, 0.10])),   # cosine ~0.949 -- within 90% of boxes[1]'s
+        _unit(np.array([0.33, 0.05])),   # cosine ~0.989 -- this frame's own top
+    ])
 
     tracker.offer_topk(np.zeros((10, 10, 3), dtype=np.uint8), boxes, feats)
 
     assert tracker._n_cluster_fallback == 1
-    assert tracker.effective_prototype()["main"].shape[1] == 2, "fallback gate should have accepted it"
+    # Highest GeCo2 score among the (both-verified) fallback set wins -- boxes[0].
+    assert tracker.effective_prototype()["main"].shape[1] == 2, "fallback gate should have accepted boxes[0]"
+    assert detector.calls[0][1] == [(boxes[0].x1, boxes[0].y1, boxes[0].x2, boxes[0].y2)]
+
+
+def test_fallback_relative_ratio_rejects_candidate_far_below_frame_top():
+    cfg = _make_cfg(
+        min_consecutive_hits=1,
+        cluster_verification_overrides={
+            "enabled": True, "min_candidates_for_cluster": 5, "fallback_relative_ratio": 0.95,
+        },
+    )
+    detector = _FakeDetector()
+    tracker = _make_tracker(cfg, detector=detector)
+    tracker._cross_prototype = _unit(np.array([1.0, 0.0]))
+    tracker._cross_per_ref_features = None
+
+    # boxes[0]'s cosine is far below 95% of boxes[1]'s (this frame's top) --
+    # must be rejected even though it has the HIGHER GeCo2 score.
+    boxes = [Box(0, 0, 10, 10, score=0.9), Box(20, 20, 30, 30, score=0.1)]
+    feats = np.array([
+        _unit(np.array([0.10, 0.30])),   # cosine ~0.316 -- well below 95% of boxes[1]'s
+        _unit(np.array([0.33, 0.05])),   # cosine ~0.989 -- this frame's own top
+    ])
+
+    tracker.offer_topk(np.zeros((10, 10, 3), dtype=np.uint8), boxes, feats)
+
+    assert tracker._n_cluster_fallback == 1
+    assert detector.calls[0][1] == [(boxes[1].x1, boxes[1].y1, boxes[1].x2, boxes[1].y2)], (
+        "only boxes[1] (this frame's own top) should have been accepted, despite boxes[0]'s higher GeCo2 score"
+    )
 
 
 def test_mutually_exclusive_with_topk_fusion_cluster_wins(caplog):

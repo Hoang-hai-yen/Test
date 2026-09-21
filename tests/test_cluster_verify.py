@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from aero_eyes.config import ClusterVerificationConfig
-from aero_eyes.utils.cluster_verify import cluster_verify_candidates
+from aero_eyes.utils.cluster_verify import _self_tuning_n_clusters, cluster_verify_candidates
 
 
 def _make_unit(vecs: np.ndarray) -> np.ndarray:
@@ -42,7 +42,7 @@ def test_separates_tp_from_fp_cluster(cluster_method):
     cand, ref, n_tp, n_fp = _two_cluster_scene(rng)
 
     cfg = ClusterVerificationConfig(
-        enabled=True, cluster_method=cluster_method, min_cluster_size=2, spectral_n_clusters=2,
+        enabled=True, cluster_method=cluster_method, min_cluster_size=2,
     )
     keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg)
 
@@ -175,3 +175,112 @@ def test_all_exemplars_labelled_noise_keeps_nothing():
 
     assert method_label == "cluster_hdbscan"
     assert not keep_mask.any()
+
+
+# ---------------------------------------------------------------------------
+# _self_tuning_n_clusters -- ported from DAVE's own reference implementation
+# (models/dave.py::COTR.eigenDecomposition in the cloned DAVE repo), not
+# just the paper text. See the field's own docstring (ClusterVerificationConfig
+# .spectral_egv_threshold) for why this replaced an earlier fixed
+# spectral_n_clusters=2.
+# ---------------------------------------------------------------------------
+
+def test_self_tuning_n_clusters_detects_two_well_separated_clusters():
+    rng = np.random.default_rng(10)
+    d = 16
+    center_a = np.zeros(d)
+    center_a[0] = 1.0
+    center_b = np.zeros(d)
+    center_b[1] = 1.0
+    group_a = _make_unit(center_a[None, :] + 0.02 * rng.normal(size=(5, d)))
+    group_b = _make_unit(center_b[None, :] + 0.02 * rng.normal(size=(5, d)))
+    combined = np.concatenate([group_a, group_b], axis=0)
+    affinity = np.clip(combined @ combined.T, 0.0, None)
+
+    assert _self_tuning_n_clusters(affinity, egv_threshold=0.132) == 2
+
+
+def test_self_tuning_n_clusters_returns_one_for_homogeneous_affinity():
+    """No prominent eigengap (a single, undifferentiated cluster) -- DAVE's
+    own code skips clustering entirely rather than forcing a split; this
+    helper's return value of 1 achieves the same effect (SpectralClustering
+    (n_clusters=1) trivially puts everyone in one cluster -- i.e. every
+    candidate verifies, matching "keep everything, don't reject")."""
+    rng = np.random.default_rng(11)
+    d = 16
+    center = np.zeros(d)
+    center[0] = 1.0
+    homogeneous = _make_unit(center[None, :] + 0.05 * rng.normal(size=(10, d)))
+    affinity = np.clip(homogeneous @ homogeneous.T, 0.0, None)
+
+    assert _self_tuning_n_clusters(affinity, egv_threshold=0.132) == 1
+
+
+def test_self_tuning_n_clusters_higher_threshold_is_stricter():
+    """A stricter (higher) egv_threshold demands a more prominent gap before
+    trusting a split -- the same 2-cluster affinity that clears a lenient
+    threshold can fall back to 1 (no split) under a strict enough one."""
+    rng = np.random.default_rng(12)
+    d = 16
+    center_a = np.zeros(d)
+    center_a[0] = 1.0
+    center_b = np.zeros(d)
+    center_b[1] = 1.0
+    # Only WEAKLY separated (large noise relative to center separation) --
+    # a real but modest eigengap, not the crisp one in the "well separated"
+    # test above.
+    group_a = _make_unit(center_a[None, :] + 0.35 * rng.normal(size=(5, d)))
+    group_b = _make_unit(center_b[None, :] + 0.35 * rng.normal(size=(5, d)))
+    combined = np.concatenate([group_a, group_b], axis=0)
+    affinity = np.clip(combined @ combined.T, 0.0, None)
+
+    assert _self_tuning_n_clusters(affinity, egv_threshold=0.01) >= 2
+    assert _self_tuning_n_clusters(affinity, egv_threshold=0.9) == 1
+
+
+def test_spectral_backend_uses_eigengap_not_fixed_two():
+    """End-to-end: a truly homogeneous keyframe (candidates and exemplars
+    all genuinely alike -- no real outlier present) must NOT have a
+    spurious split forced onto it. A fixed spectral_n_clusters=2 (the
+    earlier, pre-fix version of this module) would have rejected roughly
+    half of these candidates for no reason; the eigengap-based estimate
+    must keep all of them."""
+    rng = np.random.default_rng(13)
+    d = 16
+    center = np.zeros(d)
+    center[0] = 1.0
+    cand = _make_unit(center[None, :] + 0.05 * rng.normal(size=(8, d)))
+    ref = _make_unit(center[None, :] + 0.03 * rng.normal(size=(3, d)))
+
+    cfg = ClusterVerificationConfig(enabled=True, cluster_method="spectral")
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg)
+
+    assert method_label == "cluster_spectral"
+    assert keep_mask.all(), "a homogeneous keyframe (no real outlier) must not have a spurious split forced onto it"
+
+
+def test_max_candidates_for_cluster_skips_verification_entirely():
+    """Matches DAVE's own performance safeguard (models/dave.py::forward:
+    "if len(feat_pairs) > 500: return ... generated_bboxes") -- above the
+    cap, keep every candidate unchanged rather than attempting (possibly
+    very expensive) clustering."""
+    rng = np.random.default_rng(14)
+    cand, ref, n_tp, n_fp = _two_cluster_scene(rng)  # would normally reject the FP half
+
+    cfg = ClusterVerificationConfig(enabled=True, cluster_method="hdbscan", max_candidates_for_cluster=5)
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg)
+
+    assert method_label == "cluster_skipped_too_many_candidates"
+    assert keep_mask.all()
+
+
+def test_max_candidates_for_cluster_none_means_no_cap():
+    rng = np.random.default_rng(15)
+    cand, ref, n_tp, n_fp = _two_cluster_scene(rng)
+
+    cfg = ClusterVerificationConfig(enabled=True, cluster_method="hdbscan", max_candidates_for_cluster=None)
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg)
+
+    assert method_label == "cluster_hdbscan"
+    assert keep_mask[:n_tp].all()
+    assert not keep_mask[n_tp:].any()
