@@ -555,9 +555,41 @@ def test_pool_sims():
     max_pooled = _pool_sims(sims_per_ref, "max")
     assert np.allclose(max_pooled, [0.9, 0.6])
 
+    min_pooled = _pool_sims(sims_per_ref, "min")
+    assert np.allclose(min_pooled, [0.1, 0.4])
+
     # Unknown/unset pooling falls back to mean (matches the config default).
     default_pooled = _pool_sims(sims_per_ref, "anything-else")
     assert np.allclose(default_pooled, mean_pooled)
+
+
+def test_pool_sims_agreement_weighted():
+    from aero_eyes.stages.stage3 import _pool_sims
+
+    sims_per_ref = [
+        np.array([0.9, 0.5]),
+        np.array([0.1, 0.4]),
+        np.array([0.1, 0.6]),
+    ]
+    # ref 0 and ref 1 agree with each other (same direction), ref 2 is an
+    # outlier -- agreement_weighted should give ref 2 less influence than a
+    # plain mean would, pulling the pooled result closer to ref 0/1's own
+    # scores than mean_pooled is.
+    ref_feats = np.array([[1.0, 0.0], [0.95, 0.05], [0.0, 1.0]])
+
+    weighted = _pool_sims(sims_per_ref, "agreement_weighted", ref_feats, agreement_epsilon=20.0)
+    mean_pooled = _pool_sims(sims_per_ref, "mean")
+    # Candidate 0: ref0=0.9 (high-weight), ref2=0.1 (low-weight) -- weighted
+    # pooling should sit CLOSER to 0.9 than the unweighted mean does.
+    assert abs(weighted[0] - 0.9) < abs(mean_pooled[0] - 0.9)
+
+
+def test_pool_sims_agreement_weighted_requires_ref_feats():
+    from aero_eyes.stages.stage3 import _pool_sims
+
+    sims_per_ref = [np.array([0.9]), np.array([0.1])]
+    with pytest.raises(ValueError, match="requires ref_feats"):
+        _pool_sims(sims_per_ref, "agreement_weighted")
 
 
 def test_stage4_produces_tracks_with_none_tracker(cfg, synth_fixture):

@@ -1778,13 +1778,32 @@ accuracy:
     tuned_nms: true
     multi_reference_embedding: true   # keep per-ref protos + ensemble match
     # How per-ref similarity scores get pooled into one, when
-    # multi_reference_embedding is active. "mean" (default) averages across
-    # all 3 refs -- a candidate matching only ONE ref well (e.g. object shot
-    # from 3 different angles, candidate's own angle resembles just one of
-    # them) gets that good score diluted by the other two weak ones. "max"
-    # takes the single best-matching ref's score instead, so a genuinely
-    # good match isn't dragged down by refs shot from a different angle.
-    multi_ref_pooling: max   # "mean" | "max"
+    # multi_reference_embedding is active.
+    # "mean" (default) averages across all 3 refs -- a candidate matching
+    #   only ONE ref well (e.g. object shot from 3 different angles,
+    #   candidate's own angle resembles just one of them) gets that good
+    #   score diluted by the other two weak ones.
+    # "max" takes the single best-matching ref's score instead ("OR" over
+    #   refs), so a genuinely good match isn't dragged down by refs shot
+    #   from a different angle -- but STRUCTURALLY favors recall over
+    #   precision: a candidate only needs to resemble ONE ref well to score
+    #   highly, so if any one reference's own framing/lighting happens to
+    #   coincidentally resemble some background clutter class, max lets
+    #   that leak through for every candidate.
+    # "min" (NOT YET VALIDATED) takes the single WORST-matching ref's score
+    #   instead ("AND" over refs) -- opposite tradeoff from max: a
+    #   candidate must resemble ALL 3 refs to score highly. Favors
+    #   precision at some recall cost -- worth trying if max is suspected
+    #   of letting confusers through via just one permissive reference.
+    # "agreement_weighted" (NOT YET VALIDATED) weights each ref's score by
+    #   its own BD-CSPN-style agreement with the consensus of the OTHER
+    #   refs (aero_eyes.utils.ref_agreement.agreement_weights) instead of
+    #   treating all 3 equally (mean) or letting one alone decide (max/min).
+    multi_ref_pooling: max   # mean | max | min | agreement_weighted
+    # Softmax temperature for multi_ref_pooling=agreement_weighted -- same
+    # tuning tradeoff as stage1.prototype.agreement_weighted_epsilon (no
+    # canonical literature value found, needs tuning on your own footage).
+    agreement_weighted_epsilon: 10.0
 
   max_accuracy:
     synthetic_viewpoint_aug:

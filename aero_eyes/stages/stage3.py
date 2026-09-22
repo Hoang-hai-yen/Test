@@ -88,20 +88,33 @@ def _score_against_ref(
     raise ValueError(f"Unknown stage3.similarity metric '{metric}'. Must be 'cosine', 'l1', 'l2', or 'rmd'.")
 
 
-def _pool_sims(sims_per_ref: list, pooling: str) -> np.ndarray:
+def _pool_sims(
+    sims_per_ref: list, pooling: str, ref_feats: np.ndarray | list | None = None,
+    agreement_epsilon: float = 10.0,
+) -> np.ndarray:
     """Combine per-reference-image similarity arrays into one, per
-    accuracy.cheap_boosters.multi_ref_pooling:
-      mean -- average across refs (original behavior). A candidate that
-        matches one ref very well but the other two poorly (e.g. the object
-        was photographed from 3 different angles and this candidate's own
-        viewing angle only resembles one of them) has that good score
-        diluted by the two weak ones.
-      max -- the single best-matching ref's score per candidate, so a
-        genuinely good match from one well-aligned reference view isn't
-        dragged down by refs shot from a different angle/lighting.
+    accuracy.cheap_boosters.multi_ref_pooling (see that field's own
+    docstring in aero_eyes/config.py for the full tradeoff writeup):
+      mean -- average across refs (original behavior).
+      max -- the single best-matching ref's score per candidate ("OR" over
+        refs -- favors recall, structurally risks a confuser leaking
+        through via just one coincidentally-permissive reference).
+      min -- the single WORST-matching ref's score per candidate ("AND"
+        over refs -- favors precision at some recall cost).
+      agreement_weighted -- NOT YET VALIDATED -- weighted average using
+        aero_eyes.utils.ref_agreement.agreement_weights(ref_feats,
+        agreement_epsilon); REQUIRES ref_feats (raises otherwise).
     """
     if pooling == "max":
         return np.max(sims_per_ref, axis=0)
+    if pooling == "min":
+        return np.min(sims_per_ref, axis=0)
+    if pooling == "agreement_weighted":
+        if ref_feats is None:
+            raise ValueError("_pool_sims(pooling='agreement_weighted') requires ref_feats.")
+        from aero_eyes.utils.ref_agreement import agreement_weights
+        weights = agreement_weights(np.asarray(ref_feats), agreement_epsilon)
+        return np.average(np.stack(sims_per_ref, axis=0), axis=0, weights=weights)
     return np.mean(sims_per_ref, axis=0)
 
 
@@ -526,6 +539,7 @@ def run_dynamic_prototype_rounds(
     on_round=None,
     all_frame_idxs: list[int] | None = None,
     background: tuple[np.ndarray, np.ndarray] | None = None,
+    agreement_epsilon: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, list]:
     """stage3.dynamic_prototype's iterative refinement loop (opt-in, no-op
     when dp.enabled is False): a fixed high-confidence cutoff only ever
@@ -609,7 +623,7 @@ def run_dynamic_prototype_rounds(
                 _score_against_ref(all_feats, ref_feat, similarity_metric, background=background)
                 for ref_feat in per_ref_features
             ]
-            all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
+            all_sims = _pool_sims(sims_per_ref, multi_ref_pooling, per_ref_features, agreement_epsilon)
         else:
             prototype = (1 - dp.alpha) * prototype + dp.alpha * dynamic_feat
             prototype = prototype / (np.linalg.norm(prototype) + 1e-8)
@@ -854,6 +868,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
         and len(per_ref_features) > 0
     )
     multi_ref_pooling = cfg.accuracy.cheap_boosters.multi_ref_pooling
+    agreement_epsilon = cfg.accuracy.cheap_boosters.agreement_weighted_epsilon
 
     # ---- Match: global top-K or per-keyframe threshold ----
     detections: dict[int, list[Detection]] = {}
@@ -919,7 +934,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
             _score_against_ref(all_feats, ref_feat, s3.similarity, background=background)
             for ref_feat in per_ref_features
         ]
-        all_sims = _pool_sims(sims_per_ref, multi_ref_pooling)
+        all_sims = _pool_sims(sims_per_ref, multi_ref_pooling, per_ref_features, agreement_epsilon)
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity, background=background)  # [N]
 
@@ -957,6 +972,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
             sample_id, all_feats, all_sims, prototype, per_ref_features,
             use_multi_ref, multi_ref_pooling, s3.similarity, s3.dynamic_prototype,
             all_frame_idxs=all_frame_idxs, background=background,
+            agreement_epsilon=agreement_epsilon,
         )
 
     # Persist the dynamic_prototype-adapted state SEPARATELY from
@@ -1033,7 +1049,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 _score_against_ref(cand_feats_frame, rf, s3.similarity, background=background)
                 for rf in ref_feats_frame
             ]
-            sims_frame = _pool_sims(sims_per_ref_frame, multi_ref_pooling)
+            sims_frame = _pool_sims(sims_per_ref_frame, multi_ref_pooling, ref_feats_frame, agreement_epsilon)
             if sims_frame.size == 0:
                 return sims_frame.astype(bool)
             relative_floor = float(sims_frame.max()) * s3.cluster_verification.fallback_relative_ratio

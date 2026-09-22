@@ -19,6 +19,7 @@ from aero_eyes.types import Box
 
 def _make_cfg(
     accuracy_mode="cheap_boosters", multi_reference_embedding=True, multi_ref_pooling="mean",
+    agreement_weighted_epsilon=10.0,
     topk_fusion_overrides=None, cluster_verification_overrides=None, margin_verification_overrides=None,
     **dp_overrides,
 ):
@@ -64,6 +65,7 @@ def _make_cfg(
             cheap_boosters=SimpleNamespace(
                 multi_reference_embedding=multi_reference_embedding,
                 multi_ref_pooling=multi_ref_pooling,
+                agreement_weighted_epsilon=agreement_weighted_epsilon,
             ),
         ),
     )
@@ -291,6 +293,39 @@ def test_feature_extractor_similarity_pools_per_ref_with_max():
     feat = np.array([1.0, 0.0])
     sim = tracker._feature_extractor_similarity(np.zeros((10, 10, 3), dtype=np.uint8), box, precomputed_feature=feat)
     assert sim == pytest.approx(1.0), "max pooling should surface the single best-matching ref's score"
+
+
+def test_feature_extractor_similarity_pools_per_ref_with_min():
+    cfg = _make_cfg(multi_reference_embedding=True, multi_ref_pooling="min")
+    tracker = _make_tracker(cfg)
+    tracker._cross_prototype = np.array([1.0, 0.0])  # would give sim=1.0 if wrongly used instead of per-ref
+    tracker._cross_per_ref_features = [np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.0, 1.0])]
+
+    box = Box(10, 10, 20, 20, score=0.9)
+    feat = np.array([1.0, 0.0])
+    sim = tracker._feature_extractor_similarity(np.zeros((10, 10, 3), dtype=np.uint8), box, precomputed_feature=feat)
+    assert sim == pytest.approx(0.0), "min pooling should surface the single worst-matching ref's score"
+
+
+def test_feature_extractor_similarity_pools_per_ref_with_agreement_weighted():
+    cfg = _make_cfg(
+        multi_reference_embedding=True, multi_ref_pooling="agreement_weighted",
+        agreement_weighted_epsilon=20.0,
+    )
+    tracker = _make_tracker(cfg)
+    tracker._cross_prototype = np.array([0.0, 1.0])  # would give sim=0.0 if wrongly used instead of per-ref
+    # ref 0 and ref 1 agree with each other; ref 2 is an outlier -- its
+    # (perfect, sim=1.0) match to feat should count for LESS than a plain
+    # mean would give it.
+    tracker._cross_per_ref_features = [
+        np.array([1.0, 0.0]), np.array([0.95, 0.05]) / np.linalg.norm([0.95, 0.05]), np.array([0.0, 1.0]),
+    ]
+
+    box = Box(10, 10, 20, 20, score=0.9)
+    feat = np.array([0.0, 1.0])  # matches ref 2 (the outlier) perfectly, refs 0/1 poorly
+    sim = tracker._feature_extractor_similarity(np.zeros((10, 10, 3), dtype=np.uint8), box, precomputed_feature=feat)
+    mean_sim = (1.0 * 0.0 + 1.0 * (0.95 * 0 + 0.05 * 1) / np.linalg.norm([0.95, 0.05]) + 1.0 * 1.0) / 3
+    assert sim < mean_sim, "agreement_weighted should discount the outlier ref's perfect match vs. plain mean"
 
 
 def test_offer_precomputed_feature_multi_ref_pooling_gates_acceptance():

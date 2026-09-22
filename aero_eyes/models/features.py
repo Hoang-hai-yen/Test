@@ -110,8 +110,8 @@ def _ensure_transformers_onnx_shim() -> None:
     sys.modules["transformers.onnx"] = shim
 
 
-def _ensure_fgclip_subconfigs(config: Any) -> None:
-    """FG-CLIP's own remote config class (qihoo360/fg-clip-*, loaded via
+def _ensure_fgclip_subconfigs(config: Any, hf_name: str) -> None:
+    """FG-CLIP's own remote code (qihoo360/fg-clip-*, loaded via
     trust_remote_code) does not always convert its `text_config`/
     `vision_config` sub-fields from the plain dict read out of config.json
     into CLIPTextConfig/CLIPVisionConfig instances -- something
@@ -120,15 +120,36 @@ def _ensure_fgclip_subconfigs(config: Any) -> None:
     (same category as _ensure_transformers_onnx_shim above), surfacing as
     "config.text_config is expected to be of type CLIPTextConfig but is of
     type <class 'dict'>" from modeling_fgclip.py's own constructor.
-    Patches both sub-configs IN PLACE if they're still plain dicts; a no-op
-    otherwise (e.g. a future FG-CLIP/transformers release that fixes this
-    upstream), so this stays harmless if the underlying bug goes away.
+
+    IMPORTANT: modeling_fgclip.py's isinstance check is against ITS OWN
+    vendored CLIPTextConfig/CLIPVisionConfig classes (bundled alongside
+    modeling_fgclip.py in the same trust_remote_code download), NOT
+    transformers.CLIPTextConfig -- same name, but a DIFFERENT class object,
+    so constructing with the standard library's class still fails the
+    check (confirmed: the error message literally names
+    "transformers.models.clip.configuration_clip.CLIPTextConfig" as the
+    WRONG type once that fix was tried). get_class_from_dynamic_module
+    fetches the exact class modeling_fgclip.py itself resolves, from the
+    same cached module -- guaranteed identity match regardless of where
+    FG-CLIP's bundle actually defines/imports it from.
+
+    Patches both sub-configs IN PLACE unless already an instance of the
+    correct (vendored) class; a no-op once the underlying bug is fixed
+    upstream, so this stays harmless if it ever gets fixed.
     """
-    from transformers import CLIPTextConfig, CLIPVisionConfig
-    if isinstance(getattr(config, "text_config", None), dict):
-        config.text_config = CLIPTextConfig(**config.text_config)
-    if isinstance(getattr(config, "vision_config", None), dict):
-        config.vision_config = CLIPVisionConfig(**config.vision_config)
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    CLIPTextConfig = get_class_from_dynamic_module("modeling_fgclip.CLIPTextConfig", hf_name)
+    CLIPVisionConfig = get_class_from_dynamic_module("modeling_fgclip.CLIPVisionConfig", hf_name)
+
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None and not isinstance(text_config, CLIPTextConfig):
+        kwargs = text_config if isinstance(text_config, dict) else text_config.to_dict()
+        config.text_config = CLIPTextConfig(**kwargs)
+
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is not None and not isinstance(vision_config, CLIPVisionConfig):
+        kwargs = vision_config if isinstance(vision_config, dict) else vision_config.to_dict()
+        config.vision_config = CLIPVisionConfig(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +821,7 @@ class FGCLIPFeatureExtractor:
         # needed (another version-skew symptom in FG-CLIP's hosted code,
         # like _ensure_transformers_onnx_shim above).
         config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
-        _ensure_fgclip_subconfigs(config)
+        _ensure_fgclip_subconfigs(config, hf_name)
         model = AutoModelForCausalLM.from_pretrained(hf_name, config=config, trust_remote_code=True)
         return model, processor
 

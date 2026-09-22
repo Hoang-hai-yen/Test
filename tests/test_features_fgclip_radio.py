@@ -65,54 +65,105 @@ def test_onnx_shim_noop_when_already_cached_with_onnxconfig(monkeypatch):
 # ---------------------------------------------------------------------------
 # FG-CLIP config sub-config compatibility shim (_ensure_fgclip_subconfigs) --
 # real `transformers` is not installed in this dev environment, so these
-# fake sys.modules["transformers"] itself, same technique as the onnx shim
-# tests above.
+# fake sys.modules["transformers.dynamic_module_utils"] itself (the shim's
+# own dependency), same technique as the onnx shim tests above.
+#
+# IMPORTANT: the classes returned by get_class_from_dynamic_module here are
+# deliberately DIFFERENT objects from transformers.CLIPTextConfig/
+# CLIPVisionConfig (mirroring the real bug: FG-CLIP's own vendored classes
+# are NOT the same class object as the standard library's, despite the same
+# name -- see _ensure_fgclip_subconfigs's own docstring). Tests must catch
+# a regression back to "from transformers import CLIPTextConfig" (the
+# FIRST, wrong fix this project tried).
 # ---------------------------------------------------------------------------
 
-def _fake_transformers_clip_configs(monkeypatch):
+def _fake_get_class_from_dynamic_module(monkeypatch):
     import sys
     import types
 
-    fake_transformers = types.ModuleType("transformers")
+    calls = []
 
-    class _FakeCLIPTextConfig:
+    class _VendoredCLIPTextConfig:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    class _FakeCLIPVisionConfig:
+        def to_dict(self):
+            return dict(self.kwargs)
+
+    class _VendoredCLIPVisionConfig:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    fake_transformers.CLIPTextConfig = _FakeCLIPTextConfig
-    fake_transformers.CLIPVisionConfig = _FakeCLIPVisionConfig
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    return _FakeCLIPTextConfig, _FakeCLIPVisionConfig
+        def to_dict(self):
+            return dict(self.kwargs)
+
+    def fake_get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **kw):
+        calls.append((class_reference, pretrained_model_name_or_path))
+        if class_reference.endswith("CLIPTextConfig"):
+            return _VendoredCLIPTextConfig
+        if class_reference.endswith("CLIPVisionConfig"):
+            return _VendoredCLIPVisionConfig
+        raise AssertionError(f"unexpected class_reference: {class_reference}")
+
+    fake_dmu = types.ModuleType("transformers.dynamic_module_utils")
+    fake_dmu.get_class_from_dynamic_module = fake_get_class_from_dynamic_module
+    monkeypatch.setitem(sys.modules, "transformers.dynamic_module_utils", fake_dmu)
+    return _VendoredCLIPTextConfig, _VendoredCLIPVisionConfig, calls
 
 
 def test_ensure_fgclip_subconfigs_converts_plain_dicts(monkeypatch):
     from types import SimpleNamespace
 
-    FakeText, FakeVision = _fake_transformers_clip_configs(monkeypatch)
+    VendoredText, VendoredVision, calls = _fake_get_class_from_dynamic_module(monkeypatch)
     config = SimpleNamespace(
         text_config={"hidden_size": 512}, vision_config={"hidden_size": 768},
     )
 
-    features_mod._ensure_fgclip_subconfigs(config)
+    features_mod._ensure_fgclip_subconfigs(config, "qihoo360/fg-clip-base")
 
-    assert isinstance(config.text_config, FakeText)
+    assert isinstance(config.text_config, VendoredText)
     assert config.text_config.kwargs == {"hidden_size": 512}
-    assert isinstance(config.vision_config, FakeVision)
+    assert isinstance(config.vision_config, VendoredVision)
     assert config.vision_config.kwargs == {"hidden_size": 768}
+    assert calls == [
+        ("modeling_fgclip.CLIPTextConfig", "qihoo360/fg-clip-base"),
+        ("modeling_fgclip.CLIPVisionConfig", "qihoo360/fg-clip-base"),
+    ]
+
+
+def test_ensure_fgclip_subconfigs_converts_wrong_class_instance(monkeypatch):
+    """The exact real-world bug: text_config is ALREADY a CLIPTextConfig
+    instance, just the WRONG one (e.g. the standard transformers.
+    CLIPTextConfig, from this project's own first, incorrect fix attempt)
+    -- must still be reconstructed as the vendored class, not left alone
+    just because isinstance(..., dict) is False."""
+    from types import SimpleNamespace
+
+    class _WrongCLIPTextConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def to_dict(self):
+            return dict(self.kwargs)
+
+    VendoredText, VendoredVision, _ = _fake_get_class_from_dynamic_module(monkeypatch)
+    wrong_instance = _WrongCLIPTextConfig(hidden_size=512)
+    config = SimpleNamespace(text_config=wrong_instance, vision_config={"hidden_size": 768})
+
+    features_mod._ensure_fgclip_subconfigs(config, "qihoo360/fg-clip-base")
+
+    assert isinstance(config.text_config, VendoredText), "must reconstruct even a same-named wrong-class instance"
+    assert config.text_config.kwargs == {"hidden_size": 512}
 
 
 def test_ensure_fgclip_subconfigs_noop_when_already_correct_type(monkeypatch):
     from types import SimpleNamespace
 
-    FakeText, FakeVision = _fake_transformers_clip_configs(monkeypatch)
-    already_correct = FakeText(hidden_size=512)
-    config = SimpleNamespace(text_config=already_correct, vision_config=FakeVision(hidden_size=768))
+    VendoredText, VendoredVision, calls = _fake_get_class_from_dynamic_module(monkeypatch)
+    already_correct = VendoredText(hidden_size=512)
+    config = SimpleNamespace(text_config=already_correct, vision_config=VendoredVision(hidden_size=768))
 
-    features_mod._ensure_fgclip_subconfigs(config)
+    features_mod._ensure_fgclip_subconfigs(config, "qihoo360/fg-clip-base")
 
     assert config.text_config is already_correct, "must not reconstruct an already-correct sub-config"
 
@@ -120,10 +171,10 @@ def test_ensure_fgclip_subconfigs_noop_when_already_correct_type(monkeypatch):
 def test_ensure_fgclip_subconfigs_handles_missing_attrs_gracefully(monkeypatch):
     from types import SimpleNamespace
 
-    _fake_transformers_clip_configs(monkeypatch)
+    _fake_get_class_from_dynamic_module(monkeypatch)
     config = SimpleNamespace()  # no text_config/vision_config at all
 
-    features_mod._ensure_fgclip_subconfigs(config)  # must not raise
+    features_mod._ensure_fgclip_subconfigs(config, "qihoo360/fg-clip-base")  # must not raise
 
 
 # ---------------------------------------------------------------------------

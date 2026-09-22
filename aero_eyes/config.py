@@ -1669,7 +1669,34 @@ class CheapBoostersConfig(BaseModel):
     #     instead of averaging all of them. Keeps a genuinely good match
     #     from a single well-aligned reference view from being dragged down
     #     by refs shot from a different angle/lighting than this candidate.
-    multi_ref_pooling: Literal["mean", "max"] = "mean"
+    #     STRUCTURALLY favors recall over precision: a candidate only needs
+    #     to resemble ONE of the refs well to score highly (an "OR" over
+    #     refs) -- if any one reference's own framing/lighting happens to
+    #     coincidentally resemble some background clutter class, max lets
+    #     that leak through for every candidate, since only 1-of-3 needs to
+    #     "agree". Prefer "min" or "agreement_weighted" below if precision
+    #     (not recall) is the binding constraint.
+    #   min -- take the single WORST-matching ref's score per candidate
+    #     instead ("AND" over refs) -- a candidate must resemble ALL 3 refs
+    #     reasonably well to score highly. Opposite tradeoff from max: lower
+    #     risk of one coincidentally-permissive reference leaking a
+    #     confuser through, higher risk of under-scoring a genuine match
+    #     whose current viewing angle only resembles 1-2 of the 3 refs.
+    #   agreement_weighted -- NOT YET VALIDATED -- weighted average of the
+    #     3 per-ref scores, weighted by each reference's own BD-CSPN-style
+    #     self-referential agreement with the consensus of the OTHER refs
+    #     (aero_eyes.utils.ref_agreement.agreement_weights -- same family of
+    #     technique as stage1.prototype.fusion="agreement_weighted", but
+    #     computed independently here over SCORES rather than embeddings,
+    #     since no mask-confidence weight is available at this stage). An
+    #     outlier reference contributes less to the combined score instead
+    #     of counting equally (mean) or deciding the outcome alone (max) or
+    #     vetoing alone (min).
+    multi_ref_pooling: Literal["mean", "max", "min", "agreement_weighted"] = "mean"
+    # Softmax temperature for multi_ref_pooling="agreement_weighted" -- see
+    # stage1.prototype.agreement_weighted_epsilon's own docstring for the
+    # same tuning tradeoff (no canonical literature value found).
+    agreement_weighted_epsilon: float = 10.0
 
 
 class MaxAccuracyConfig(BaseModel):

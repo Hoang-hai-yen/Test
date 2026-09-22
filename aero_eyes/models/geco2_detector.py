@@ -948,8 +948,8 @@ class GeCo2DynamicPrototypeTracker:
         alongside the fused prototype. When
         accuracy.cheap_boosters.multi_reference_embedding is on, the cross
         check scores the candidate against EACH ref separately and pools
-        with accuracy.cheap_boosters.multi_ref_pooling (mean|max) -- same
-        pattern Stage 3's own matching and
+        with accuracy.cheap_boosters.multi_ref_pooling (mean|max|min|
+        agreement_weighted) -- same pattern Stage 3's own matching and
         stage4._detect_on_frame_geco2's cosine filter use -- instead of
         collapsing to a single mean vector first, which dilutes a good
         match against one ref with two poor ones under "max" pooling.
@@ -1738,8 +1738,9 @@ class GeCo2DynamicPrototypeTracker:
         When accuracy.cheap_boosters.multi_reference_embedding is on and
         per-ref vectors are available, scores against each of the 3
         reference images separately and pools with
-        accuracy.cheap_boosters.multi_ref_pooling (mean|max) instead of
-        collapsing to the single fused prototype vector first -- see
+        accuracy.cheap_boosters.multi_ref_pooling (mean|max|min|
+        agreement_weighted) instead of collapsing to the single fused
+        prototype vector first -- see
         __init__'s cross_check_per_ref_features docstring for why.
         """
         if self._cross_extractor is None and precomputed_feature is None:
@@ -1776,17 +1777,30 @@ class GeCo2DynamicPrototypeTracker:
         against the reference prototype -- the multi-ref-pooling-aware part
         of _feature_extractor_similarity, factored out so offer_topk can
         score EVERY surviving candidate's precomputed feature the same way
-        without duplicating the mean/max pooling logic."""
+        without duplicating the pooling logic. See accuracy.cheap_boosters.
+        multi_ref_pooling's own docstring (aero_eyes/config.py) for the
+        mean/max/min/agreement_weighted tradeoff -- same 4 options and same
+        aero_eyes.utils.ref_agreement.agreement_weights formula stage3.py's
+        own _pool_sims uses, kept consistent between the two call sites."""
         use_multi_ref = (
             self.cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
             and self.cfg.accuracy.cheap_boosters.multi_reference_embedding
             and self._cross_per_ref_features
         )
-        if use_multi_ref:
-            sims = np.array([float(feat @ ref_feat) for ref_feat in self._cross_per_ref_features])
-            pooling = self.cfg.accuracy.cheap_boosters.multi_ref_pooling
-            return float(sims.max()) if pooling == "max" else float(sims.mean())
-        return float(feat @ self._cross_prototype)
+        if not use_multi_ref:
+            return float(feat @ self._cross_prototype)
+        sims = np.array([float(feat @ ref_feat) for ref_feat in self._cross_per_ref_features])
+        pooling = self.cfg.accuracy.cheap_boosters.multi_ref_pooling
+        if pooling == "max":
+            return float(sims.max())
+        if pooling == "min":
+            return float(sims.min())
+        if pooling == "agreement_weighted":
+            from aero_eyes.utils.ref_agreement import agreement_weights
+            epsilon = self.cfg.accuracy.cheap_boosters.agreement_weighted_epsilon
+            weights = agreement_weights(np.stack(self._cross_per_ref_features, axis=0), epsilon)
+            return float(sims @ weights)
+        return float(sims.mean())
 
     def _ref_feats_for_cluster(self) -> np.ndarray | None:
         """Exemplar feature set for dynamic_prototype.cluster_verification
