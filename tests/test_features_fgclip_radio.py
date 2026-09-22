@@ -63,6 +63,70 @@ def test_onnx_shim_noop_when_already_cached_with_onnxconfig(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# FG-CLIP config sub-config compatibility shim (_ensure_fgclip_subconfigs) --
+# real `transformers` is not installed in this dev environment, so these
+# fake sys.modules["transformers"] itself, same technique as the onnx shim
+# tests above.
+# ---------------------------------------------------------------------------
+
+def _fake_transformers_clip_configs(monkeypatch):
+    import sys
+    import types
+
+    fake_transformers = types.ModuleType("transformers")
+
+    class _FakeCLIPTextConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _FakeCLIPVisionConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_transformers.CLIPTextConfig = _FakeCLIPTextConfig
+    fake_transformers.CLIPVisionConfig = _FakeCLIPVisionConfig
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    return _FakeCLIPTextConfig, _FakeCLIPVisionConfig
+
+
+def test_ensure_fgclip_subconfigs_converts_plain_dicts(monkeypatch):
+    from types import SimpleNamespace
+
+    FakeText, FakeVision = _fake_transformers_clip_configs(monkeypatch)
+    config = SimpleNamespace(
+        text_config={"hidden_size": 512}, vision_config={"hidden_size": 768},
+    )
+
+    features_mod._ensure_fgclip_subconfigs(config)
+
+    assert isinstance(config.text_config, FakeText)
+    assert config.text_config.kwargs == {"hidden_size": 512}
+    assert isinstance(config.vision_config, FakeVision)
+    assert config.vision_config.kwargs == {"hidden_size": 768}
+
+
+def test_ensure_fgclip_subconfigs_noop_when_already_correct_type(monkeypatch):
+    from types import SimpleNamespace
+
+    FakeText, FakeVision = _fake_transformers_clip_configs(monkeypatch)
+    already_correct = FakeText(hidden_size=512)
+    config = SimpleNamespace(text_config=already_correct, vision_config=FakeVision(hidden_size=768))
+
+    features_mod._ensure_fgclip_subconfigs(config)
+
+    assert config.text_config is already_correct, "must not reconstruct an already-correct sub-config"
+
+
+def test_ensure_fgclip_subconfigs_handles_missing_attrs_gracefully(monkeypatch):
+    from types import SimpleNamespace
+
+    _fake_transformers_clip_configs(monkeypatch)
+    config = SimpleNamespace()  # no text_config/vision_config at all
+
+    features_mod._ensure_fgclip_subconfigs(config)  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # FG-CLIP
 # ---------------------------------------------------------------------------
 

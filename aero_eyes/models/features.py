@@ -110,6 +110,27 @@ def _ensure_transformers_onnx_shim() -> None:
     sys.modules["transformers.onnx"] = shim
 
 
+def _ensure_fgclip_subconfigs(config: Any) -> None:
+    """FG-CLIP's own remote config class (qihoo360/fg-clip-*, loaded via
+    trust_remote_code) does not always convert its `text_config`/
+    `vision_config` sub-fields from the plain dict read out of config.json
+    into CLIPTextConfig/CLIPVisionConfig instances -- something
+    transformers.CLIPConfig's own __init__ has historically done
+    automatically. Another version-skew symptom in FG-CLIP's hosted code
+    (same category as _ensure_transformers_onnx_shim above), surfacing as
+    "config.text_config is expected to be of type CLIPTextConfig but is of
+    type <class 'dict'>" from modeling_fgclip.py's own constructor.
+    Patches both sub-configs IN PLACE if they're still plain dicts; a no-op
+    otherwise (e.g. a future FG-CLIP/transformers release that fixes this
+    upstream), so this stays harmless if the underlying bug goes away.
+    """
+    from transformers import CLIPTextConfig, CLIPVisionConfig
+    if isinstance(getattr(config, "text_config", None), dict):
+        config.text_config = CLIPTextConfig(**config.text_config)
+    if isinstance(getattr(config, "vision_config", None), dict):
+        config.vision_config = CLIPVisionConfig(**config.vision_config)
+
+
 # ---------------------------------------------------------------------------
 # Multi-scale attention-weighted pooling (pooling="multiscale_attn", shared
 # between DINOv2FeatureExtractor and DINOv3FeatureExtractor)
@@ -761,7 +782,7 @@ class FGCLIPFeatureExtractor:
 
     def _load(self, variant: str):
         try:
-            from transformers import AutoImageProcessor, AutoModelForCausalLM
+            from transformers import AutoConfig, AutoImageProcessor, AutoModelForCausalLM
         except ImportError:
             raise RuntimeError(
                 "transformers not installed. Run: pip install transformers"
@@ -774,7 +795,13 @@ class FGCLIPFeatureExtractor:
         # here purely as a vision encoder (only get_image_features() below
         # is called, never text generation).
         processor = AutoImageProcessor.from_pretrained(hf_name)
-        model = AutoModelForCausalLM.from_pretrained(hf_name, trust_remote_code=True)
+        # Load+patch the config BEFORE from_pretrained builds the model --
+        # see _ensure_fgclip_subconfigs's own docstring for why this is
+        # needed (another version-skew symptom in FG-CLIP's hosted code,
+        # like _ensure_transformers_onnx_shim above).
+        config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
+        _ensure_fgclip_subconfigs(config)
+        model = AutoModelForCausalLM.from_pretrained(hf_name, config=config, trust_remote_code=True)
         return model, processor
 
     @torch.no_grad()
