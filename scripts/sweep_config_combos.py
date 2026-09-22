@@ -171,8 +171,13 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
         Combo("E1b_dinov3_sat493m", "encoder", {
             "stage1.feature_extractor.model": "dinov3",
             "stage1.feature_extractor.dinov3_pretrain_dataset": "sat493m",
+            # sat493m is only published on HF for vitl16 -- vitb16 (this
+            # field's own config.yaml default) 404s (confirmed in practice:
+            # facebook/dinov3-vitb16-pretrain-sat493m doesn't exist).
+            "stage1.feature_extractor.dinov3_variant": "vitl16",
         }, needs_stage1=True, recompute=True,
-              note="architecture change + satellite-domain pretrain together"),
+              note="architecture change + satellite-domain pretrain together -- forced to vitl16 "
+                   "(1024-d, ~300M params) since sat493m isn't published for vitb16 on HF"),
         Combo("E2_dinov2_registers", "encoder",
               {"stage1.feature_extractor.dinov2_use_registers": True}, needs_stage1=True, recompute=True),
         Combo("E3_multiscale_attn", "encoder",
@@ -198,6 +203,7 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
             "stage1.feature_extractor.model": "ensemble",
             "stage1.feature_extractor.ensemble_dino_model": "dinov3",
             "stage1.feature_extractor.dinov3_pretrain_dataset": "sat493m",
+            "stage1.feature_extractor.dinov3_variant": "vitl16",  # see E1b's own note -- sat493m 404s on vitb16
         }, needs_stage1=True, recompute=True),
         Combo("E6_fgclip", "encoder", {"stage1.feature_extractor.model": "fgclip"},
               needs_stage1=True, recompute=True, heavy=True,

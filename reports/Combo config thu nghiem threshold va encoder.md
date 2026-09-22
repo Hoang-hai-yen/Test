@@ -23,10 +23,15 @@ stage1:
     dinov3_pretrain_dataset: lvd1689m   # mặc định, chỉ để tường minh
 
 # E1b — DINOv3 + domain vệ tinh (kiến trúc + domain pretrain cùng lúc)
+# QUAN TRỌNG: sat493m chỉ được publish trên HF cho vitl16 -- vitb16 (mặc định
+# của dinov3_variant) sẽ 404 (đã xác nhận thực tế: repo
+# facebook/dinov3-vitb16-pretrain-sat493m không tồn tại). Bắt buộc set
+# dinov3_variant: vitl16 khi dùng sat493m.
 stage1:
   feature_extractor:
     model: dinov3
     dinov3_pretrain_dataset: sat493m   # thay vì lvd1689m mặc định
+    dinov3_variant: vitl16             # bắt buộc -- sat493m không có bản vitb16
 
 # E2 — DINOv2 with registers (drop-in swap, cùng chiều embedding)
 stage1:
@@ -68,6 +73,7 @@ stage1:
     model: ensemble
     ensemble_dino_model: dinov3
     dinov3_pretrain_dataset: sat493m
+    dinov3_variant: vitl16   # bắt buộc -- xem lưu ý ở E1b
 
 # E6 — FG-CLIP (hard fine-grained negative pairs) -- dự án đã thấy CLIP/SigLIP
 # thường thua DINOv2/v3 trên footage thật, đây là biến thể khác hẳn mục tiêu
