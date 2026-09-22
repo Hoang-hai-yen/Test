@@ -85,6 +85,16 @@ def test_run_sweep_reuses_stage1_and_recomputes_once_then_restores_files(tmp_pat
     sample_dir.mkdir(parents=True)
     _seed_candidates(sample_dir)
     original_candidates_bytes = (sample_dir / "candidates.json").read_bytes()
+    # Seed a PRE-EXISTING detections.json + prototype.npz, exactly like a
+    # real work_dir a normal pipeline run already populated -- reproduces
+    # the real bug found in practice: without forcing project.use_cache off,
+    # run_stage1/run_stage3 both short-circuit on an already-on-disk file
+    # and every combo silently scores the SAME stale cached result instead
+    # of ever actually re-running with its own overrides.
+    (sample_dir / "detections.json").write_bytes(b"pre-existing-stale-detections")
+    (sample_dir / "prototype.npz").write_bytes(b"pre-existing-stale-prototype")
+    original_detections_bytes = (sample_dir / "detections.json").read_bytes()
+    original_prototype_bytes = (sample_dir / "prototype.npz").read_bytes()
     config_path = _config_yaml(tmp_path, _gt_file(tmp_path), work_dir, data_root)
 
     stage1_combos = [
@@ -99,13 +109,16 @@ def test_run_sweep_reuses_stage1_and_recomputes_once_then_restores_files(tmp_pat
 
     stage1_calls: list[str] = []
     stage3_recompute_calls: list[bool] = []
+    use_cache_calls: list[bool] = []
 
     def fake_run_stage1(cfg, sample_id):
+        use_cache_calls.append(cfg.project.use_cache)
         stage1_calls.append(cfg.stage1.feature_extractor.model)
         (sample_dir / "prototype.npz").write_bytes(b"fake-prototype-bytes")
         return sample_dir / "prototype.npz"
 
     def fake_run_stage3(cfg, sample_id):
+        use_cache_calls.append(cfg.project.use_cache)
         stage3_recompute_calls.append(cfg.stage3.recompute_candidate_features)
         det = Detection(frame_idx=0, box=Box(0.0, 0.0, 10.0, 10.0), similarity=0.9, source="detect")
         write_detections({0: [det]}, sample_dir / "detections.json", threshold=0.5)
@@ -135,13 +148,21 @@ def test_run_sweep_reuses_stage1_and_recomputes_once_then_restores_files(tmp_pat
     assert stage3_recompute_calls.count(True) == 1
     assert stage3_recompute_calls.count(False) == 3
 
+    # project.use_cache must be forced False on EVERY run_stage1/run_stage3
+    # call, regardless of a pre-existing prototype.npz/detections.json --
+    # this is the regression test for the real bug found in practice: every
+    # combo silently returning the SAME stale cached detections.json because
+    # use_cache wasn't forced off.
+    assert use_cache_calls and all(v is False for v in use_cache_calls)
+
     # candidates.json was only ever READ, never mutated.
     assert (sample_dir / "candidates.json").read_bytes() == original_candidates_bytes
-    # prototype.npz/detections.json didn't exist before the sweep -- must be
-    # gone afterward (restored to "didn't exist"), not left over from the
-    # last combo that happened to run.
-    assert not (sample_dir / "prototype.npz").exists()
-    assert not (sample_dir / "detections.json").exists()
+    # prototype.npz/detections.json DID pre-exist (seeded above, like a real
+    # work_dir a normal pipeline run already populated) -- must be restored
+    # to that exact original content afterward, not left at whatever the
+    # last combo that ran happened to write.
+    assert (sample_dir / "prototype.npz").read_bytes() == original_prototype_bytes
+    assert (sample_dir / "detections.json").read_bytes() == original_detections_bytes
 
 
 def test_run_sweep_stage1_failure_marks_only_its_own_paired_combos_as_failed(tmp_path):

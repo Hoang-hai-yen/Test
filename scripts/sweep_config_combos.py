@@ -105,6 +105,18 @@ BASELINE_OVERRIDES: dict[str, Any] = {
     "stage3.adaptive_threshold_online_method": "window_stat",
     "stage3.adaptive_threshold_method": "z_score",
     "stage3.adaptive_z_score": 2.0,
+    # project.use_cache defaults to true -- run_stage1/run_stage3 both
+    # short-circuit and return the EXISTING prototype.npz/detections.json
+    # unchanged when one is already on disk (see their own cache-check at
+    # the top of each function), which is exactly what a normal pipeline
+    # run in this SAME work_dir would have left behind. Without forcing
+    # this off, every combo here would silently read back that one
+    # pre-existing file instead of ever actually re-running Stage 1/3 with
+    # its own overrides -- every combo would score identically, which is
+    # what this comment exists to prevent (confirmed to happen in
+    # practice: 3 different z_score combos all returned the exact same
+    # cached detections.json before this override was added).
+    "project.use_cache": False,
 }
 
 # Files a Stage-1-touching combo can mutate in place -- backed up/restored
