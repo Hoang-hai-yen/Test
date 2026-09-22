@@ -17,6 +17,11 @@ Supported models:
              L2-normalized (dino_dim + clip_dim, e.g. 1280 for vitb14/
              vitb16 + vit-b/32) -- see FeatureExtractorConfig.
              ensemble_dino_model.
+  fgclip   — FG-CLIP (base/large), a CLIP variant fine-tuned with ~10M hard
+             fine-grained negative pairs (512/768-d). NOT YET VALIDATED.
+  radio    — NVIDIA RADIO / C-RADIO, a backbone distilled from multiple
+             teacher VFMs at once (DINOv2/v3 + CLIP/SigLIP2 + SAM/SAM3),
+             pooled "summary" embedding. NOT YET VALIDATED.
 
 All extractors return L2-normalized float32 feature vectors.
 """
@@ -469,6 +474,187 @@ class EnsembleFeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
+# FG-CLIP (fine-grained CLIP, hard-negative contrastive training)
+# ---------------------------------------------------------------------------
+
+class FGCLIPFeatureExtractor:
+    """FG-CLIP visual encoder (arXiv:2505.05071) -- vision-only, returns
+    L2-normalized image embeddings.
+
+    Unlike vanilla CLIP/SigLIP (both already in this project, and
+    empirically UNDERPERFORMING DINOv2/DINOv3 on this project's own aerial
+    footage per its own A/B testing), FG-CLIP is fine-tuned with ~10M hard
+    fine-grained negative pairs specifically to separate near-duplicate
+    instances that share a broad category/appearance -- a different
+    failure mode than the broad category-vs-category alignment vanilla
+    CLIP/SigLIP optimize for. Candidate for when the confusers are
+    texturally close to the target (dry leaves, plastic sheeting, white
+    paper) rather than semantically distinct categories.
+
+    NOT YET VALIDATED on this project's own footage.
+    """
+
+    _VARIANT_MAP = {
+        "base":  "qihoo360/fg-clip-base",   # 512-d
+        "large": "qihoo360/fg-clip-large",  # 768-d
+    }
+    _DIMS = {"base": 512, "large": 768}
+
+    def __init__(self, variant: str = "base", device: str = "auto"):
+        if variant not in self._VARIANT_MAP:
+            raise ValueError(f"Unknown FG-CLIP variant '{variant}'. Must be one of {list(self._VARIANT_MAP)}.")
+        self.variant = variant
+        self.device  = _resolve_device(device)
+        self.model, self.processor = self._load(variant)
+        self.model.eval().to(self.device)
+        log.info("FG-CLIP %s on %s  (dim=%d)", variant, self.device, self._dim())
+
+    def _load(self, variant: str):
+        try:
+            from transformers import AutoImageProcessor, AutoModelForCausalLM
+        except ImportError:
+            raise RuntimeError(
+                "transformers not installed. Run: pip install transformers"
+            )
+        hf_name = self._VARIANT_MAP[variant]
+        # FG-CLIP ships custom modeling code (not a stock CLIPModel), so it
+        # needs trust_remote_code -- registered under AutoModelForCausalLM
+        # per the model's own official usage example, despite being used
+        # here purely as a vision encoder (only get_image_features() below
+        # is called, never text generation).
+        processor = AutoImageProcessor.from_pretrained(hf_name)
+        model = AutoModelForCausalLM.from_pretrained(hf_name, trust_remote_code=True)
+        return model, processor
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            pixel_values = self.processor.preprocess(batch_pil, return_tensors="pt")["pixel_values"]
+            pixel_values = pixel_values.to(self.device)
+            feats = self.model.get_image_features(pixel_values)
+            out.append(F.normalize(feats, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._DIMS.get(self.variant, 512)
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
+# RADIO / C-RADIO (NVIDIA multi-teacher distilled hybrid backbone)
+# ---------------------------------------------------------------------------
+
+class RadioFeatureExtractor:
+    """NVIDIA RADIO / C-RADIO (arXiv:2312.06709 AM-RADIO, arXiv:2412.07679
+    RADIOv2.5) -- a single backbone distilled from multiple teacher VFMs at
+    once (DINOv2/DINOv3, CLIP/SigLIP2, SAM/SAM3). Returns the model's
+    pooled "summary" output (CLS-token analog), L2-normalized.
+
+    variant is the torch.hub `version` string, e.g. "c-radio_v3-b"
+    (default -- the smallest C-RADIO tier, closest in scale to this
+    project's DINOv2 ViT-B/14 baseline, NVIDIA Open Model License,
+    commercial use allowed). Plain "radio-*"/"e-radio" checkpoints are
+    released under NSCLv1 (non-commercial only) -- prefer a "c-radio_*"
+    variant for anything beyond research use.
+
+    Output dimension is NOT hardcoded from a static table (unlike the
+    other extractors above) -- NVIDIA's own docs don't publish a clean
+    per-variant summary-dim table, so it's probed once at construction
+    time with a real forward pass instead of risking a wrong guess that
+    would silently corrupt prototype/RMD-score dimensionality downstream.
+
+    NOT YET VALIDATED for retrieval/re-identification -- all published
+    RADIO evidence (vs. single-teacher DINOv2/SAM/CLIP baselines) is from
+    segmentation/classification/VQA benchmarks, not retrieval. Candidate
+    for testing whether SAM's boundary/localization-aware teacher signal,
+    combined with DINOv2/v3's own spatial features, sharpens this
+    project's object-vs-background-clutter embedding.
+    """
+
+    _KNOWN_VERSIONS = (
+        "c-radio_v3-b", "c-radio_v3-l", "c-radio_v3-h", "c-radio_v3-g",
+        "c-radio_v4-so400m", "c-radio_v4-h",
+        "radio-b", "radio-l", "radio-g", "e-radio",
+    )
+    _NON_COMMERCIAL_PREFIXES = ("radio-", "e-radio")
+
+    def __init__(self, variant: str = "c-radio_v3-b", device: str = "auto", image_size: int = 224):
+        if variant not in self._KNOWN_VERSIONS:
+            raise ValueError(f"Unknown RADIO variant '{variant}'. Must be one of {self._KNOWN_VERSIONS}.")
+        if variant.startswith(self._NON_COMMERCIAL_PREFIXES):
+            log.warning(
+                "RADIO variant '%s' is released under NSCLv1 (non-commercial use only) -- "
+                "use a 'c-radio_*' variant instead for commercial deployment.", variant,
+            )
+        self.variant    = variant
+        self.image_size = image_size
+        self.device     = _resolve_device(device)
+        self.model      = torch.hub.load("NVlabs/RADIO", "radio_model", version=variant, progress=True)
+        self.model.eval().to(self.device)
+        self._cached_dim = self._probe_dim()
+        log.info("RADIO %s on %s  (dim=%d)", variant, self.device, self._cached_dim)
+
+    @torch.no_grad()
+    def _probe_dim(self) -> int:
+        dummy = torch.zeros(1, 3, self.image_size, self.image_size, device=self.device)
+        dummy = self._to_supported_resolution(dummy)
+        summary, _ = self.model(dummy)
+        return int(summary.shape[-1])
+
+    def _to_supported_resolution(self, batch: torch.Tensor) -> torch.Tensor:
+        res = self.model.get_nearest_supported_resolution(*batch.shape[-2:])
+        if tuple(res) == tuple(batch.shape[-2:]):
+            return batch
+        return F.interpolate(batch, res, mode="bilinear", align_corners=False)
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        out: list[np.ndarray] = []
+        for i in range(0, len(images), batch_size):
+            batch_imgs = images[i:i+batch_size]
+            tensors = []
+            for im in batch_imgs:
+                pil = _bgr_to_pil(im).resize((self.image_size, self.image_size), Image.BICUBIC)
+                # RADIO expects [0, 1]-range NCHW float tensors and does its
+                # own internal mean/std normalization -- no ImageNet-style
+                # preprocessing here (see NVlabs/RADIO README), just scale.
+                arr = np.array(pil, dtype=np.float32) / 255.0
+                tensors.append(torch.from_numpy(arr.transpose(2, 0, 1).copy()))
+            batch = torch.stack(tensors).to(self.device)
+            batch = self._to_supported_resolution(batch)
+            summary, _ = self.model(batch)
+            out.append(F.normalize(summary, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._cached_dim
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
 # Candidate-crop background masking wrapper (opt-in, stage1.
 # feature_extractor.candidate_background_masking)
 # ---------------------------------------------------------------------------
@@ -630,10 +816,21 @@ def build_feature_extractor(cfg):
             dinov3_pretrain_dataset = fe.dinov3_pretrain_dataset,
             dinov3_kaggle_model_id  = fe.dinov3_kaggle_model_id,
         )
+    elif fe.model == "fgclip":
+        base = FGCLIPFeatureExtractor(
+            variant = fe.fgclip_variant,
+            device  = dev,
+        )
+    elif fe.model == "radio":
+        base = RadioFeatureExtractor(
+            variant    = fe.radio_variant,
+            device     = dev,
+            image_size = fe.image_size,
+        )
     else:
         raise ValueError(
             f"Unknown feature extractor model '{fe.model}'. "
-            "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
+            "Must be 'dinov2', 'dinov3', 'clip', 'siglip', 'ensemble', 'fgclip', or 'radio'."
         )
 
     cbm = fe.candidate_background_masking

@@ -195,7 +195,7 @@ class ProjectionHeadConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
+    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble", "fgclip", "radio"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     # DINOv2 "with registers" (torch.hub dinov2_{variant}_reg / HF
     # facebook/dinov2-with-registers-*): Meta found a handful of patch tokens
@@ -259,6 +259,37 @@ class FeatureExtractorConfig(BaseModel):
     # background clutter (e.g. dry leaves) that DINOv3 alone confuses with
     # the target -- see docs/GECO2_precision_techniques_reference.md.
     ensemble_dino_model: Literal["dinov2", "dinov3"] = "dinov2"
+    # FG-CLIP (arXiv:2505.05071): a CLIP variant fine-tuned with ~10M hard
+    # fine-grained negative pairs, specifically to separate near-duplicate
+    # instances that share a broad category/appearance rather than just
+    # aligning to broad category text -- a different failure mode than
+    # vanilla CLIP/SigLIP above (which this project already found
+    # UNDERPERFORM DINOv2/DINOv3 empirically on its own footage). Candidate
+    # for when the confusers are texturally close to the target (dry
+    # leaves, plastic sheeting, white paper) rather than semantically
+    # distinct. "base" (512-d) or "large" (768-d). Loaded via
+    # transformers.AutoModelForCausalLM(trust_remote_code=True) -- see
+    # FGCLIPFeatureExtractor's own docstring (aero_eyes/models/features.py).
+    # NOT YET VALIDATED on this project's own footage.
+    fgclip_variant: Literal["base", "large"] = "base"
+    # NVIDIA RADIO / C-RADIO (arXiv:2312.06709 AM-RADIO, arXiv:2412.07679
+    # RADIOv2.5): a single backbone distilled from multiple teacher VFMs at
+    # once (DINOv2/DINOv3 + CLIP/SigLIP2 + SAM/SAM3), returning the pooled
+    # "summary" embedding. All published evidence for "the hybrid beats a
+    # single-teacher backbone" is from segmentation/classification/VQA
+    # benchmarks, NOT retrieval/re-identification -- this is an empirical
+    # bet, not a literature-confirmed upgrade, see RadioFeatureExtractor's
+    # own docstring (aero_eyes/models/features.py). Default "c-radio_v3-b"
+    # is the smallest C-RADIO tier (NVIDIA Open Model License, commercial
+    # use allowed) -- closest in scale to this project's DINOv2 ViT-B/14
+    # baseline. "radio-*"/"e-radio" variants are NSCLv1-licensed
+    # (non-commercial only). NOT YET VALIDATED on this project's own
+    # footage.
+    radio_variant: Literal[
+        "c-radio_v3-b", "c-radio_v3-l", "c-radio_v3-h", "c-radio_v3-g",
+        "c-radio_v4-so400m", "c-radio_v4-h",
+        "radio-b", "radio-l", "radio-g", "e-radio",
+    ] = "c-radio_v3-b"
     weights: Optional[str] = None
     image_size: int = 224
     projection_head: ProjectionHeadConfig = ProjectionHeadConfig()

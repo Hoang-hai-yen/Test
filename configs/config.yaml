@@ -105,7 +105,7 @@ stage1:
   crop_to_object: false
   crop_context_margin: 0.5
   feature_extractor:
-    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dino+clip concat, see ensemble_dino_model below)
+    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dino+clip concat, see ensemble_dino_model below) | fgclip | radio
     dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
                               # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
     # "With registers" DINOv2 (dinov2_{variant}_reg on torch.hub / HF
@@ -154,6 +154,22 @@ stage1:
     # leaves) that DINOv3 alone confuses with the target -- see
     # docs/GECO2_precision_techniques_reference.md.
     ensemble_dino_model: dinov2   # dinov2 | dinov3
+    # FG-CLIP (arXiv:2505.05071): CLIP fine-tuned with ~10M hard
+    # fine-grained negative pairs, aimed at separating near-duplicate
+    # instances (not just broad categories) -- a different failure mode
+    # than vanilla CLIP/SigLIP above, which this project already found
+    # UNDERPERFORM DINOv2/DINOv3 empirically on its own footage. Used only
+    # when model=fgclip. NOT YET VALIDATED.
+    fgclip_variant: base     # base (512-d) | large (768-d)
+    # NVIDIA RADIO / C-RADIO (arXiv:2312.06709, arXiv:2412.07679): backbone
+    # distilled from multiple teacher VFMs at once (DINOv2/v3 + CLIP/
+    # SigLIP2 + SAM/SAM3), pooled "summary" embedding. Published evidence
+    # for "hybrid beats single-teacher" is segmentation/classification/VQA
+    # only, NOT retrieval -- an empirical bet, not a literature-confirmed
+    # upgrade. Used only when model=radio. c-radio_* variants are NVIDIA
+    # Open Model License (commercial use allowed); radio-*/e-radio are
+    # NSCLv1 (non-commercial only). NOT YET VALIDATED.
+    radio_variant: c-radio_v3-b   # c-radio_v3-{b,l,h,g} | c-radio_v4-{so400m,h} | radio-{b,l,g} | e-radio
     weights: null            # null = load from torch.hub / hf
     image_size: 224
     # Optional small trained head on top of the frozen backbone above (see
