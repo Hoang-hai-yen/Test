@@ -1000,6 +1000,14 @@ class GeCo2DynamicPrototypeTracker:
         self._n_cross_check_rejected = 0
         self._n_appended = 0
         self._n_frozen_rejected = 0  # dynamic_prototype.freeze_when_full -- see log_summary()
+        # dynamic_prototype.interval_window_enabled (opt-in, offer() only --
+        # see Geco2DynamicPrototypeConfig.interval_window_enabled's own
+        # docstring and _commit_or_buffer's below). _pending_window holds
+        # (score, new_tokens, frame_bgr, confirmed, frame_idx, source_label)
+        # tuples buffered since the last commit.
+        self._pending_window: list[tuple] = []
+        self._n_offers_since_commit = 0
+        self._n_window_discarded = 0  # candidates buffered but NOT the window's best -- see log_summary()
         # dynamic_prototype.topk_fusion (opt-in, offer_topk() only -- see
         # that method's own docstring): running Z-score baselines + its own
         # diagnostic counters, separate from the generic ones above so
@@ -1141,17 +1149,85 @@ class GeCo2DynamicPrototypeTracker:
             )
             return
 
+        self._commit_or_buffer(
+            new_tokens, sim, frame_bgr, confirmed, frame_idx,
+            f"cross_check_sim={sim:.3f}, source={self.dp_cfg.cross_check_source}",
+        )
+
+    def _commit_or_buffer(
+        self, new_tokens: dict, score: float, frame_bgr: np.ndarray, confirmed: Box,
+        frame_idx: int | None, log_label: str,
+    ) -> None:
+        """Shared append/evict path for offer() once a candidate has
+        cleared both gates (consecutive-hits + cross-check) AND
+        freeze_when_full -- see Geco2DynamicPrototypeConfig.
+        interval_window_enabled's own docstring (aero_eyes/config.py).
+
+        SCOPE NOTE: only offer() routes through this method. offer_topk()
+        and _offer_topk_cluster() still append immediately (their own
+        inline append blocks, unchanged) -- they have additional
+        interacting side effects (topk_fusion's running Z-score history,
+        cluster_verification's own bookkeeping) that need separate design
+        before the same buffering pattern can be safely layered on top of
+        them. interval_window_enabled currently has NO effect on those two
+        paths.
+
+        interval_window_enabled=False (default): identical to the
+        append-immediately behavior this project had before this option
+        existed.
+
+        interval_window_enabled=True: buffers (score, new_tokens, ...)
+        instead of appending. Once interval_window_frames offers have been
+        buffered since the last commit, commits ONLY the single
+        best-scoring one and discards the rest of the window.
+        """
+        if not self.dp_cfg.interval_window_enabled:
+            self._append_token(new_tokens)
+            self._save_debug_viz(frame_bgr, confirmed, frame_idx, log_label)
+            log.info(
+                "[Stage123-GeCo2] %s: dynamic_prototype appended a token (frame=%s, %s) -- "
+                "%d/%d dynamic token(s) active",
+                self.sample_id, frame_idx, log_label,
+                len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+            )
+            return
+
+        self._pending_window.append((score, new_tokens, frame_bgr, confirmed, frame_idx, log_label))
+        self._n_offers_since_commit += 1
+        if self._n_offers_since_commit < self.dp_cfg.interval_window_frames:
+            log.debug(
+                "[Stage123-GeCo2] %s: dynamic_prototype buffered a gate-passing candidate "
+                "(frame=%s, %s) -- %d/%d offers into current interval window",
+                self.sample_id, frame_idx, log_label,
+                self._n_offers_since_commit, self.dp_cfg.interval_window_frames,
+            )
+            return
+
+        best_score, best_tokens, best_frame, best_confirmed, best_frame_idx, best_label = max(
+            self._pending_window, key=lambda item: item[0],
+        )
+        discarded = len(self._pending_window) - 1
+        self._n_window_discarded += discarded
+        self._pending_window = []
+        self._n_offers_since_commit = 0
+        self._append_token(best_tokens)
+        self._save_debug_viz(best_frame, best_confirmed, best_frame_idx, f"{best_label} (best-of-window)")
+        log.info(
+            "[Stage123-GeCo2] %s: dynamic_prototype interval window closed -- committed best "
+            "candidate (frame=%s, %s, score=%.3f), discarded %d other gate-passing candidate(s) -- "
+            "%d/%d dynamic token(s) active",
+            self.sample_id, best_frame_idx, best_label, best_score, discarded,
+            len(self._dynamic_tokens), self.dp_cfg.max_tokens,
+        )
+
+    def _append_token(self, new_tokens: dict) -> None:
+        """Unconditional FIFO append + evict -- freeze_when_full is checked
+        by the CALLER before ever reaching _commit_or_buffer, so this never
+        needs to re-check it."""
         self._n_appended += 1
         self._dynamic_tokens.append(new_tokens)
         if len(self._dynamic_tokens) > self.dp_cfg.max_tokens:
             self._dynamic_tokens.pop(0)  # FIFO: oldest APPENDED token only, originals never evicted
-        self._save_debug_viz(frame_bgr, confirmed, frame_idx, f"cross_check_sim={sim:.3f}")
-        log.info(
-            "[Stage123-GeCo2] %s: dynamic_prototype appended a token (frame=%s, cross_check "
-            "sim=%.3f, source=%s) -- %d/%d dynamic token(s) active",
-            self.sample_id, frame_idx, sim, self.dp_cfg.cross_check_source,
-            len(self._dynamic_tokens), self.dp_cfg.max_tokens,
-        )
 
     def offer_topk(self, frame_bgr: np.ndarray, boxes: list[Box], feats: np.ndarray, frame_idx: int | None = None) -> None:
         """stage123_geco2.dynamic_prototype.topk_fusion (opt-in) -- ONLY
@@ -1515,6 +1591,13 @@ class GeCo2DynamicPrototypeTracker:
             self._n_cross_check_rejected, self._n_frozen_rejected, self._n_appended,
             len(self._dynamic_tokens), self.dp_cfg.max_tokens,
         )
+        if self.dp_cfg.interval_window_enabled:
+            log.info(
+                "[Stage123-GeCo2] %s: dynamic_prototype interval_window summary -- %d "
+                "candidate(s) discarded (buffered but not the best in their window), "
+                "%d gate-passing candidate(s) still buffered in an unclosed window at end of run",
+                self.sample_id, self._n_window_discarded, len(self._pending_window),
+            )
         if self.dp_cfg.topk_fusion.enabled and self._n_topk_offers > 0:
             log.info(
                 "[Stage123-GeCo2] %s: dynamic_prototype topk_fusion summary -- %d offer_topk() "

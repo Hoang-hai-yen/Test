@@ -70,6 +70,46 @@ def _bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
 
+def _ensure_transformers_onnx_shim() -> None:
+    """FG-CLIP's own remote code (qihoo360/fg-clip-*'s modeling_clip.py,
+    executed via trust_remote_code=True) does `from transformers.onnx
+    import OnnxConfig` at import time -- a module removed from recent
+    transformers releases (ONNX export tooling moved to the separate
+    `optimum` package), causing a hard ModuleNotFoundError before
+    FGCLIPFeatureExtractor ever gets a chance to run, independent of
+    anything in THIS project. OnnxConfig is only referenced there for
+    legacy/typing purposes and is never actually instantiated for a
+    vision-only forward pass (get_image_features()), so a minimal stub
+    class satisfies the import without needing to downgrade transformers
+    itself (which risks breaking DINOv3/SigLIP2's own from_pretrained calls
+    elsewhere in this file that may need a newer version). No-op if
+    transformers.onnx already imports fine AND exposes OnnxConfig (older
+    transformers installs, or a future release that restores it) -- never
+    overrides a real module.
+
+    Checks sys.modules directly rather than relying solely on a bare
+    `import transformers.onnx` statement's own ImportError -- transformers'
+    top-level package uses a lazy-module system whose submodule resolution
+    does not reliably short-circuit via sys.modules the way a plain
+    package's would, making a bare import statement alone unpredictable to
+    reason about (and to test) across transformers versions.
+    """
+    import sys
+    existing = sys.modules.get("transformers.onnx")
+    if existing is not None and hasattr(existing, "OnnxConfig"):
+        return
+    try:
+        import transformers.onnx as real_onnx
+        if hasattr(real_onnx, "OnnxConfig"):
+            return
+    except ImportError:
+        pass
+    import types
+    shim = types.ModuleType("transformers.onnx")
+    shim.OnnxConfig = type("OnnxConfig", (), {})
+    sys.modules["transformers.onnx"] = shim
+
+
 # ---------------------------------------------------------------------------
 # Multi-scale attention-weighted pooling (pooling="multiscale_attn", shared
 # between DINOv2FeatureExtractor and DINOv3FeatureExtractor)
@@ -726,6 +766,7 @@ class FGCLIPFeatureExtractor:
             raise RuntimeError(
                 "transformers not installed. Run: pip install transformers"
             )
+        _ensure_transformers_onnx_shim()
         hf_name = self._VARIANT_MAP[variant]
         # FG-CLIP ships custom modeling code (not a stock CLIPModel), so it
         # needs trust_remote_code -- registered under AutoModelForCausalLM

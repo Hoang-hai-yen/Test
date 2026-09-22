@@ -47,6 +47,8 @@ def _make_cfg(
         cross_check_threshold=0.5,
         cross_check_threshold_self_calibrate=False,
         cross_check_threshold_self_calibrate_ratio=0.7,
+        interval_window_enabled=False,
+        interval_window_frames=8,
         topk_fusion=SimpleNamespace(**tk_defaults),
         cluster_verification=SimpleNamespace(**cv_defaults),
         margin_verification=SimpleNamespace(**mv_defaults),
@@ -814,3 +816,92 @@ def test_offer_skips_debug_viz_when_disabled(tmp_path):
     tracker.offer(frame, box, frame_idx=42)
 
     assert not (tmp_path / "viz" / "dynamic_prototype").exists()
+
+
+# ---------------------------------------------------------------------------
+# interval_window_enabled (offer() only -- see _commit_or_buffer's own
+# docstring for the offer_topk()/cluster_verification scope limitation)
+# ---------------------------------------------------------------------------
+
+def test_offer_interval_window_buffers_until_full():
+    cfg = _make_cfg(
+        min_consecutive_hits=1, cross_check_threshold=0.0,
+        interval_window_enabled=True, interval_window_frames=3,
+    )
+    detector = _FakeDetector()
+    tracker = _make_tracker(cfg, detector=detector)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 0.5
+    frame = np.zeros((10, 10, 3), dtype=np.uint8)
+    box = Box(10, 10, 20, 20, score=0.9)
+
+    tracker.offer(frame, box)
+    tracker.offer(frame, box)
+    assert tracker.dynamic_token_count() == 0, "window not closed yet -- nothing committed"
+    assert tracker._n_appended == 0
+    assert len(tracker._pending_window) == 2
+
+    tracker.offer(frame, box)  # 3rd offer closes the window (interval_window_frames=3)
+    assert tracker.dynamic_token_count() == 1
+    assert tracker._n_appended == 1
+    assert len(tracker._pending_window) == 0
+
+
+def test_offer_interval_window_commits_only_the_best_scoring_candidate():
+    cfg = _make_cfg(
+        min_consecutive_hits=1, cross_check_threshold=0.0,
+        interval_window_enabled=True, interval_window_frames=3,
+    )
+    detector = _FakeDetector()
+    base = _token_set(value=0.0)
+    tracker = _make_tracker(cfg, detector=detector, base_prototype=base)
+    sims = iter([0.3, 0.9, 0.5])  # 2nd offer (token value=11.0) has the best sim
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: next(sims)
+    frame = np.zeros((10, 10, 3), dtype=np.uint8)
+    box = Box(10, 10, 20, 20, score=0.9)
+
+    for _ in range(3):
+        tracker.offer(frame, box)
+
+    eff = tracker.effective_prototype()
+    assert eff["main"].shape[1] == 2  # base + only the single committed token
+    assert eff["main"][0, 1].tolist() == [11.0, 11.0, 11.0, 11.0]  # 2nd offer's token, best sim=0.9
+    assert tracker._n_window_discarded == 2
+
+
+def test_offer_interval_window_disabled_appends_immediately():
+    cfg = _make_cfg(min_consecutive_hits=1, cross_check_threshold=0.5, interval_window_enabled=False)
+    detector = _FakeDetector()
+    tracker = _make_tracker(cfg, detector=detector)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 0.8
+    box = Box(10, 10, 20, 20, score=0.9)
+    tracker.offer(np.zeros((10, 10, 3), dtype=np.uint8), box)
+    assert tracker.dynamic_token_count() == 1
+    assert tracker._n_window_discarded == 0
+
+
+def test_offer_interval_window_respects_freeze_when_full_before_buffering():
+    """freeze_when_full must still gate BEFORE a candidate ever reaches the
+    interval window -- a frozen-out candidate must not consume a window slot."""
+    cfg = _make_cfg(
+        min_consecutive_hits=1, cross_check_threshold=0.0, max_tokens=1, freeze_when_full=True,
+        interval_window_enabled=True, interval_window_frames=2,
+    )
+    detector = _FakeDetector()
+    tracker = _make_tracker(cfg, detector=detector)
+    tracker._feature_extractor_similarity = lambda frame_bgr, box, precomputed_feature=None: 1.0
+    frame = np.zeros((10, 10, 3), dtype=np.uint8)
+    box = Box(10, 10, 20, 20, score=0.9)
+
+    tracker.offer(frame, box)  # buffered (1/2)
+    tracker.offer(frame, box)  # window closes -> commits -> 1 slot now full (max_tokens=1)
+    assert tracker.dynamic_token_count() == 1
+
+    tracker.offer(frame, box)  # freeze_when_full must reject BEFORE ever buffering
+    assert len(tracker._pending_window) == 0
+    assert tracker._n_frozen_rejected == 1
+
+
+def test_log_summary_with_interval_window_does_not_raise():
+    cfg = _make_cfg(interval_window_enabled=True)
+    tracker = _make_tracker(cfg)
+    tracker.log_summary()

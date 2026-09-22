@@ -233,7 +233,21 @@ stage1:
       center_fallback_ratio: 0.75
   prototype:
     # How the 3 per-reference feature sets are fused.
-    fusion: mean             # mean | max | concat_then_pca
+    # mean (default) | max | concat_then_pca (literature favors this for
+    # COMPLEMENTARY views, weaker fit + statistically unstable for 3
+    # near-duplicate close-ups -- see prototype-building research report) |
+    # agreement_weighted (NOT YET VALIDATED -- BD-CSPN-style, arXiv:1911.10713
+    # Eq. 5-6: self-referential softmax reweighting that automatically
+    # downweights an outlier reference using only the references themselves,
+    # combined multiplicatively with the existing mask-area weight. Real
+    # risk at only 3 points: the softmax could overfit to noise -- watch for
+    # this on your own footage).
+    fusion: mean             # mean | max | concat_then_pca | agreement_weighted
+    # Softmax temperature for fusion=agreement_weighted -- no canonical value
+    # found in literature, needs tuning. Higher = more aggressive outlier
+    # downweighting (higher overfitting risk at only 3 refs); 0 = equal
+    # weights (reduces to mask-area-weighted mean).
+    agreement_weighted_epsilon: 10.0
     l2_normalize: true
     cache_name: prototype.npz
   # Degrade reference images (shrink-then-upscale + optional blur) to look
@@ -258,6 +272,19 @@ stage1:
     enabled: false
     num_sample_frames: 5
     strength: 0.3   # 0 = no change, 1 = fully replaced by the video's own mean embedding
+    # NOT YET VALIDATED -- false (default): sample frames are chosen by
+    # plain np.linspace with no awareness of whether they contain the
+    # target object itself, risking contamination of "video_domain_mean"
+    # with object-identity signal (COSOC, arXiv:2107.07746) instead of pure
+    # scene/lighting/compression style. true: oversample a pool of
+    # num_sample_frames * filter_pool_multiplier candidates, score each
+    # against the (pre-domain-calibration) fused prototype, keep only the
+    # num_sample_frames LEAST target-similar ones -- deliberately no
+    # hand-set absolute threshold, since no single cutoff generalizes
+    # across this project's videos (see baseline scale-calibration docs for
+    # the same lesson learned elsewhere).
+    filter_target_like_frames: false
+    filter_pool_multiplier: 3
 
 # ----------------------------------------------------------------------------
 # STAGE 2 — Candidate generation (per keyframe)
@@ -1074,6 +1101,17 @@ stage123_geco2:
     # for the equivalent there).
     cross_check_threshold_self_calibrate: false
     cross_check_threshold_self_calibrate_ratio: 0.7
+    # NOT YET VALIDATED, offer() only (does not yet cover offer_topk()/
+    # cluster_verification's own accept paths). false (default): a
+    # candidate that clears both gates is appended IMMEDIATELY. true:
+    # STARK/MixFormer-style batched commit -- gate-passing candidates are
+    # buffered instead, and every interval_window_frames offers, only the
+    # SINGLE BEST-scoring buffered candidate is actually appended, the rest
+    # of that window discarded. Addresses a gap vs. SOT tracking literature:
+    # a gate alone can't catch a confidently-wrong confuser, since it's
+    # scored on the SAME similarity signal used to match.
+    interval_window_enabled: false
+    interval_window_frames: 8
     # Opt-in second full sweep over the video after pass 1 finishes. Pass 1
     # runs as described above; if it accepted >=1 dynamic token, pass 2
     # re-detects every keyframe from frame 1 again using that FINAL

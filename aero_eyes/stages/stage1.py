@@ -23,6 +23,100 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _mask_area_weights(masks: list[np.ndarray]) -> np.ndarray:
+    """Weight each ref by its own mask's foreground area ratio -- a ref
+    whose segmenter mask covers more of the frame is (empirically) a more
+    confident/reliable segmentation, less likely to have background
+    bleeding into what was measured as "the object"."""
+    weights = np.array([m.sum() / m.size + 1e-4 for m in masks])
+    return weights / weights.sum()
+
+
+def fuse_prototype(
+    per_ref_array: np.ndarray, masks: list[np.ndarray], fusion: str,
+    agreement_weighted_epsilon: float = 10.0,
+) -> np.ndarray:
+    """Combine per_ref_array [num_refs, D] (one feature vector per
+    reference image) into a single prototype vector, per
+    stage1.prototype.fusion. Pulled out of run_stage1 as a standalone,
+    array-only function so it's unit-testable without mocking the whole
+    Stage 1 pipeline (segmentation/feature-extraction/video I/O).
+    """
+    if fusion == "mean":
+        weights = _mask_area_weights(masks)
+        log.info("mask-area-weighted fusion, weights=%s", weights)
+        return np.average(per_ref_array, axis=0, weights=weights)
+    elif fusion == "max":
+        return per_ref_array.max(axis=0)
+    elif fusion == "concat_then_pca":
+        # Simple PCA reduction to the per-ref feature dimension
+        from sklearn.decomposition import PCA  # type: ignore
+        n_components = per_ref_array.shape[1]
+        pca = PCA(n_components=min(n_components, per_ref_array.shape[0]))
+        pca.fit(per_ref_array)
+        return pca.components_[0]
+    elif fusion == "agreement_weighted":
+        # BD-CSPN-style (Liu et al., ECCV 2020, arXiv:1911.10713 Eq. 5-6)
+        # self-referential softmax reweighting -- see PrototypeConfig.
+        # fusion's own docstring (aero_eyes/config.py) for the full
+        # rationale. Combined MULTIPLICATIVELY with the mask-area weight
+        # above, not as a replacement for it.
+        mask_weights = _mask_area_weights(masks)
+        row_norms = np.linalg.norm(per_ref_array, axis=1, keepdims=True).clip(min=1e-8)
+        unit_refs = per_ref_array / row_norms
+        mean_dir = np.average(unit_refs, axis=0, weights=mask_weights)
+        mean_dir = mean_dir / max(np.linalg.norm(mean_dir), 1e-8)
+        agreement = unit_refs @ mean_dir  # cosine sim of each ref to the mask-weighted mean direction
+        logits = agreement_weighted_epsilon * agreement
+        agree_weights = np.exp(logits - logits.max())  # numerically stable softmax
+        agree_weights = agree_weights / agree_weights.sum()
+        combined_weights = mask_weights * agree_weights
+        combined_weights = combined_weights / combined_weights.sum()
+        log.info(
+            "agreement-weighted fusion, mask_w=%s agreement_w=%s combined_w=%s",
+            mask_weights, agree_weights, combined_weights,
+        )
+        return np.average(per_ref_array, axis=0, weights=combined_weights)
+    else:
+        raise ValueError(f"Unknown fusion method '{fusion}'")
+
+
+def select_calibration_frames(
+    pool_idxs: list[int], pool_frames: list, pool_feats: np.ndarray,
+    prototype: np.ndarray, n: int,
+) -> tuple[list[int], list]:
+    """Pick the n LEAST target-similar frames from a larger candidate pool,
+    for domain_calibration.filter_target_like_frames -- see
+    DinoDomainCalibrationConfig.filter_target_like_frames's own docstring
+    (aero_eyes/config.py) for the rationale (avoid contaminating
+    "video_domain_mean" with the target object's own identity).
+
+    Deliberately rank-based (pick the n lowest similarities) rather than a
+    hand-set absolute similarity threshold -- no single cutoff generalizes
+    across this project's very different videos/objects. Returns
+    (kept_idxs, kept_frames), both length min(n, len(pool_idxs)), in
+    ASCENDING frame-index order (same convention as the unfiltered path's
+    sorted(set(...)) sampling).
+
+    Pure array/list function (no video I/O) so it's unit-testable directly.
+    """
+    proto_norm = prototype / max(np.linalg.norm(prototype), 1e-8)
+    feat_norms = np.linalg.norm(pool_feats, axis=1, keepdims=True).clip(min=1e-8)
+    unit_feats = pool_feats / feat_norms
+    target_sims = unit_feats @ proto_norm
+    keep_n = min(n, len(pool_idxs))
+    order = np.argsort(target_sims)  # ascending: least target-like first
+    keep_positions = sorted(order[:keep_n].tolist())
+    kept_idxs = [pool_idxs[p] for p in keep_positions]
+    kept_frames = [pool_frames[p] for p in keep_positions]
+    log.info(
+        "domain_calibration frame filter kept %d/%d pool frames (lowest target-similarity), "
+        "sims kept=%s", len(kept_idxs), len(pool_idxs),
+        np.round(target_sims[keep_positions], 3).tolist(),
+    )
+    return kept_idxs, kept_frames
+
+
 def _apply_aerial_sim(img: np.ndarray, downscale_factor: float, blur_ksize: int) -> np.ndarray:
     """Degrade a reference image toward what a distant aerial camera would
     capture: shrink-then-upscale to destroy fine detail, optionally followed
@@ -204,29 +298,9 @@ def run_stage1(cfg, sample_id: str) -> Path:
 
     # ---- 5. Fuse prototype ----
     fusion = cfg.stage1.prototype.fusion
-    if fusion == "mean":
-        # Weight each ref's contribution by its own mask's foreground area
-        # ratio instead of a plain unweighted mean -- a ref whose segmenter
-        # mask covers more of the frame is (empirically) a more confident/
-        # reliable segmentation, less likely to have background bleeding
-        # into what was measured as "the object", so it should count for
-        # more when fusing the 3 refs into one prototype.
-        weights = np.array([m.sum() / m.size + 1e-4 for m in masks])
-        weights = weights / weights.sum()
-        log.info("[Stage1] %s: mask-area-weighted fusion, weights=%s", sample_id, weights)
-        prototype = np.average(per_ref_array, axis=0, weights=weights)
-    elif fusion == "max":
-        prototype = per_ref_array.max(axis=0)
-    elif fusion == "concat_then_pca":
-        flat = per_ref_array.reshape(1, -1).squeeze()
-        # Simple PCA reduction to the per-ref feature dimension
-        from sklearn.decomposition import PCA  # type: ignore
-        n_components = per_ref_array.shape[1]
-        pca = PCA(n_components=min(n_components, per_ref_array.shape[0]))
-        pca.fit(per_ref_array)
-        prototype = pca.components_[0]
-    else:
-        raise ValueError(f"Unknown fusion method '{fusion}'")
+    prototype = fuse_prototype(
+        per_ref_array, masks, fusion, cfg.stage1.prototype.agreement_weighted_epsilon,
+    )
 
     if cfg.stage1.prototype.l2_normalize:
         norm = np.linalg.norm(prototype)
@@ -259,8 +333,18 @@ def run_stage1(cfg, sample_id: str) -> Path:
         info = video_info(video_path)
         total_frames = info["total_frames"]
         n = max(1, min(dc_cfg.num_sample_frames, total_frames))
-        sample_idxs = sorted(set(np.linspace(0, max(total_frames - 1, 0), num=n).astype(int).tolist()))
-        sample_frames = [read_frame(video_path, i) for i in sample_idxs]
+
+        if dc_cfg.filter_target_like_frames:
+            pool_n = max(n, min(total_frames, n * dc_cfg.filter_pool_multiplier))
+            pool_idxs = sorted(set(np.linspace(0, max(total_frames - 1, 0), num=pool_n).astype(int).tolist()))
+            pool_frames = [read_frame(video_path, i) for i in pool_idxs]
+            pool_feats = extractor.extract(pool_frames, batch_size=cfg.runtime.batch_size)
+            sample_idxs, sample_frames = select_calibration_frames(
+                pool_idxs, pool_frames, pool_feats, prototype, n,
+            )
+        else:
+            sample_idxs = sorted(set(np.linspace(0, max(total_frames - 1, 0), num=n).astype(int).tolist()))
+            sample_frames = [read_frame(video_path, i) for i in sample_idxs]
 
         frame_feats = extractor.extract(sample_frames, batch_size=cfg.runtime.batch_size)
         video_domain_mean = frame_feats.mean(axis=0)

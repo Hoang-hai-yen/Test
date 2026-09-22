@@ -15,6 +15,54 @@ from aero_eyes.models import features as features_mod
 
 
 # ---------------------------------------------------------------------------
+# transformers.onnx compatibility shim (FG-CLIP's own remote code imports
+# it; removed from recent transformers releases -- see
+# _ensure_transformers_onnx_shim's own docstring)
+# ---------------------------------------------------------------------------
+
+def test_onnx_shim_installs_stub_when_real_module_missing(monkeypatch):
+    import sys
+
+    # Simulate this project's actual bug report: no working transformers.onnx
+    # at all (neither already cached in sys.modules nor freshly importable).
+    monkeypatch.delitem(sys.modules, "transformers.onnx", raising=False)
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "transformers.onnx" or name.startswith("transformers.onnx"):
+            raise ImportError("simulated: transformers.onnx removed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    features_mod._ensure_transformers_onnx_shim()
+    monkeypatch.setattr(builtins, "__import__", real_import)
+
+    assert "transformers.onnx" in sys.modules
+    assert hasattr(sys.modules["transformers.onnx"], "OnnxConfig")
+    # Actual `from transformers.onnx import OnnxConfig` must now succeed.
+    from transformers.onnx import OnnxConfig  # noqa: F401
+
+    # Cleanup -- must not leak this stub into other tests' sys.modules state.
+    monkeypatch.delitem(sys.modules, "transformers.onnx", raising=False)
+
+
+def test_onnx_shim_noop_when_already_cached_with_onnxconfig(monkeypatch):
+    import sys
+    import types
+
+    fake_real_module = types.ModuleType("transformers.onnx")
+    fake_real_module.OnnxConfig = "real_sentinel"
+    monkeypatch.setitem(sys.modules, "transformers.onnx", fake_real_module)
+
+    features_mod._ensure_transformers_onnx_shim()
+
+    assert sys.modules["transformers.onnx"].OnnxConfig == "real_sentinel", (
+        "must not overwrite an sys.modules entry that already has OnnxConfig"
+    )
+
+
+# ---------------------------------------------------------------------------
 # FG-CLIP
 # ---------------------------------------------------------------------------
 

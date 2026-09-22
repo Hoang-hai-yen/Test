@@ -339,7 +339,42 @@ class FeatureExtractorConfig(BaseModel):
 
 
 class PrototypeConfig(BaseModel):
-    fusion: Literal["mean", "max", "concat_then_pca"] = "mean"
+    # "mean" (default): mask-area-weighted average of the num_references
+    # per-ref feature vectors -- see run_stage1's own fusion comment.
+    # "max": elementwise max across refs.
+    # "concat_then_pca": flatten+concat all refs, take the first principal
+    # component -- literature precedent favors this for COMPLEMENTARY views
+    # (different scale/angle/modality), a weaker fit for near-duplicate
+    # close-up photos of one object, and PCA on only num_references data
+    # points is statistically unstable (rank-deficient) -- see prototype-
+    # building research notes/report for the caveat.
+    # "agreement_weighted": NOT YET VALIDATED -- BD-CSPN-style (Liu et al.,
+    # ECCV 2020, arXiv:1911.10713 Eq. 5-6) self-referential softmax
+    # reweighting: each ref is scored by cosine similarity to the mask-
+    # weighted mean of all refs, then re-weighted by
+    # softmax(agreement_weighted_epsilon * that similarity) -- an outlier
+    # reference (dissimilar to the consensus of the others) automatically
+    # gets a smaller weight, using ONLY the num_references reference images
+    # themselves (no query/target-domain data -- that role is already
+    # covered by domain_calibration below). Combined MULTIPLICATIVELY with
+    # the existing mask-area confidence weight (segmentation confidence and
+    # cross-reference agreement are different, complementary signals).
+    # Theoretical literature basis: mean-pooling's gap vs. a corrected
+    # prototype is LARGEST at small K (few-shot theory + BD-CSPN's own
+    # reported deltas shrink from 1-shot to 5-shot) -- see prototype-
+    # building research notes for the K=3 extrapolation and its caveats
+    # (a real risk at only 3 points: the self-weighting softmax could
+    # overfit to noise and aggressively down-weight a genuinely good
+    # reference by chance -- untested, watch for this on your own footage).
+    fusion: Literal["mean", "max", "concat_then_pca", "agreement_weighted"] = "mean"
+    # Softmax temperature (epsilon in BD-CSPN's Eq. 5-6) for
+    # fusion="agreement_weighted" -- no canonical value was found in the
+    # literature for this project's own embedding space, so this needs
+    # tuning: higher = more aggressively downweights an outlier ref (higher
+    # risk of overfitting to noise at num_references=3), lower = closer to
+    # plain mean-pooling (an epsilon of 0 makes every weight equal,
+    # reducing to mask-area-weighted mean exactly).
+    agreement_weighted_epsilon: float = 10.0
     l2_normalize: bool = True
     cache_name: str = "prototype.npz"
 
@@ -379,6 +414,25 @@ class DinoDomainCalibrationConfig(BaseModel):
     # embedding (almost certainly too aggressive -- the object's own
     # identity would be washed out by generic background/scene content).
     strength: float = 0.3
+    # NOT YET VALIDATED -- false (default): num_sample_frames frame indices
+    # are chosen by plain np.linspace across the whole video, with no
+    # awareness of whether the sampled frame happens to contain the target
+    # object itself. If it does, "video_domain_mean" is contaminated with
+    # object-identity signal instead of purely scene/lighting/compression
+    # style -- the exact risk COSOC (NeurIPS 2021, arXiv:2107.07746) flags
+    # for background-vs-foreground statistics estimated from mixed frames
+    # -- see prototype-building research notes for the full citation.
+    # true: oversamples a candidate pool of num_sample_frames *
+    # filter_pool_multiplier frames (still evenly spaced via np.linspace),
+    # scores each against the (pre-domain-calibration) fused prototype, and
+    # keeps only the num_sample_frames LEAST target-similar ones --
+    # deliberately avoiding a hand-set absolute similarity threshold (no
+    # single cutoff generalizes across this project's very different
+    # videos/objects -- see docs/GECO2_baseline_scale_calibration_results*.md
+    # for the same lesson learned about hand-set constants elsewhere in
+    # this pipeline).
+    filter_target_like_frames: bool = False
+    filter_pool_multiplier: int = 3
 
 
 class Stage1Config(BaseModel):
@@ -2325,6 +2379,25 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     # topk_fusion for the equivalent there).
     cross_check_threshold_self_calibrate: bool = False
     cross_check_threshold_self_calibrate_ratio: float = 0.7
+    # NOT YET VALIDATED, offer() only (does not yet affect offer_topk()/
+    # cluster_verification's own accept paths -- see this field's own scope
+    # note in GeCo2DynamicPrototypeTracker._commit_or_buffer's docstring).
+    # false (default): a candidate that clears BOTH gates (consecutive-hits
+    # + cross-check) is appended IMMEDIATELY, one commit per gate-pass --
+    # SOT tracking literature (STARK, MixFormer) consistently pairs a gate
+    # like this with a SECOND, independent safeguard this project's tracker
+    # was missing: an update INTERVAL, so a single gate-passing candidate
+    # (which, by construction, already scored well on the SAME similarity
+    # signal used to match -- i.e. a confidently-wrong confuser looks
+    # identical to a genuine match from the gate's point of view) can't
+    # immediately mutate the token sequence on its own.
+    # true: gate-passing candidates are buffered instead of committed
+    # immediately; every interval_window_frames offers, only the SINGLE
+    # BEST-scoring buffered candidate (by its own cross-check score) is
+    # actually appended, and the rest of that window is discarded --
+    # STARK/MixFormer-style batched "best-of-window" commit.
+    interval_window_enabled: bool = False
+    interval_window_frames: int = 8
     # Opt-in second full sweep over the video after pass 1 finishes: pass 1
     # runs exactly as described above (online accumulation via offer()),
     # and if it accepted at least one dynamic token, pass 2 re-detects
