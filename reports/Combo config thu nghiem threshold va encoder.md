@@ -146,16 +146,28 @@ stage1:
     fusion: agreement_weighted
     agreement_weighted_epsilon: 10.0   # cao hơn = downweight outlier mạnh hơn, dễ overfit vì chỉ có 3 ref
 
-# P2 — filter_target_like_frames: pool frame lớn hơn cho domain_calibration,
-# giữ N frame ÍT giống target nhất thay vì random/đều -- tránh contamination
+# P2a — domain_calibration BẬT nhưng KHÔNG dùng smart filter (mặc định khi
+# enabled=true: chọn frame đều bằng np.linspace, không quan tâm frame đó có
+# giống target hay không) -- điểm đối chứng để tách "domain_calibration tự nó
+# có giúp không" khỏi "smart filter ở P2 có giúp thêm không"
 stage1:
   domain_calibration:
+    enabled: true
+
+# P2 — filter_target_like_frames: pool frame lớn hơn cho domain_calibration,
+# giữ N frame ÍT giống target nhất thay vì random/đều -- tránh contamination.
+# BẮT BUỘC domain_calibration.enabled: true đi kèm -- filter_target_like_frames
+# chỉ được đọc BÊN TRONG khối `if dc_cfg.enabled` (aero_eyes/stages/stage1.py),
+# thiếu enabled=true thì field này hoàn toàn vô tác dụng (no-op).
+stage1:
+  domain_calibration:
+    enabled: true
     filter_target_like_frames: true
 
-# P3 — combo P1+P2
+# P3 — combo P1+P2 (cũng cần enabled: true, cùng lý do như P2)
 stage1:
   prototype: { fusion: agreement_weighted }
-  domain_calibration: { filter_target_like_frames: true }
+  domain_calibration: { enabled: true, filter_target_like_frames: true }
 
 # P4 — aerial_sim: giả lập domain gap (ảnh ref cận cảnh -> giống góc nhìn xa
 # của drone hơn) bằng cách shrink-rồi-upscale ảnh reference trước khi encode.
@@ -417,7 +429,7 @@ stage123_geco2:
 pipeline: { detector: geco2 }
 stage1:
   prototype: { fusion: agreement_weighted }
-  domain_calibration: { filter_target_like_frames: true }
+  domain_calibration: { enabled: true, filter_target_like_frames: true }   # enabled bắt buộc, xem lưu ý ở P2
 stage123_geco2:
   dynamic_prototype: { enabled: true, interval_window_enabled: true }
 ```
@@ -428,7 +440,7 @@ stage123_geco2:
 
 1. **O1 (baseline, đã có)** → xác nhận lại số trên chính sample đang test.
 2. **E1a** (1 dòng, rẻ) → đo, rồi **E1b** (thêm domain pretrain) → so trực tiếp với E1a.
-3. **P3** (P1+P2, rẻ, độc lập) → đo. **P4** (aerial_sim), **P5** (background_mode), **P6/P7** (crop_to_object x margin) đo riêng từng cái, không chồng với P3 trong cùng 1 lần.
+3. **P2a** (domain_calibration bật, chưa filter) → **P3** (P1+P2, rẻ, độc lập) → đo. **P4** (aerial_sim), **P5** (background_mode), **P6/P7** (crop_to_object x margin) đo riêng từng cái, không chồng với P3 trong cùng 1 lần.
 4. **F1** → **F2** (cả 2 spatial_weight) → **F3** → **F4** → **F4c** (ablation accumulate_new_anchors, chỉ có ý nghĩa nếu F4 cho kết quả khác biệt), mỗi bước đo riêng trước khi chồng thành **F5**.
 5. **T2/T3/T4** — thử thay thế z_score mặc định trong O1, so trực tiếp với T1.
 6. **O2/O3/O4** — thử thay window_stat, so trực tiếp với O1 (kỳ vọng thấp hơn vì chưa validate).

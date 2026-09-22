@@ -238,10 +238,26 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
                    "statistically unstable for 3 near-duplicate close-ups per this project's own notes"),
         Combo("P1_agreement_weighted_fusion", "prototype",
               {"stage1.prototype.fusion": "agreement_weighted"}, needs_stage1=True),
-        Combo("P2_filter_target_like_frames", "prototype",
-              {"stage1.domain_calibration.filter_target_like_frames": True}, needs_stage1=True),
+        # domain_calibration.filter_target_like_frames only takes effect
+        # INSIDE the `if dc_cfg.enabled:` block (aero_eyes/stages/stage1.py)
+        # -- enabled=false (config.yaml default) makes the whole domain
+        # calibration step, filter_target_like_frames included, a no-op.
+        # Both must be set together or this combo silently does nothing.
+        # P2a isolates "does domain_calibration itself help" (plain
+        # np.linspace frame sampling, filter_target_like_frames stays at
+        # its own false default) from P2's "does the smart filter help
+        # FURTHER on top of it".
+        Combo("P2a_domain_calibration_plain", "prototype",
+              {"stage1.domain_calibration.enabled": True}, needs_stage1=True,
+              note="domain_calibration on, filter_target_like_frames left at its own "
+                   "default (false, naive np.linspace sampling) -- comparison point for P2"),
+        Combo("P2_filter_target_like_frames", "prototype", {
+            "stage1.domain_calibration.enabled": True,
+            "stage1.domain_calibration.filter_target_like_frames": True,
+        }, needs_stage1=True),
         Combo("P3_P1_plus_P2", "prototype", {
             "stage1.prototype.fusion": "agreement_weighted",
+            "stage1.domain_calibration.enabled": True,
             "stage1.domain_calibration.filter_target_like_frames": True,
         }, needs_stage1=True),
         Combo("P4_aerial_sim", "prototype", {"stage1.aerial_sim.enabled": True},
