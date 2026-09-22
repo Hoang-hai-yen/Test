@@ -15,7 +15,14 @@ Các lựa chọn cho `model`: `dinov2` (mặc định) | `dinov3` | `clip` | `s
 **Đổi `model` hoặc kích thước embedding → cache cũ (`prototype.npz`, `candidates.feats.npz`) không còn khớp chiều** — phải xoá cache hoặc bật `stage3.recompute_candidate_features: true` mỗi lần đổi nhóm này.
 
 ```yaml
-# E1 — DINOv3 domain vệ tinh thay vì ảnh web chung (rẻ nhất, không đổi kiến trúc)
+# E1a — chỉ đổi kiến trúc DINOv2 -> DINOv3, GIỮ NGUYÊN pretrain mặc định
+# (lvd1689m) -- tách riêng "đổi kiến trúc" khỏi "đổi domain pretrain" ở E1b
+stage1:
+  feature_extractor:
+    model: dinov3
+    dinov3_pretrain_dataset: lvd1689m   # mặc định, chỉ để tường minh
+
+# E1b — DINOv3 + domain vệ tinh (kiến trúc + domain pretrain cùng lúc)
 stage1:
   feature_extractor:
     model: dinov3
@@ -41,7 +48,21 @@ stage1:
     model: clip        # hoặc siglip
     clip_variant: vit-l/14     # hoặc siglip_variant: large
 
-# E5 — ensemble DINOv3 + CLIP (ghép 2 backbone, nặng hơn E1/E4 cộng lại)
+# E5a — ensemble DINOv2 (mặc định gốc trước khi dự án tổng quát hoá sang
+# dinov3 -- CHƯA từng được A/B test riêng, đáng có trong sweep làm đối chứng)
+stage1:
+  feature_extractor:
+    model: ensemble
+    ensemble_dino_model: dinov2
+
+# E5b — ensemble DINOv3 (lvd1689m) + CLIP
+stage1:
+  feature_extractor:
+    model: ensemble
+    ensemble_dino_model: dinov3
+    dinov3_pretrain_dataset: lvd1689m
+
+# E5c — ensemble DINOv3 (sat493m) + CLIP (nặng nhất, ghép domain pretrain + ensemble)
 stage1:
   feature_extractor:
     model: ensemble
@@ -66,11 +87,11 @@ stage1:
     radio_variant: c-radio_v3-b   # *-b/l/h/g variants; chỉ c-radio_*/v4-* được phép dùng thương mại
 ```
 
-**Thứ tự đáng thử**: E1 (rẻ nhất, 1 dòng) → E2/E3 (vẫn DINO, không đổi chiều embedding nếu chỉ đổi pooling — kiểm tra kỹ vì multiscale_attn có thể đổi chiều output, cần xoá cache để chắc) → E4 (đổi hẳn encoder, so trực tiếp) → E5 (ghép, chỉ thử sau khi biết CLIP/SigLIP một mình có giúp gì không) → E6/E7 (ít có cơ sở lý thuyết trực tiếp hơn, thử sau cùng).
+**Thứ tự đáng thử**: E1a (chỉ đổi kiến trúc, rẻ nhất) → E1b (thêm domain pretrain, so trực tiếp với E1a để biết phần nào thực sự đóng góp) → E2/E3 (vẫn DINO, không đổi chiều embedding nếu chỉ đổi pooling — kiểm tra kỹ vì multiscale_attn có thể đổi chiều output, cần xoá cache để chắc) → E4 (đổi hẳn encoder, so trực tiếp) → E5a/E5b/E5c (ghép, chỉ thử sau khi biết CLIP/SigLIP và DINOv2/v3 một mình có giúp gì không — E5a là baseline ensemble gốc chưa từng test) → E6/E7 (ít có cơ sở lý thuyết trực tiếp hơn, thử sau cùng).
 
 ---
 
-## 2. Prototype construction (`stage1.prototype` / `stage1.domain_calibration`)
+## 2. Prototype construction & tiền xử lý ảnh reference (`stage1.prototype` / `stage1.domain_calibration` / `stage1.segmentation` / `stage1.crop_to_object`)
 
 Độc lập với nhau và với mục 1 — không cần đổi cache khi chỉ đổi 2 field này (không đổi chiều embedding).
 
@@ -91,6 +112,33 @@ stage1:
 stage1:
   prototype: { fusion: agreement_weighted }
   domain_calibration: { filter_target_like_frames: true }
+
+# P4 — aerial_sim: giả lập domain gap (ảnh ref cận cảnh -> giống góc nhìn xa
+# của drone hơn) bằng cách shrink-rồi-upscale ảnh reference trước khi encode.
+# downscale_factor=1.0 là no-op (tương đương enabled=false); càng nhỏ càng
+# "xa"/mờ hơn.
+stage1:
+  aerial_sim:
+    enabled: true
+    downscale_factor: 0.5   # thử thêm 1.0 (no-op, đối chứng) và 0.1 (rất mạnh)
+
+# P5 — background_mode: giữ nguyên nền thật của ảnh ref thay vì flat-fill mặc
+# định -- đối chứng xem việc "làm sạch" nền ref có thực sự giúp hay chỉ tạo
+# thêm 1 dạng domain gap khác (ref nền phẳng vs. candidate video nền thật)
+stage1:
+  segmentation:
+    background_mode: keep_real   # mean_fill (mặc định) | keep_real | blur
+
+# P6/P7 — crop_to_object: crop ảnh ref về đúng tight mask box (mở rộng theo
+# crop_context_margin) TRƯỚC khi resize -- object chiếm phần lớn canvas hơn.
+# Yêu cầu segmentation.enabled (mặc định đã true). Thử 2 margin khác nhau.
+stage1:
+  crop_to_object: true
+  crop_context_margin: 0.0   # P6: bó sát nhất có thể
+
+stage1:
+  crop_to_object: true
+  crop_context_margin: 0.2   # P7: chừa thêm chút ngữ cảnh quanh object
 ```
 
 ---
@@ -222,7 +270,38 @@ stage3:
 
 ---
 
-## 6. GeCo2 online tracker (`stage123_geco2.dynamic_prototype`)
+## 6. Multi-reference pooling (`accuracy.cheap_boosters.multi_ref_pooling`)
+
+Cách gộp 3 similarity score per-reference thành 1 số, khi `accuracy.cheap_boosters.multi_reference_embedding: true` (mặc định đã bật). Độc lập với mục 3-5 — không đổi cache, chỉ đổi công thức gộp ở Stage 3 (`_pool_sims` trong `stage3.py`). Giá trị đang set trong config.yaml hiện tại là `max`.
+
+```yaml
+# M1 — mean (gộp trung bình 3 ref -- ý nghĩa gốc trong docstring dùng làm default)
+accuracy:
+  cheap_boosters:
+    multi_ref_pooling: mean
+
+# M2 — max (mặc định hiện tại của config.yaml) -- "OR" qua 3 ref, thiên recall,
+# rủi ro: 1 ref nào đó tình cờ giống 1 loại clutter sẽ làm lọt clutter đó qua
+# cho MỌI candidate.
+
+# M3 — min (NOT YET VALIDATED) -- "AND" qua 3 ref, thiên precision, đáng thử
+# nếu nghi ngờ max đang để lọt confuser qua 1 ref quá dễ dãi.
+accuracy:
+  cheap_boosters:
+    multi_ref_pooling: min
+
+# M4 — agreement_weighted (NOT YET VALIDATED) -- trọng số mỗi ref theo mức
+# đồng thuận BD-CSPN-style với 2 ref còn lại, thay vì coi 3 ref ngang nhau
+# (mean) hoặc để 1 ref một mình quyết (max/min).
+accuracy:
+  cheap_boosters:
+    multi_ref_pooling: agreement_weighted
+    agreement_weighted_epsilon: 10.0
+```
+
+---
+
+## 7. GeCo2 online tracker (`stage123_geco2.dynamic_prototype`)
 
 Chỉ áp dụng khi `pipeline.detector: geco2`. `interval_window_enabled` chỉ có tác dụng ở đường `offer()` mặc định — **vô hiệu nếu** `topk_fusion.enabled: true` hoặc `cluster_verification.enabled: true` đang bật (khi đó `offer_topk()` đi đường khác).
 
@@ -248,15 +327,22 @@ stage123_geco2:
 
 ---
 
-## 7. Thứ tự khuyến nghị tổng thể
+## 8. Thứ tự khuyến nghị tổng thể
 
 1. **O1 (baseline, đã có)** → xác nhận lại số trên chính sample đang test.
-2. **E1** (1 dòng, rẻ) → đo.
-3. **P3** (P1+P2, rẻ, độc lập) → đo.
+2. **E1a** (1 dòng, rẻ) → đo, rồi **E1b** (thêm domain pretrain) → so trực tiếp với E1a.
+3. **P3** (P1+P2, rẻ, độc lập) → đo. **P4** (aerial_sim), **P5** (background_mode), **P6/P7** (crop_to_object x margin) đo riêng từng cái, không chồng với P3 trong cùng 1 lần.
 4. **F1** → **F2** (cả 2 spatial_weight) → **F3** → **F4**, mỗi bước đo riêng trước khi chồng thành **F5**.
 5. **T2/T3/T4** — thử thay thế z_score mặc định trong O1, so trực tiếp với T1.
 6. **O2/O3/O4** — thử thay window_stat, so trực tiếp với O1 (kỳ vọng thấp hơn vì chưa validate).
-7. **E2/E3** → **E4** → **E5** → **E6/E7** — nhánh đổi encoder, cần rebuild cache, thử sau cùng vì tốn compute nhất.
-8. Nếu cân nhắc pipeline `geco2` hẳn: **G1** → **G2**, so sánh riêng (không so P/R/F1 trực tiếp với chuỗi trên vì khác cơ chế root).
+7. **M1/M3/M4** — thử thay `multi_ref_pooling: max` mặc định, so trực tiếp với baseline (= M2).
+8. **E2/E3** → **E4** → **E5a/E5b/E5c** → **E6/E7** — nhánh đổi encoder, cần rebuild cache, thử sau cùng vì tốn compute nhất.
+9. Nếu cân nhắc pipeline `geco2` hẳn: **G1** → **G2**, so sánh riêng (không so P/R/F1 trực tiếp với chuỗi trên vì khác cơ chế root).
 
 Sau mỗi bước: `pytest tests/ -q` phải xanh toàn bộ trước khi coi thay đổi cấu hình là hợp lệ để thử tiếp bước sau.
+
+---
+
+## 9. Script tự động hoá
+
+`scripts/sweep_config_combos.py` chạy toàn bộ combo mục 1-6 + 8 (bỏ mục 7 GeCo2 vì khác pipeline root) theo kiểu one-factor-at-a-time từ baseline, cho 1 hoặc nhiều sample, chỉ chạy Stage 1 (khi combo đổi encoder/prototype/aerial_sim) + Stage 3, dùng lại `candidates.json` đã có sẵn — không đụng Stage 2/4/5. Đọc docstring đầu file script để biết cách dùng, danh sách combo mặc định, và cách nó backup/restore `prototype.npz`/`candidates.json`/`detections.json` của từng sample trước-sau khi sweep (không để lại trạng thái bẩn).

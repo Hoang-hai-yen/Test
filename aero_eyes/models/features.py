@@ -791,6 +791,11 @@ class FGCLIPFeatureExtractor:
         "large": "qihoo360/fg-clip-large",  # 768-d
     }
     _DIMS = {"base": 512, "large": 768}
+    # FG-CLIP's own official usage example manually resizes every image to
+    # (_IMAGE_SIZE, _IMAGE_SIZE) BEFORE calling the image processor, rather
+    # than relying on AutoImageProcessor's own resizing -- see extract()'s
+    # own comment for why this isn't optional.
+    _IMAGE_SIZE = 224
 
     def __init__(self, variant: str = "base", device: str = "auto"):
         if variant not in self._VARIANT_MAP:
@@ -829,7 +834,14 @@ class FGCLIPFeatureExtractor:
     def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        pil_imgs = [_bgr_to_pil(im) for im in images]
+        # Confirmed on this project's own GPU run: skipping this manual
+        # resize (i.e. trusting AutoImageProcessor's own resizing, the
+        # pattern every OTHER extractor in this module uses) produces a
+        # patch grid that doesn't match modeling_fgclip.py's position-
+        # embedding table size -- NOT a clear shape-mismatch error at the
+        # input, but a CUDA device-side assert deep inside the vision
+        # encoder ("indexSelectLargeIndex ... srcIndex < srcSelectDimSize").
+        pil_imgs = [_bgr_to_pil(im).resize((self._IMAGE_SIZE, self._IMAGE_SIZE), Image.BICUBIC) for im in images]
         out: list[np.ndarray] = []
         for i in range(0, len(pil_imgs), batch_size):
             batch_pil = pil_imgs[i:i+batch_size]
