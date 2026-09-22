@@ -1,10 +1,16 @@
 """Feature extractors for Stage B (prototype encoding + candidate matching).
 
 Supported models:
-  dinov2   — DINOv2 ViT-S/14 or ViT-B/14, CLS token (384 or 768-d).
-             Optionally the "with registers" variant (dinov2_use_registers) --
-             same output dim, cleaner attention/features per Meta's ablations.
-  dinov3   — DINOv3 ViT-S/16, ViT-B/16 or ViT-L/16, CLS token (384/768/1024-d).
+  dinov2   — DINOv2 ViT-S/14 or ViT-B/14 (384 or 768-d). pooling="cls"
+             (default) is the single global CLS token, as before.
+             pooling="multiscale_attn" is NOT YET VALIDATED -- see
+             DINOv2FeatureExtractor's own docstring. Optionally the "with
+             registers" variant (dinov2_use_registers) -- same output dim,
+             cleaner attention/features per Meta's ablations.
+  dinov3   — DINOv3 ViT-S/16, ViT-B/16 or ViT-L/16 (384/768/1024-d). Same
+             pooling="cls"/"multiscale_attn" choice as dinov2 above (see
+             DINOv3FeatureExtractor's own docstring; multiscale_attn
+             requires dinov3_source="huggingface").
              dinov3_source="huggingface" (default): weights gated on
              HuggingFace -- request access and set HF_TOKEN before use.
              dinov3_source="kaggle": loads a raw Meta .pth checkpoint (e.g. a
@@ -65,26 +71,157 @@ def _bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# Multi-scale attention-weighted pooling (pooling="multiscale_attn", shared
+# between DINOv2FeatureExtractor and DINOv3FeatureExtractor)
+# ---------------------------------------------------------------------------
+#
+# ViT analog of DAVE's detect-and-verify backbone (DAVE/models/backbone.py),
+# which concatenates ResNet layer2+3+4 conv features instead of using a
+# single global vector -- multi-scale spatial detail the final layer alone
+# doesn't preserve. There is no CNN "layer2/3/4" in a ViT, so the closest
+# equivalent is concatenating patch-token features from several transformer
+# DEPTHS (early/mid/late) instead of only the final CLS token.
+#
+# Each selected depth's patch tokens are pooled using THAT layer's own
+# CLS-token attention as weights, instead of a naive average -- the original
+# DINO paper's well-documented finding is that CLS-token attention highlights
+# salient foreground regions (Caron et al., "Emerging Properties in
+# Self-Supervised Vision Transformers", arXiv:2104.14294), an
+# already-computed foreground signal this reuses for free. Patches the model
+# itself is NOT attending to (background/clutter texture) contribute less to
+# the resulting embedding than they would under global-average pooling.
+
+def _select_multiscale_layers(num_layers: int) -> list[int]:
+    """Pick ~3 transformer depths (1-indexed into `hidden_states`, i.e. "the
+    representation after block i") at roughly 50%/75%/100% of the
+    backbone's depth -- the ViT analog of DAVE's ResNet layer2+3+4
+    concatenation, spanning early/mid/late representations instead of a
+    single final-layer vector."""
+    layers = sorted({max(1, min(num_layers, round(f * num_layers))) for f in (0.5, 0.75, 1.0)})
+    return layers
+
+
+def _multiscale_attn_pool(
+    hidden_states: tuple[torch.Tensor, ...],
+    attentions: tuple[torch.Tensor, ...],
+    scale_layers: list[int],
+    num_patches: int,
+) -> torch.Tensor:
+    """Concatenate, across `scale_layers` (1-indexed depths into
+    hidden_states), each layer's patch tokens pooled by that layer's own
+    CLS-token attention (averaged over heads). Returns
+    [B, D*len(scale_layers)], NOT yet L2-normalized (the caller does that
+    after this call, same as every other extractor in this module).
+
+    num_patches must be the EXACT patch count for the actual processed
+    image (compute it from the real pixel_values tensor shape and the
+    architecture's fixed patch_size, e.g. (H // patch_size) * (W //
+    patch_size) -- never from a configured image_size field, since the HF
+    image processor used upstream may resize to its own default rather
+    than consulting it). num_prefix_tokens = seq_len - num_patches then
+    covers CLS (+ any register tokens) correctly regardless of whether
+    registers are enabled, since it's derived from the real tensor shape
+    rather than assumed.
+    """
+    if attentions is None or attentions[0] is None:
+        raise RuntimeError(
+            "pooling='multiscale_attn' needs output_attentions=True to return real "
+            "attention tensors -- got None. This backbone must be loaded with "
+            "attn_implementation='eager' (recent transformers releases default to "
+            "sdpa/flash-attn backends, which don't return attentions)."
+        )
+    pooled_per_layer = []
+    for layer_idx in scale_layers:
+        h = hidden_states[layer_idx]                        # [B, seq, D]
+        num_prefix = h.shape[1] - num_patches                # CLS (+ any register tokens)
+        if num_prefix < 1:
+            raise RuntimeError(
+                f"multiscale_attn: layer {layer_idx} has seq_len={h.shape[1]} but "
+                f"num_patches={num_patches} leaves no room for a CLS token -- "
+                "patch_size/pixel_values shape mismatch."
+            )
+        patch_tokens = h[:, num_prefix:, :]                  # [B, N, D]
+        attn = attentions[layer_idx - 1].mean(dim=1)         # [B, seq, seq], avg over heads
+        weights = attn[:, 0, num_prefix:]                    # [B, N] -- CLS's attention to each patch
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        pooled = (patch_tokens * weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
+        pooled_per_layer.append(pooled)
+    return torch.cat(pooled_per_layer, dim=-1)
+
+
+def _patch_grid_count(pixel_values: torch.Tensor, patch_size: int) -> int:
+    """Exact patch count for an already-processed [B, 3, H, W] tensor, given
+    the architecture's fixed patch_size -- see _multiscale_attn_pool's own
+    docstring for why this must come from the real tensor, not a config
+    field."""
+    h, w = pixel_values.shape[-2], pixel_values.shape[-1]
+    if h % patch_size != 0 or w % patch_size != 0:
+        raise RuntimeError(
+            f"multiscale_attn: processed image size {h}x{w} is not divisible by "
+            f"patch_size={patch_size} -- the image processor must output patch-aligned "
+            "dimensions for attention-weighted patch pooling to align correctly."
+        )
+    return (h // patch_size) * (w // patch_size)
+
+
+# ---------------------------------------------------------------------------
 # DINOv2
 # ---------------------------------------------------------------------------
 
 class DINOv2FeatureExtractor:
-    """Batched DINOv2 ViT-S/14 or ViT-B/14, returns L2-normalized CLS tokens."""
+    """Batched DINOv2 ViT-S/14 or ViT-B/14, returns L2-normalized features.
+
+    pooling="cls" (default): single global CLS token, as before.
+
+    pooling="multiscale_attn": NOT YET VALIDATED -- see this module's
+    "Multi-scale attention-weighted pooling" section above for the
+    mechanism. Forces the HuggingFace backend (skips the torch.hub attempt
+    entirely) since it needs output_hidden_states=True/
+    output_attentions=True with attn_implementation="eager" -- the raw
+    torch.hub checkpoint doesn't expose per-layer attention the same way.
+    Output dim becomes len(scale_layers)x (typically 3x) the single-CLS
+    dim (concatenated, then L2-normalized).
+    """
+
+    _HF_MAP_NO_REG = {
+        "vits14": "facebook/dinov2-small", "vitb14": "facebook/dinov2-base",
+        "vitl14": "facebook/dinov2-large", "vitg14": "facebook/dinov2-giant",
+    }
+    _HF_MAP_REG = {
+        "vits14": "facebook/dinov2-with-registers-small", "vitb14": "facebook/dinov2-with-registers-base",
+        "vitl14": "facebook/dinov2-with-registers-large", "vitg14": "facebook/dinov2-with-registers-giant",
+    }
+    _PATCH_SIZE = 14
 
     def __init__(
         self, variant: str = "vitb14", device: str = "auto", image_size: int = 224,
-        use_registers: bool = False,
+        use_registers: bool = False, pooling: str = "cls",
     ):
+        if pooling not in ("cls", "multiscale_attn"):
+            raise ValueError(f"Unknown DINOv2 pooling '{pooling}'. Must be 'cls' or 'multiscale_attn'.")
         self.variant       = variant
         self.image_size    = image_size
         self.use_registers = use_registers
+        self.pooling       = pooling
         self.device        = _resolve_device(device)
-        self.model         = self._load(variant)
+        self.processor: Any = None
+        self._scale_layers: list[int] = []
+        if pooling == "multiscale_attn":
+            self.model, self.processor = self._load_hf(variant, eager_attn=True)
+            self._scale_layers = _select_multiscale_layers(self.model.config.num_hidden_layers)
+        else:
+            self.model = self._load(variant)
         self.model.eval().to(self.device)
         log.info(
-            "DINOv2 %s%s on %s  (dim=%d)", variant,
-            " (with registers)" if use_registers else "", self.device, self._dim(),
+            "DINOv2 %s%s pooling=%s on %s  (dim=%d)", variant,
+            " (with registers)" if use_registers else "", pooling, self.device, self._dim(),
         )
+
+    def _hf_repo(self, variant: str) -> str:
+        hf_map = self._HF_MAP_REG if self.use_registers else self._HF_MAP_NO_REG
+        if variant not in hf_map:
+            raise ValueError(f"Unknown DINOv2 variant '{variant}'. Must be one of {list(hf_map)}.")
+        return hf_map[variant]
 
     def _load(self, variant: str) -> Any:
         hub_name = f"dinov2_{variant}" + ("_reg" if self.use_registers else "")
@@ -93,27 +230,29 @@ class DINOv2FeatureExtractor:
             return m
         except Exception as e:
             log.warning("torch.hub failed (%s) → HuggingFace", e)
-        if self.use_registers:
-            hf_map = {
-                "vits14": "facebook/dinov2-with-registers-small", "vitb14": "facebook/dinov2-with-registers-base",
-                "vitl14": "facebook/dinov2-with-registers-large", "vitg14": "facebook/dinov2-with-registers-giant",
-            }
-        else:
-            hf_map = {
-                "vits14": "facebook/dinov2-small", "vitb14": "facebook/dinov2-base",
-                "vitl14": "facebook/dinov2-large", "vitg14": "facebook/dinov2-giant",
-            }
-        if variant not in hf_map:
-            raise ValueError(f"Unknown DINOv2 variant '{variant}'. Must be one of {list(hf_map)}.")
         from transformers import AutoModel
-        m = AutoModel.from_pretrained(hf_map[variant])
+        m = AutoModel.from_pretrained(self._hf_repo(variant))
         m._hf = True
         return m
+
+    def _load_hf(self, variant: str, eager_attn: bool = False):
+        from transformers import AutoImageProcessor, AutoModel
+        hf_name = self._hf_repo(variant)
+        processor = AutoImageProcessor.from_pretrained(hf_name)
+        # output_attentions=True needs attn_implementation="eager" on recent
+        # transformers releases -- sdpa/flash-attn backends silently return
+        # None for attentions instead.
+        kwargs = {"attn_implementation": "eager"} if eager_attn else {}
+        model = AutoModel.from_pretrained(hf_name, **kwargs)
+        model._hf = True
+        return model, processor
 
     @torch.no_grad()
     def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
+        if self.pooling == "multiscale_attn":
+            return self._extract_multiscale_attn(images, batch_size)
         tensors = [_preprocess_dino(im, self.image_size) for im in images]
         out: list[np.ndarray] = []
         for i in range(0, len(tensors), batch_size):
@@ -125,6 +264,22 @@ class DINOv2FeatureExtractor:
             out.append(F.normalize(feats, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
 
+    @torch.no_grad()
+    def _extract_multiscale_attn(self, images: list[np.ndarray], batch_size: int) -> np.ndarray:
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            inputs = self.processor(images=batch_pil, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            outputs = self.model(**inputs, output_hidden_states=True, output_attentions=True)
+            num_patches = _patch_grid_count(inputs["pixel_values"], self._PATCH_SIZE)
+            pooled = _multiscale_attn_pool(
+                outputs.hidden_states, outputs.attentions, self._scale_layers, num_patches,
+            )
+            out.append(F.normalize(pooled, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
     def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
@@ -134,7 +289,10 @@ class DINOv2FeatureExtractor:
     _DIMS = {"vits14": 384, "vitb14": 768, "vitl14": 1024, "vitg14": 1536}
 
     def _dim(self) -> int:
-        return self._DIMS.get(self.variant, 768)
+        base = self._DIMS.get(self.variant, 768)
+        if self.pooling == "multiscale_attn":
+            return base * max(len(self._scale_layers), 1)
+        return base
 
     # Keep old name for compatibility
     def _feature_dim(self) -> int:
@@ -177,16 +335,26 @@ class DINOv3FeatureExtractor:
     ImageNet-style normalization DINOv2's own torch.hub path uses), since
     the raw hub model expects a plain tensor, not transformers' processor
     output.
+
+    pooling="cls" (default): single global CLS/pooler_output token, as
+    before. pooling="multiscale_attn" is NOT YET VALIDATED -- see this
+    module's "Multi-scale attention-weighted pooling" section above for
+    the mechanism. Requires source="huggingface" (raises at construction
+    otherwise) -- the kaggle raw checkpoint path has no
+    output_hidden_states/output_attentions API. Output dim becomes
+    len(scale_layers)x (typically 3x) the single-CLS dim.
     """
 
     _ARCHS = ("vits16", "vitb16", "vitl16")
     _PRETRAIN_DATASETS = ("lvd1689m", "sat493m")
     _DIMS = {"vits16": 384, "vitb16": 768, "vitl16": 1024}
+    _PATCH_SIZE = 16
 
     def __init__(
         self, variant: str = "vitb16", device: str = "auto",
         source: str = "huggingface", pretrain_dataset: str = "lvd1689m",
         kaggle_model_id: str | None = None, image_size: int = 224,
+        pooling: str = "cls",
     ):
         if variant not in self._ARCHS:
             raise ValueError(f"Unknown DINOv3 variant '{variant}'. Must be one of {self._ARCHS}.")
@@ -197,27 +365,44 @@ class DINOv3FeatureExtractor:
             )
         if source not in ("huggingface", "kaggle"):
             raise ValueError(f"Unknown DINOv3 source '{source}'. Must be 'huggingface' or 'kaggle'.")
+        if pooling not in ("cls", "multiscale_attn"):
+            raise ValueError(f"Unknown DINOv3 pooling '{pooling}'. Must be 'cls' or 'multiscale_attn'.")
+        if pooling == "multiscale_attn" and source != "huggingface":
+            raise ValueError(
+                "DINOv3 pooling='multiscale_attn' requires source='huggingface' -- the kaggle "
+                "raw checkpoint path doesn't expose output_hidden_states/output_attentions."
+            )
         self.variant          = variant
         self.pretrain_dataset = pretrain_dataset
         self.source           = source
         self.image_size       = image_size
+        self.pooling          = pooling
         self.device           = _resolve_device(device)
         self.processor        = None
+        self._scale_layers: list[int] = []
         if source == "huggingface":
-            self.model, self.processor = self._load_huggingface(variant, pretrain_dataset)
+            self.model, self.processor = self._load_huggingface(
+                variant, pretrain_dataset, eager_attn=(pooling == "multiscale_attn"),
+            )
         else:
             self.model = self._load_kaggle(variant, kaggle_model_id)
         self.model.eval().to(self.device)
+        if pooling == "multiscale_attn":
+            self._scale_layers = _select_multiscale_layers(self.model.config.num_hidden_layers)
         log.info(
-            "DINOv3 %s pretrain=%s (source=%s) on %s  (dim=%d)",
-            variant, pretrain_dataset, source, self.device, self._dim(),
+            "DINOv3 %s pretrain=%s (source=%s) pooling=%s on %s  (dim=%d)",
+            variant, pretrain_dataset, source, pooling, self.device, self._dim(),
         )
 
-    def _load_huggingface(self, variant: str, pretrain_dataset: str):
+    def _load_huggingface(self, variant: str, pretrain_dataset: str, eager_attn: bool = False):
         from transformers import AutoImageProcessor, AutoModel
         hf_name = f"facebook/dinov3-{variant}-pretrain-{pretrain_dataset}"
         processor = AutoImageProcessor.from_pretrained(hf_name)
-        model     = AutoModel.from_pretrained(hf_name)
+        # output_attentions=True needs attn_implementation="eager" on recent
+        # transformers releases -- sdpa/flash-attn backends silently return
+        # None for attentions instead.
+        kwargs = {"attn_implementation": "eager"} if eager_attn else {}
+        model = AutoModel.from_pretrained(hf_name, **kwargs)
         return model, processor
 
     def _load_kaggle(self, variant: str, kaggle_model_id: str | None):
@@ -252,6 +437,8 @@ class DINOv3FeatureExtractor:
     def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
+        if self.pooling == "multiscale_attn":
+            return self._extract_multiscale_attn(images, batch_size)
         if self.source == "kaggle":
             # Raw torch.hub model, plain tensor in/CLS tensor out -- same
             # calling convention as DINOv2FeatureExtractor's own hub path.
@@ -272,6 +459,22 @@ class DINOv3FeatureExtractor:
             out.append(F.normalize(pooled, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
 
+    @torch.no_grad()
+    def _extract_multiscale_attn(self, images: list[np.ndarray], batch_size: int) -> np.ndarray:
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            inputs = self.processor(images=batch_pil, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            outputs = self.model(**inputs, output_hidden_states=True, output_attentions=True)
+            num_patches = _patch_grid_count(inputs["pixel_values"], self._PATCH_SIZE)
+            pooled = _multiscale_attn_pool(
+                outputs.hidden_states, outputs.attentions, self._scale_layers, num_patches,
+            )
+            out.append(F.normalize(pooled, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
     def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
@@ -279,7 +482,10 @@ class DINOv3FeatureExtractor:
         return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
 
     def _dim(self) -> int:
-        return self._DIMS.get(self.variant, 768)
+        base = self._DIMS.get(self.variant, 768)
+        if self.pooling == "multiscale_attn":
+            return base * max(len(self._scale_layers), 1)
+        return base
 
     def _feature_dim(self) -> int:
         return self._dim()
@@ -436,15 +642,19 @@ class EnsembleFeatureExtractor:
         dinov3_source: str = "huggingface",
         dinov3_pretrain_dataset: str = "lvd1689m",
         dinov3_kaggle_model_id: str | None = None,
+        dinov2_pooling: str = "cls",
+        dinov3_pooling: str = "cls",
     ):
         if dino_model == "dinov3":
             self.dino = DINOv3FeatureExtractor(
                 variant=dinov3_variant, device=device, source=dinov3_source,
                 pretrain_dataset=dinov3_pretrain_dataset, kaggle_model_id=dinov3_kaggle_model_id,
-                image_size=image_size,
+                image_size=image_size, pooling=dinov3_pooling,
             )
         elif dino_model == "dinov2":
-            self.dino = DINOv2FeatureExtractor(dinov2_variant, device, image_size, dinov2_use_registers)
+            self.dino = DINOv2FeatureExtractor(
+                dinov2_variant, device, image_size, dinov2_use_registers, pooling=dinov2_pooling,
+            )
         else:
             raise ValueError(f"Unknown ensemble dino_model '{dino_model}'. Must be 'dinov2' or 'dinov3'.")
         self.clip = CLIPFeatureExtractor(clip_variant, device)
@@ -783,6 +993,7 @@ def build_feature_extractor(cfg):
             device        = dev,
             image_size    = fe.image_size,
             use_registers = fe.dinov2_use_registers,
+            pooling       = fe.dinov2_pooling,
         )
     elif fe.model == "dinov3":
         base = DINOv3FeatureExtractor(
@@ -792,6 +1003,7 @@ def build_feature_extractor(cfg):
             pretrain_dataset = fe.dinov3_pretrain_dataset,
             kaggle_model_id  = fe.dinov3_kaggle_model_id,
             image_size       = fe.image_size,
+            pooling          = fe.dinov3_pooling,
         )
     elif fe.model == "clip":
         base = CLIPFeatureExtractor(
@@ -815,6 +1027,8 @@ def build_feature_extractor(cfg):
             dinov3_source           = fe.dinov3_source,
             dinov3_pretrain_dataset = fe.dinov3_pretrain_dataset,
             dinov3_kaggle_model_id  = fe.dinov3_kaggle_model_id,
+            dinov2_pooling          = fe.dinov2_pooling,
+            dinov3_pooling          = fe.dinov3_pooling,
         )
     elif fe.model == "fgclip":
         base = FGCLIPFeatureExtractor(

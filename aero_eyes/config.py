@@ -209,6 +209,20 @@ class FeatureExtractorConfig(BaseModel):
     # _DIMS), so this is a drop-in swap, not a separate model size to
     # reconfigure downstream. False (default) = original DINOv2, unchanged.
     dinov2_use_registers: bool = False
+    # "cls" (default): single global CLS token, as before. "multiscale_attn"
+    # is NOT YET VALIDATED -- concatenates attention-weighted-pooled patch
+    # tokens from ~3 transformer depths (50%/75%/100%), in the spirit of
+    # DAVE's detect-and-verify backbone (DAVE/models/backbone.py, this
+    # project's own vendored DAVE checkout, concatenates ResNet
+    # layer2+3+4 conv features instead of a single global vector) adapted
+    # to a ViT: each layer's patch tokens are pooled by that layer's own
+    # CLS-token attention instead of a naive average, so background/
+    # clutter patches the model itself isn't attending to contribute less
+    # to the embedding -- see DINOv2FeatureExtractor's own docstring
+    # (aero_eyes/models/features.py). Forces the HuggingFace backend
+    # (skips the torch.hub attempt). Also used by model="ensemble" when
+    # ensemble_dino_model="dinov2".
+    dinov2_pooling: Literal["cls", "multiscale_attn"] = "cls"
     # DINOv3 architecture size. Weights are gated on HuggingFace
     # (facebook/dinov3-*) -- request access on the model page and set
     # HF_TOKEN before using dinov3_source=huggingface below.
@@ -245,6 +259,11 @@ class FeatureExtractorConfig(BaseModel):
     # dinov3_pretrain_dataset above (this string is the actual weight
     # source; those two fields aren't validated against it).
     dinov3_kaggle_model_id: Optional[str] = None
+    # Same "cls"/"multiscale_attn" choice as dinov2_pooling above (see its
+    # own docstring) -- requires dinov3_source="huggingface" when set to
+    # "multiscale_attn" (raises at construction otherwise). Also used by
+    # model="ensemble" when ensemble_dino_model="dinov3".
+    dinov3_pooling: Literal["cls", "multiscale_attn"] = "cls"
     clip_variant: str = "vit-b/32"   # "vit-b/32" (512-d) or "vit-l/14" (768-d)
     # SigLIP: open access (no gating), vision-only encoder.
     siglip_variant: Literal["base", "large", "so400m"] = "base"

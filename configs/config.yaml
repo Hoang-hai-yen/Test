@@ -114,6 +114,17 @@ stage1:
     # producing cleaner features per Meta's own ablations -- same output dim
     # as the non-register variant above, drop-in swap. false = original DINOv2.
     dinov2_use_registers: false
+    # cls (default) = single global CLS token, as before. multiscale_attn is
+    # NOT YET VALIDATED -- concatenates attention-weighted-pooled patch
+    # tokens from ~3 transformer depths (50%/75%/100%), in the spirit of
+    # DAVE's detect-and-verify backbone (DAVE/models/backbone.py concats
+    # ResNet layer2+3+4 conv features instead of a single global vector)
+    # adapted to a ViT: each layer's patch tokens are pooled by that layer's
+    # own CLS-token attention instead of a naive average, so background/
+    # clutter patches the model isn't attending to contribute less to the
+    # embedding. Forces the HuggingFace backend. Also used by model=ensemble
+    # when ensemble_dino_model=dinov2.
+    dinov2_pooling: cls   # cls | multiscale_attn
     # dinov3_variant: used only when model=dinov3.
     dinov3_variant: vitb16   # vits16 (384-d) | vitb16 (768-d) | vitl16 (1024-d)
     # WHICH pretraining run's weights to load, same architecture either way:
@@ -141,6 +152,10 @@ stage1:
     # is the actual weight source; those two fields aren't validated
     # against it).
     dinov3_kaggle_model_id: null   # e.g. "yadavdamodar/dinov3-vitl16-pretrain-sat493m/pyTorch/default"
+    # Same cls | multiscale_attn choice as dinov2_pooling above -- requires
+    # dinov3_source=huggingface when set to multiscale_attn. Also used by
+    # model=ensemble when ensemble_dino_model=dinov3.
+    dinov3_pooling: cls   # cls | multiscale_attn
     clip_variant: vit-b/32   # vit-b/32 (512-d) | vit-l/14 (768-d)
     # siglip_variant: used only when model=siglip. Open access on HuggingFace,
     # no token needed. Vision encoder only (no text tower loaded).
