@@ -52,17 +52,23 @@ def _seed_candidates(sample_dir: Path) -> None:
 
 
 def test_stage1_default_reruns_stage1_instead_of_trusting_stale_disk_state():
-    """Regression test: stage1_default must have needs_stage1=True (no
-    stage1.* overrides, but STILL a real rerun) -- a work_dir from an
+    """Regression test: stage1_default must have needs_stage1=True AND
+    recompute=True (no stage1.* overrides, but STILL a real rerun of both
+    Stage 1 and candidate feature extraction) -- a work_dir from an
     earlier run (possibly with a different stage1 config, e.g. on a
     server the user doesn't remember the exact history of) can hold a
-    prototype.npz that does NOT match config.yaml's CURRENT stage1
-    settings, with no way to tell from the file alone. Silently reusing
-    it (needs_stage1=False) would make "stage1_default" mean "whatever's
-    cached", not "this config's own defaults"."""
+    prototype.npz AND a candidates.json whose cached features do NOT
+    match config.yaml's CURRENT stage1 settings, with no way to tell from
+    the files alone. Confirmed in practice: a stale candidates.json (2304-d
+    features from an old multiscale_attn/ensemble run) paired with a
+    freshly-regenerated 768-d prototype.npz crashes Stage 3's `feats @ ref`
+    with a dimension-mismatch ValueError. Silently reusing either file
+    (needs_stage1=False or recompute=False) would make "stage1_default"
+    mean "whatever's cached", not "this config's own defaults"."""
     default = build_stage1_combos(include_heavy=True)[0]
     assert default.id == "stage1_default"
     assert default.needs_stage1 is True
+    assert default.recompute is True
     assert default.overrides == {}
 
 

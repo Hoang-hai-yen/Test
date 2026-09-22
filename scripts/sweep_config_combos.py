@@ -155,12 +155,24 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
     BASELINE_OVERRIDES, so this is never skipped) guarantees "stage1_default"
     actually means "this file's own current stage1 settings", not
     "whatever happened to be cached from some earlier, possibly different,
-    run"."""
+    run".
+
+    Same staleness risk applies to candidates.json's own cached per-
+    candidate features, not just prototype.npz -- confirmed in practice:
+    an existing work_dir's candidates.json can hold features from a
+    DIFFERENT, incompatible extractor (e.g. a real production run that
+    used multiscale_attn/ensemble pooling), producing a dimension
+    mismatch (`feats @ ref` ValueError) against a freshly-regenerated
+    prototype.npz that correctly matches config.yaml's CURRENT encoder.
+    stage1_default therefore ALSO forces recompute=True -- exactly the
+    same "trust this config, not stale disk state" principle as its own
+    needs_stage1=True above."""
     combos = [
-        Combo("stage1_default", "encoder", {}, needs_stage1=True,
-              note="no stage1.* overrides -- reruns Stage 1 fresh with config.yaml's own current "
-                   "stage1 settings, so it's guaranteed consistent with THIS run, not whatever a "
-                   "stale on-disk prototype.npz from some earlier config happens to hold"),
+        Combo("stage1_default", "encoder", {}, needs_stage1=True, recompute=True,
+              note="no stage1.* overrides -- reruns Stage 1 AND re-extracts candidate features "
+                   "fresh with config.yaml's own current stage1 settings, so it's guaranteed "
+                   "consistent with THIS run, not whatever a stale on-disk prototype.npz/"
+                   "candidates.json from some earlier config happens to hold"),
 
         # ---- encoder swaps (mục 1) -- needs Stage 1 + recompute ----
         Combo("E1a_dinov3_lvd1689m", "encoder", {
