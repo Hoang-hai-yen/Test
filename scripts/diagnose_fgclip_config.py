@@ -35,6 +35,14 @@ def main() -> None:
 
     hf_name = "qihoo360/fg-clip-base"
 
+    # Same prerequisite FGCLIPFeatureExtractor._load() applies before ANY
+    # AutoConfig/AutoModel call for this repo -- forgetting this (as this
+    # diagnostic script's first version did) reproduces the ORIGINAL
+    # transformers.onnx ModuleNotFoundError, unrelated to the position-
+    # embedding bug this script is actually trying to isolate.
+    from aero_eyes.models.features import _ensure_transformers_onnx_shim
+    _ensure_transformers_onnx_shim()
+
     # ---- Stage 1: raw AutoConfig.from_pretrained, BEFORE this project's own fix ----
     config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
     _describe("AutoConfig.from_pretrained (raw, before _ensure_fgclip_subconfigs)", config.vision_config)
