@@ -328,3 +328,59 @@ def test_factory_dispatches_to_radio(monkeypatch):
     _, kwargs = calls[0]
     assert kwargs["variant"] == "c-radio_v4-h"
     assert kwargs["image_size"] == cfg.stage1.feature_extractor.image_size
+
+
+# ---------------------------------------------------------------------------
+# FG-CLIP position_ids fix (_fix_fgclip_position_ids) -- confirmed empirically
+# (this project's own scripts/diagnose_fgclip_config.py run) to be a
+# persistent, checkpoint-corrupted buffer, NOT an image-size/config mismatch
+# -- see _fix_fgclip_position_ids's own docstring for the full story.
+# ---------------------------------------------------------------------------
+
+class _FakeEmbeddings:
+    def __init__(self, position_ids: torch.Tensor):
+        self.position_ids = position_ids
+
+
+class _FakeVisionModel:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+
+
+class _FakeFGCLIPModel:
+    def __init__(self, embeddings):
+        self.vision_model = _FakeVisionModel(embeddings)
+
+
+def test_fix_fgclip_position_ids_resets_corrupted_buffer():
+    corrupted = torch.tensor([[0, 1, 352951806590982]])  # garbage last value, like the real bug
+    model = _FakeFGCLIPModel(_FakeEmbeddings(corrupted))
+
+    features_mod._fix_fgclip_position_ids(model)
+
+    fixed = model.vision_model.embeddings.position_ids
+    assert fixed.shape == (1, 3)
+    assert fixed.tolist() == [[0, 1, 2]]
+
+
+def test_fix_fgclip_position_ids_correct_buffer_stays_correct():
+    """Idempotent / harmless on an already-correct buffer -- arange(N) in,
+    arange(N) out, so this fix is safe to apply unconditionally."""
+    already_correct = torch.arange(197).unsqueeze(0)
+    model = _FakeFGCLIPModel(_FakeEmbeddings(already_correct))
+
+    features_mod._fix_fgclip_position_ids(model)
+
+    assert model.vision_model.embeddings.position_ids.tolist() == already_correct.tolist()
+
+
+def test_fix_fgclip_position_ids_noop_when_path_not_found(caplog):
+    """A model whose module layout doesn't match either checked path must
+    not raise -- just warn, so a future FG-CLIP restructuring degrades
+    gracefully instead of crashing this project's own loading code."""
+    class _EmptyModel:
+        pass
+
+    with caplog.at_level("WARNING"):
+        features_mod._fix_fgclip_position_ids(_EmptyModel())
+    assert "could not find" in caplog.text

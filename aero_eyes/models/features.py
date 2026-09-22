@@ -163,6 +163,61 @@ def _ensure_fgclip_subconfigs(config: Any, hf_name: str) -> None:
         config.vision_config = CLIPVisionConfig(**kwargs)
 
 
+def _fix_fgclip_position_ids(model: Any) -> None:
+    """FG-CLIP's own vendored modeling_clip.py registers the vision
+    embeddings' `position_ids` buffer as a PERSISTENT buffer (an old,
+    long-since-fixed pattern in upstream transformers' own CLIP
+    implementation -- current transformers marks this buffer
+    persistent=False precisely because it's a deterministic
+    torch.arange(num_positions) sequence, never a trained value, and
+    should never be read from a checkpoint's state_dict). Because it's
+    persistent here, loading FG-CLIP's checkpoint OVERWRITES the correct
+    arange sequence with whatever raw (and in practice, garbage/
+    uninitialized-looking) values happen to be stored under that key in
+    the checkpoint file -- confirmed empirically on this project's own
+    diagnostic run: position_ids.max() came back as 352951806590982, wildly
+    outside the valid [0, num_positions) range, causing an out-of-bounds
+    CUDA embedding-lookup crash inside self.position_embedding(
+    self.position_ids) that looked (from the crash site alone) like an
+    image-size/config mismatch but was neither -- config.vision_config's
+    image_size/patch_size and the actual processor output were BOTH
+    confirmed correct and mutually consistent (196 patches + 1 CLS = 197,
+    exactly matching the position_embedding table's own size) before this
+    was found to be the real cause.
+
+    Recomputes the buffer as the correct, checkpoint-independent
+    torch.arange(num_positions) sequence, in place, for whichever vision
+    tower attribute path this loaded model actually has (varies across
+    forks/versions of this vendored code -- checked defensively rather
+    than assumed to be at one single fixed path). A no-op (silently) if
+    none of the checked paths exist, so this doesn't newly break a future
+    FG-CLIP release that fixes persistence upstream or restructures its
+    module layout.
+    """
+    candidates = [
+        getattr(getattr(model, "vision_model", None), "embeddings", None),
+        getattr(getattr(getattr(model, "vision_model", None), "vision_model", None), "embeddings", None),
+    ]
+    for embeddings in candidates:
+        position_ids = getattr(embeddings, "position_ids", None)
+        if position_ids is None:
+            continue
+        num_positions = position_ids.shape[-1]
+        correct = torch.arange(num_positions, device=position_ids.device).expand(1, -1)
+        embeddings.position_ids = correct
+        log.info(
+            "FG-CLIP: reset a persistent (checkpoint-corrupted) position_ids buffer "
+            "to the correct arange(%d) sequence (was max=%s)",
+            num_positions, int(position_ids.max()) if position_ids.numel() else "n/a",
+        )
+        return
+    log.warning(
+        "FG-CLIP: could not find a vision embeddings.position_ids buffer to fix -- "
+        "if the position-embedding out-of-bounds crash recurs, this model's module "
+        "layout has changed and this fix needs updating."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Multi-scale attention-weighted pooling (pooling="multiscale_attn", shared
 # between DINOv2FeatureExtractor and DINOv3FeatureExtractor)
@@ -839,6 +894,7 @@ class FGCLIPFeatureExtractor:
         config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
         _ensure_fgclip_subconfigs(config, hf_name)
         model = AutoModelForCausalLM.from_pretrained(hf_name, config=config, trust_remote_code=True)
+        _fix_fgclip_position_ids(model)
         return model, processor
 
     @torch.no_grad()
