@@ -706,7 +706,7 @@ stage3:
     # unconditional-admission behavior unchanged.
     # NOT YET VALIDATED -- compare against the ungated version first.
     window_admission_min_consecutive_hits: 2
-    window_admission_iou_threshold: 0.5
+    window_admission_iou_threshold: 0.2
 
   # Margin-over-runner-up (WildFusion, arXiv:2608.02469, docs/GECO2_
   # precision_improvements_plan.md Phase 1 item 1). A candidate that
