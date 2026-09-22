@@ -639,6 +639,43 @@ class ClusterVerificationConfig(BaseModel):
     #   an actually-homogeneous keyframe would inject a spurious split).
     #   spectral_egv_threshold below controls this estimate.
     cluster_method: Literal["hdbscan", "spectral"] = "hdbscan"
+    # Which pairwise distance the affinity/distance matrix between EVERY
+    # pair of points (candidates + exemplars combined) is built from --
+    # see aero_eyes.utils.cluster_verify's own _distance_and_affinity
+    # docstring for the exact math per option.
+    #   "cosine" (default, DAVE-fidelity-matched): unchanged from before
+    #     this field existed.
+    #   "l1": Manhattan distance -- genuinely different cluster structure
+    #     from cosine (no monotonic relationship on L2-normalized vectors,
+    #     unlike L2/Euclidean which IS monotonic with cosine on unit
+    #     vectors and therefore not offered here as a separate option --
+    #     it would just reproduce cosine's own clustering). NOT YET
+    #     VALIDATED -- no literature evidence found that L1 clusters
+    #     better than cosine for this project's own problem, offered
+    #     purely as an empirically-testable alternative.
+    #   "mahalanobis": NOT YET VALIDATED -- whitens pairwise distance by
+    #     the SAME shared inverse-covariance (precision matrix) RMD's own
+    #     background fit already computes (aero_eyes.stages.stage3.
+    #     _fit_rmd_background, Ledoit-Wolf shrinkage over this video's
+    #     whole candidate pool) -- the same "separate real signal from the
+    #     background's own natural variance directions" idea that
+    #     motivated stage3.similarity="rmd", applied here to the pairwise
+    #     structure clustering uses instead of to a single point-vs-
+    #     prototype score. REQUIRES the caller to pass a precision_matrix
+    #     into cluster_verify_candidates (stage3.py's verification_method
+    #     ="cluster" and cluster_secondary_filter call sites do this
+    #     automatically whenever this is set to "mahalanobis"; GeCo2's own
+    #     stage123_geco2.dynamic_prototype.cluster_verification path has
+    #     no equivalent whole-video background fit and raises a clear
+    #     error if set to "mahalanobis" there).
+    #   For "l1"/"mahalanobis" with cluster_method="spectral": since
+    #     spectral needs a non-negative AFFINITY (not a distance), the
+    #     distance is converted via a Gaussian/RBF kernel (sigma = median
+    #     pairwise distance) -- a new conversion NOT part of DAVE's own
+    #     reference code (which only ever used cosine similarity directly
+    #     as its affinity), needed only to make these two new metrics
+    #     usable by spectral clustering at all.
+    pairwise_metric: Literal["cosine", "l1", "mahalanobis"] = "cosine"
     min_cluster_size: int = 2   # hdbscan only
     min_samples: Optional[int] = None   # hdbscan only; None = sklearn default (= min_cluster_size)
     # Eigengap threshold for the self-tuning cluster-count estimate (spectral
@@ -709,6 +746,20 @@ class ClusterSecondaryFilterConfig(BaseModel):
     # and slower to "forget" an appearance that's no longer representative
     # if the target's own look drifts significantly over the video.
     window_size: int = 50
+    # true (default): a candidate that's verified AND clears the
+    # consecutive-hit admission gate below gets appended to the trusted
+    # window (FIFO up to window_size), so later keyframes cluster against
+    # an increasingly rich set of THIS video's own confirmed appearances,
+    # not just the 3 static reference photos.
+    # false: the trusted window never accumulates anything -- every
+    # keyframe clusters against ONLY the 3 original exemplars, for the
+    # entire video, unchanged from keyframe 1 to the last one. Useful to
+    # isolate whether accumulation itself helps or hurts precision (e.g.
+    # if a single early false-positive slips past the admission gate and
+    # then keeps attracting texturally-similar confusers for the rest of
+    # the video -- a risk that's impossible with this set to false, at the
+    # cost of losing whatever benefit real accumulated context provides).
+    accumulate_new_anchors: bool = True
     # Reuses the SAME shared primitive/knobs as stage3.verification_method
     # ="cluster" and stage123_geco2.dynamic_prototype.cluster_verification
     # -- see ClusterVerificationConfig's own docstring. `enabled` on this

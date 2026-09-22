@@ -93,11 +93,80 @@ def _self_tuning_n_clusters(affinity: np.ndarray, egv_threshold: float) -> int:
     return max(candidate_counts[:2])
 
 
+def _rbf_affinity(distance: np.ndarray) -> np.ndarray:
+    """Converts an arbitrary distance matrix into a non-negative affinity
+    matrix for spectral clustering, via a Gaussian/RBF kernel with sigma
+    set to the median off-diagonal distance (a standard, scale-adaptive
+    default). ONLY used for pairwise_metric in ("l1", "mahalanobis") --
+    cosine keeps its own original, DAVE-fidelity-matched affinity
+    (clip(similarity, 0, None)) untouched, computed directly rather than
+    going through this generic conversion, so this function's introduction
+    cannot change cosine's existing behavior at all.
+
+    NOT from DAVE's own reference code (which only ever used cosine
+    similarity as-is for its affinity) -- this conversion is new, needed
+    only to make l1/mahalanobis distances usable by spectral clustering
+    (which requires a similarity/affinity, not a distance), and is NOT YET
+    VALIDATED.
+    """
+    n = distance.shape[0]
+    off_diag = distance[~np.eye(n, dtype=bool)]
+    sigma = float(np.median(off_diag)) if off_diag.size > 0 else 1.0
+    sigma = max(sigma, 1e-8)
+    return np.exp(-(distance ** 2) / (2.0 * sigma ** 2))
+
+
+def _distance_and_affinity(
+    combined: np.ndarray, pairwise_metric: str, precision_matrix: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Returns (distance_for_hdbscan, affinity_for_spectral, method_label_suffix)
+    for the given cluster_verification.pairwise_metric -- see that field's
+    own docstring (aero_eyes/config.py) for the full rationale of each
+    option. combined is [N+k, D], candidates then refs, same as the
+    caller's own `combined` array.
+    """
+    if pairwise_metric == "cosine":
+        similarity = combined @ combined.T  # cosine, since inputs are L2-normalized
+        # Clip the tiny negative values floating-point roundoff can produce
+        # at distance 0.
+        distance = np.clip(1.0 - similarity, 0.0, None)
+        np.fill_diagonal(distance, 0.0)
+        affinity = np.clip(similarity, 0.0, None)
+        return distance, affinity, ""
+
+    if pairwise_metric == "l1":
+        from scipy.spatial.distance import pdist, squareform
+        distance = squareform(pdist(combined, metric="cityblock"))
+        return distance, _rbf_affinity(distance), "_l1"
+
+    if pairwise_metric == "mahalanobis":
+        if precision_matrix is None:
+            raise ValueError(
+                "cluster_verification.pairwise_metric='mahalanobis' needs a shared precision "
+                "matrix (the inverse covariance from RMD's own background fit -- "
+                "aero_eyes.stages.stage3._fit_rmd_background) passed through as "
+                "cluster_verify_candidates(precision_matrix=...). Currently only wired at "
+                "stage3.py's verification_method='cluster' and cluster_secondary_filter call "
+                "sites -- stage123_geco2.dynamic_prototype.cluster_verification (GeCo2's own "
+                "online/causal path) has no equivalent whole-video background fit yet and will "
+                "always hit this error if pairwise_metric='mahalanobis' is set there."
+            )
+        from scipy.spatial.distance import pdist, squareform
+        distance = squareform(pdist(combined, metric="mahalanobis", VI=precision_matrix))
+        return distance, _rbf_affinity(distance), "_mahalanobis"
+
+    raise ValueError(
+        f"Unknown cluster_verification.pairwise_metric '{pairwise_metric}'. "
+        "Must be 'cosine', 'l1', or 'mahalanobis'."
+    )
+
+
 def cluster_verify_candidates(
     cand_feats: np.ndarray,
     ref_feats: np.ndarray,
     cfg,
     fallback_keep_mask_fn=None,
+    precision_matrix: np.ndarray | None = None,
 ) -> tuple[np.ndarray, str]:
     """Returns (keep_mask [N] bool, method_label).
 
@@ -115,6 +184,11 @@ def cluster_verify_candidates(
         adaptive_threshold_min_samples). Required in that case; a missing
         fallback with too few candidates raises rather than silently
         keeping/dropping everything.
+    precision_matrix: [D, D] shared inverse-covariance -- REQUIRED when
+        cfg.pairwise_metric == "mahalanobis" (raises otherwise), ignored
+        for every other pairwise_metric. See _distance_and_affinity's own
+        docstring for where this comes from and which callers wire it
+        through.
     """
     n = cand_feats.shape[0]
     if n == 0:
@@ -146,33 +220,29 @@ def cluster_verify_candidates(
         return np.ones(n, dtype=bool), "cluster_skipped_too_many_candidates"
 
     combined = np.concatenate([cand_feats, ref_feats], axis=0)  # [N+k, D]
-    similarity = combined @ combined.T  # cosine, since inputs are L2-normalized
+    distance, affinity, metric_suffix = _distance_and_affinity(
+        combined, cfg.pairwise_metric, precision_matrix,
+    )
 
     if cfg.cluster_method == "hdbscan":
         from sklearn.cluster import HDBSCAN
 
-        # Cosine distance for a precomputed-metric clusterer; clip the tiny
-        # negative values floating-point roundoff can produce at distance 0.
-        distance = np.clip(1.0 - similarity, 0.0, None)
-        np.fill_diagonal(distance, 0.0)
         labels = HDBSCAN(
             metric="precomputed",
             min_cluster_size=cfg.min_cluster_size,
             min_samples=cfg.min_samples,
             copy=False,  # `distance` above is a fresh local array, never reused after this call
         ).fit_predict(distance)
-        method_label = "cluster_hdbscan"
+        method_label = f"cluster_hdbscan{metric_suffix}"
         noise_label = -1
     elif cfg.cluster_method == "spectral":
         from sklearn.cluster import SpectralClustering
 
-        # Spectral affinity must be a non-negative similarity, not a distance.
-        affinity = np.clip(similarity, 0.0, None)
         n_clusters = min(_self_tuning_n_clusters(affinity, cfg.spectral_egv_threshold), combined.shape[0])
         labels = SpectralClustering(
             n_clusters=n_clusters, affinity="precomputed", random_state=0,
         ).fit_predict(affinity)
-        method_label = "cluster_spectral"
+        method_label = f"cluster_spectral{metric_suffix}"
         noise_label = None  # spectral clustering never labels a point as noise
     else:
         raise ValueError(f"Unknown cluster_verification.cluster_method '{cfg.cluster_method}'")

@@ -234,3 +234,43 @@ def test_window_admission_requires_corroboration(secondary_filter_setup, tmp_pat
     with caplog.at_level(logging.INFO):
         run_stage3(cfg2, "sample1")
     assert "0 admitted into the trusted window" in caplog.text
+
+
+def test_accumulate_new_anchors_false_never_admits_despite_immediate_confirm(secondary_filter_setup, tmp_path, caplog):
+    """accumulate_new_anchors=false must block window admission entirely,
+    even under window_admission_min_consecutive_hits=1 (the no-op gate
+    that admits a single occurrence immediately -- see the corroboration
+    test above). Proves accumulate_new_anchors is checked BEFORE the
+    confirmer is even offered anything, not just skipped after confirming."""
+    work_dir, ref, fused_ref, make_tp, make_confuser = secondary_filter_setup
+    tp_feat = make_tp(1)[0]
+    _write_candidates_with_features({10: [_det(10, 0.0, tp_feat)]}, work_dir / "candidates.json")
+
+    overrides = _base_overrides(tmp_path) + [
+        "stage3.cluster_secondary_filter.window_admission_min_consecutive_hits=1",
+        "stage3.cluster_secondary_filter.accumulate_new_anchors=false",
+    ]
+    cfg = load_config("configs/config.yaml", overrides=overrides)
+    with caplog.at_level(logging.INFO):
+        det_path = run_stage3(cfg, "sample1")
+    detections = read_detections(det_path)
+
+    assert len(detections[10]) == 1, "clustering against the 3 static exemplars alone must still work"
+    assert "0 admitted into the trusted window" in caplog.text
+
+
+def test_accumulate_new_anchors_true_is_default_and_unchanged(secondary_filter_setup, tmp_path, caplog):
+    """Sanity check that accumulate_new_anchors's own default (true)
+    reproduces the pre-existing admission behavior unchanged -- same setup
+    as the accumulate_new_anchors=false test above, minus that one override."""
+    work_dir, ref, fused_ref, make_tp, make_confuser = secondary_filter_setup
+    tp_feat = make_tp(1)[0]
+    _write_candidates_with_features({10: [_det(10, 0.0, tp_feat)]}, work_dir / "candidates.json")
+
+    overrides = _base_overrides(tmp_path) + [
+        "stage3.cluster_secondary_filter.window_admission_min_consecutive_hits=1",
+    ]
+    cfg = load_config("configs/config.yaml", overrides=overrides)
+    with caplog.at_level(logging.INFO):
+        run_stage3(cfg, "sample1")
+    assert "1 admitted into the trusted window" in caplog.text

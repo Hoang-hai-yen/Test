@@ -337,3 +337,125 @@ def test_max_candidates_for_cluster_none_means_no_cap():
     assert method_label == "cluster_hdbscan"
     assert keep_mask[:n_tp].all()
     assert not keep_mask[n_tp:].any()
+
+
+# ---------------------------------------------------------------------------
+# pairwise_metric = "l1" / "mahalanobis" (cluster_verification.pairwise_metric)
+# ---------------------------------------------------------------------------
+
+def test_distance_and_affinity_cosine_unchanged():
+    """pairwise_metric="cosine" (default) must produce EXACTLY the same
+    distance/affinity this project's own cosine path always has -- the
+    refactor that introduced _distance_and_affinity must not have changed
+    cosine's own numbers even slightly."""
+    from aero_eyes.utils.cluster_verify import _distance_and_affinity
+
+    rng = np.random.default_rng(0)
+    combined = _make_unit(rng.normal(size=(6, 8)))
+    distance, affinity, suffix = _distance_and_affinity(combined, "cosine", None)
+
+    expected_similarity = combined @ combined.T
+    expected_distance = np.clip(1.0 - expected_similarity, 0.0, None)
+    np.fill_diagonal(expected_distance, 0.0)
+    expected_affinity = np.clip(expected_similarity, 0.0, None)
+
+    assert np.allclose(distance, expected_distance)
+    assert np.allclose(affinity, expected_affinity)
+    assert suffix == ""
+
+
+def test_distance_and_affinity_l1_differs_from_cosine():
+    from aero_eyes.utils.cluster_verify import _distance_and_affinity
+
+    rng = np.random.default_rng(1)
+    combined = _make_unit(rng.normal(size=(6, 8)))
+    cosine_distance, _, cosine_suffix = _distance_and_affinity(combined, "cosine", None)
+    l1_distance, l1_affinity, l1_suffix = _distance_and_affinity(combined, "l1", None)
+
+    assert l1_suffix == "_l1"
+    assert not np.allclose(l1_distance, cosine_distance), "L1 must give a genuinely different distance structure"
+    assert np.all(l1_affinity >= 0), "spectral needs a non-negative affinity"
+    assert np.allclose(np.diag(l1_distance), 0.0), "a point's distance to itself must be 0"
+
+
+def test_distance_and_affinity_mahalanobis_requires_precision_matrix():
+    from aero_eyes.utils.cluster_verify import _distance_and_affinity
+
+    rng = np.random.default_rng(2)
+    combined = _make_unit(rng.normal(size=(6, 8)))
+    with pytest.raises(ValueError, match="needs a shared precision matrix"):
+        _distance_and_affinity(combined, "mahalanobis", None)
+
+
+def test_distance_and_affinity_mahalanobis_identity_precision_matches_euclidean():
+    """Mahalanobis distance with precision_matrix = Identity reduces
+    EXACTLY to plain Euclidean (L2) distance -- a clean mathematical
+    sanity check that the wiring (scipy's VI= parameter) is correct."""
+    from scipy.spatial.distance import pdist, squareform
+
+    from aero_eyes.utils.cluster_verify import _distance_and_affinity
+
+    rng = np.random.default_rng(3)
+    combined = rng.normal(size=(6, 8))  # no need to L2-normalize for this check
+    identity = np.eye(8)
+
+    maha_distance, _, suffix = _distance_and_affinity(combined, "mahalanobis", identity)
+    euclidean_distance = squareform(pdist(combined, metric="euclidean"))
+
+    assert suffix == "_mahalanobis"
+    assert np.allclose(maha_distance, euclidean_distance, atol=1e-6)
+
+
+def test_distance_and_affinity_unknown_pairwise_metric_raises():
+    from aero_eyes.utils.cluster_verify import _distance_and_affinity
+
+    combined = _make_unit(np.random.default_rng(4).normal(size=(4, 8)))
+    with pytest.raises(ValueError, match="Unknown cluster_verification.pairwise_metric"):
+        _distance_and_affinity(combined, "bogus", None)
+
+
+@pytest.mark.parametrize("cluster_method", ["hdbscan", "spectral"])
+def test_cluster_verify_candidates_l1_separates_tp_from_fp(cluster_method):
+    """pairwise_metric="l1" end-to-end through cluster_verify_candidates --
+    on the SAME easy, well-separated scene as the cosine baseline test
+    above, l1 should also cleanly separate TP from FP (not claiming l1 is
+    BETTER than cosine, just that it's wired correctly and functional)."""
+    rng = np.random.default_rng(5)
+    cand, ref, n_tp, n_fp = _two_cluster_scene(rng)
+
+    cfg = ClusterVerificationConfig(
+        enabled=True, cluster_method=cluster_method, pairwise_metric="l1", min_cluster_size=2,
+    )
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg)
+
+    assert method_label == f"cluster_{cluster_method}_l1"
+    assert keep_mask[:n_tp].all(), "every TP candidate should cluster with an exemplar"
+    assert not keep_mask[n_tp:].any(), "every FP candidate should be rejected"
+
+
+@pytest.mark.parametrize("cluster_method", ["hdbscan", "spectral"])
+def test_cluster_verify_candidates_mahalanobis_separates_tp_from_fp(cluster_method):
+    """pairwise_metric="mahalanobis" end-to-end, with an identity precision
+    matrix (equivalent to Euclidean distance -- see the identity-matches-
+    euclidean unit test above) on the same easy scene."""
+    rng = np.random.default_rng(6)
+    cand, ref, n_tp, n_fp = _two_cluster_scene(rng)
+    d = cand.shape[1]
+
+    cfg = ClusterVerificationConfig(
+        enabled=True, cluster_method=cluster_method, pairwise_metric="mahalanobis", min_cluster_size=2,
+    )
+    keep_mask, method_label = cluster_verify_candidates(cand, ref, cfg, precision_matrix=np.eye(d))
+
+    assert method_label == f"cluster_{cluster_method}_mahalanobis"
+    assert keep_mask[:n_tp].all(), "every TP candidate should cluster with an exemplar"
+    assert not keep_mask[n_tp:].any(), "every FP candidate should be rejected"
+
+
+def test_cluster_verify_candidates_mahalanobis_without_precision_matrix_raises():
+    rng = np.random.default_rng(7)
+    cand, ref, n_tp, n_fp = _two_cluster_scene(rng)
+
+    cfg = ClusterVerificationConfig(enabled=True, cluster_method="hdbscan", pairwise_metric="mahalanobis")
+    with pytest.raises(ValueError, match="needs a shared precision matrix"):
+        cluster_verify_candidates(cand, ref, cfg)  # precision_matrix defaults to None

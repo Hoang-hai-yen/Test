@@ -65,7 +65,7 @@ runtime:
   num_workers: 4
   batch_size: 16            # candidate-feature extraction batch
   log_level: INFO
-  save_visualizations: true # overlays/heatmaps/annotated video per stage
+  save_visualizations: false # overlays/heatmaps/annotated video per stage
 
 # ----------------------------------------------------------------------------
 # STAGE 1 — Reference processing (offline, runs once per target)
@@ -460,7 +460,7 @@ stage3:
   # NOT YET VALIDATED -- compare against the batch baseline on recorded
   # footage before trusting it for a live feed.
   adaptive_threshold_online: false
-  adaptive_threshold_online_window: 200
+  adaptive_threshold_online_window: 300
   # Alternatives to the "window_stat" (z_score/otsu/gmm on the running
   # window, unchanged) dispatch above -- only take effect when
   # adaptive_threshold_online is also true.
@@ -582,6 +582,18 @@ stage3:
     #   fixed hand-set number -- see cluster_verify.py's
     #   _self_tuning_n_clusters for the full rationale.
     cluster_method: hdbscan   # hdbscan | spectral
+    # Pairwise metric the affinity/distance matrix is built from.
+    # "cosine" (default, DAVE-fidelity-matched, unchanged). "l1" (NOT YET
+    # VALIDATED): Manhattan distance, genuinely different cluster structure
+    # from cosine on L2-normalized vectors. "mahalanobis" (NOT YET
+    # VALIDATED): whitens pairwise distance by the SAME shared inverse-
+    # covariance RMD's own background fit computes (stage3.py's
+    # _fit_rmd_background) -- same idea as stage3.similarity=rmd, applied
+    # to pairwise cluster structure instead of a single point-vs-prototype
+    # score. See ClusterVerificationConfig.pairwise_metric's own docstring
+    # (aero_eyes/config.py) for the full rationale and which call sites
+    # actually wire the precision matrix through.
+    pairwise_metric: cosine   # cosine | l1 | mahalanobis
     min_cluster_size: 2       # hdbscan only
     min_samples: null         # hdbscan only; null = sklearn default (= min_cluster_size)
     # Eigengap threshold (spectral only) -- 0.132 is DAVE's OWN default
@@ -653,12 +665,24 @@ stage3:
     # more context (closer to adaptive_threshold_online's own window) but
     # more compute per keyframe and slower to "forget" a drifted look.
     window_size: 50
+    # true (default): a verified + consecutive-hit-confirmed candidate
+    # gets appended to the trusted window, so later keyframes cluster
+    # against an increasingly rich set of THIS video's own confirmed
+    # appearances. false: the window never accumulates anything -- EVERY
+    # keyframe for the WHOLE video clusters against ONLY the 3 original
+    # exemplars, unchanged from first to last frame. Useful to isolate
+    # whether accumulation itself helps or hurts (e.g. a single early
+    # false-positive slipping past the admission gate and then attracting
+    # texturally-similar confusers for the rest of the video -- impossible
+    # when this is false, at the cost of losing real accumulated context).
+    accumulate_new_anchors: true
     # Reuses the SAME shared cluster_verification knobs as
     # stage3.cluster_verification above (its own `enabled` is not
     # consulted here -- this section's `enabled` is the switch).
     cluster_verification:
       enabled: false
       cluster_method: hdbscan
+      pairwise_metric: cosine   # cosine | l1 | mahalanobis -- see stage3.cluster_verification's own comment above
       min_cluster_size: 2
       min_samples: null
       spectral_egv_threshold: 0.132
@@ -1216,6 +1240,12 @@ stage123_geco2:
     cluster_verification:
       enabled: false
       cluster_method: hdbscan   # hdbscan | spectral -- see stage3.cluster_verification's own comment
+      # cosine | l1 | mahalanobis -- see stage3.cluster_verification's own
+      # comment above for what each does. IMPORTANT: "mahalanobis" is NOT
+      # wired for this GeCo2 path -- it has no equivalent whole-video
+      # background fit (unlike stage3.py's two call sites) and raises a
+      # clear error at runtime if set here. Only cosine/l1 actually work.
+      pairwise_metric: cosine
       min_cluster_size: 2       # hdbscan only
       min_samples: null         # hdbscan only; null = sklearn default (= min_cluster_size)
       spectral_egv_threshold: 0.132   # spectral only -- see stage3.cluster_verification's own comment

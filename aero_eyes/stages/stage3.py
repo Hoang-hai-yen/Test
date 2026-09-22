@@ -1002,7 +1002,22 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # scoring, so every consumer (main scoring, dynamic_prototype's own
     # re-scoring rounds, the cluster-mode fallback) whitens against the
     # SAME distribution. None for every other metric (ignored there).
-    background = _fit_rmd_background(all_feats) if s3.similarity == "rmd" else None
+    #
+    # Also fit (same call, same background) whenever either cluster
+    # verification path below needs a precision_matrix for
+    # cluster_verification.pairwise_metric="mahalanobis" -- one shared fit
+    # regardless of which consumer(s) actually need it, same as the
+    # s3.similarity="rmd" case.
+    needs_rmd_background = (
+        s3.similarity == "rmd"
+        or (s3.verification_method == "cluster" and s3.cluster_verification.pairwise_metric == "mahalanobis")
+        or (
+            s3.cluster_secondary_filter.enabled
+            and s3.cluster_secondary_filter.cluster_verification.pairwise_metric == "mahalanobis"
+        )
+    )
+    background = _fit_rmd_background(all_feats) if needs_rmd_background else None
+    precision_matrix = background[1] if background is not None else None
 
     # Compute similarity for every candidate at once (higher = more similar,
     # regardless of metric -- see _score_against_ref).
@@ -1140,7 +1155,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
             idxs = frame_to_indices[fi]
             frame_keep, method_label = cluster_verify_candidates(
                 all_feats[idxs], ref_feats_for_cluster, s3.cluster_verification,
-                fallback_keep_mask_fn=_fallback_keep_mask,
+                fallback_keep_mask_fn=_fallback_keep_mask, precision_matrix=precision_matrix,
             )
             method_counts[method_label] += 1
             for local_i, global_i in enumerate(idxs):
@@ -1362,7 +1377,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
             )
             frame_keep, _ = cluster_verify_candidates(
                 all_feats[idxs], ref_feats_for_frame, csf_cfg.cluster_verification,
-                fallback_keep_mask_fn=_keep_everyone,
+                fallback_keep_mask_fn=_keep_everyone, precision_matrix=precision_matrix,
             )
             verified_global_idxs = []
             for local_i, global_i in enumerate(idxs):
@@ -1371,11 +1386,15 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 else:
                     keep_mask[global_i] = False
                     n_rejected += 1
-            if verified_global_idxs:
+            if verified_global_idxs and csf_cfg.accumulate_new_anchors:
                 # This keyframe's single best-scoring verified candidate is
                 # what's "offered" to the confirmer -- same convention
                 # GeCo2DynamicPrototypeTracker.offer() already uses (one
                 # representative box per keyframe, not every survivor).
+                # Skipped entirely (not just the append below) when
+                # accumulate_new_anchors=False -- trusted_window then stays
+                # permanently empty, so every keyframe clusters against
+                # ONLY the 3 original exemplars for the whole video.
                 best_i = max(verified_global_idxs, key=lambda i: all_sims[i])
                 confirmed_box = window_confirmer.offer(all_dets[best_i].box)
                 if confirmed_box is not None:
