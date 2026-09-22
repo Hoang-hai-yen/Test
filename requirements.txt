@@ -42,3 +42,8 @@ onnxruntime-gpu        # CPU-only machine: use `onnxruntime` instead
 # Also needs Kaggle API credentials configured (~/.kaggle/kaggle.json or
 # KAGGLE_USERNAME/KAGGLE_KEY env vars).
 kagglehub
+
+# Optional — only needed if stage1.feature_extractor.model == "evaclip"
+# (LAION's library; loads EVA02-CLIP-B/16 weights from the `timm/` HF hub
+# namespace automatically, no separate download step needed).
+open_clip_torch

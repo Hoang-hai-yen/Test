@@ -769,7 +769,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
     box_refine_segmenter = None
     geco2_refine_detector = None
     geco2_refine_prototype = None
-    if br_cfg.enabled and br_cfg.apply_in_stage3:
+    if br_cfg.enabled and (br_cfg.apply_in_stage3 or br_cfg.apply_before_stage3_filtering):
         if br_cfg.method in ("sam", "sam_dense"):
             from aero_eyes.models.segmentation import MobileSAMSegmenter
             box_refine_segmenter = MobileSAMSegmenter(weights_path=cfg.stage1.segmentation.weights)
@@ -826,6 +826,29 @@ def run_stage3(cfg, sample_id: str) -> Path:
         from aero_eyes.stages.stage2 import _write_candidates_with_features
 
         recompute_extractor = build_feature_extractor(cfg)
+
+        # box_refine.apply_before_stage3_filtering: tighten EVERY candidate
+        # box (not just the per-keyframe winner apply_in_stage3 refines)
+        # BEFORE the crop below is taken -- so the re-extracted embedding
+        # reflects the tightened box, not the original loose one. See that
+        # field's own docstring (aero_eyes/config.py) for the full
+        # rationale. No "selected"/threshold-passing population exists yet
+        # at this point in the pipeline for adaptive_context_margin's own
+        # relative_to_sample_median sizing to compare against -- approximate
+        # it from every RAW candidate box's own size instead (still a
+        # reasonable "typical box size in this video" proxy).
+        apply_prefilter_refine = br_cfg.enabled and br_cfg.apply_before_stage3_filtering
+        n_boxes_refined = 0
+        if apply_prefilter_refine:
+            from aero_eyes.utils.box_refine import apply_iou_gate, refine_box, refine_boxes_dense
+
+            all_cand_boxes = [d.box for dets in candidates.values() for d in dets]
+            prefilter_reference_size = None
+            if all_cand_boxes:
+                prefilter_reference_size = float(np.median([
+                    ((b.x2 - b.x1) * (b.y2 - b.y1)) ** 0.5 for b in all_cand_boxes
+                ]))
+
         n_recomputed = 0
         for frame_idx, cand_dets in candidates.items():
             if not cand_dets:
@@ -834,6 +857,46 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 frame_bgr = read_frame(video_path, frame_idx)
             except Exception:
                 continue
+
+            if apply_prefilter_refine:
+                boxes = [d.box for d in cand_dets]
+                if br_cfg.method in ("sam_dense", "fastsam_dense", "sam2_native"):
+                    refined_boxes = refine_boxes_dense(
+                        box_refine_segmenter, frame_bgr, boxes,
+                        min_iou_with_original=br_cfg.min_iou_with_original,
+                        context_margin=br_cfg.context_margin,
+                        adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                        sample_reference_size=prefilter_reference_size,
+                        use_center_point=br_cfg.use_center_point_prompt,
+                    )
+                elif br_cfg.method == "sam2_dense":
+                    if geco2_refine_detector is not None:
+                        refined_boxes = geco2_refine_detector.sam2_refine_boxes(
+                            frame_bgr, geco2_refine_prototype, boxes,
+                            context_margin=br_cfg.context_margin,
+                            adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                            sample_reference_size=prefilter_reference_size,
+                            use_center_point=br_cfg.use_center_point_prompt,
+                            select_best_mask=br_cfg.sam2_dense_select_best_mask,
+                        )
+                        refined_boxes = apply_iou_gate(refined_boxes, boxes, br_cfg.min_iou_with_original)
+                    else:
+                        refined_boxes = boxes
+                else:
+                    refined_boxes = [
+                        refine_box(
+                            br_cfg.method, frame_bgr, b, br_cfg.context_margin,
+                            segmenter=box_refine_segmenter, min_iou_with_original=br_cfg.min_iou_with_original,
+                            adaptive_context_margin_cfg=br_cfg.adaptive_context_margin,
+                            sample_reference_size=prefilter_reference_size,
+                            use_center_point=br_cfg.use_center_point_prompt,
+                        )
+                        for b in boxes
+                    ]
+                for det, rb in zip(cand_dets, refined_boxes):
+                    det.box = rb
+                n_boxes_refined += len(cand_dets)
+
             feats = recompute_extractor.extract_crops(
                 frame_bgr, [d.box for d in cand_dets],
                 pad_ratio=cfg.stage2.candidate.feature_crop_pad,
@@ -843,6 +906,12 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 det._feature = feat
             n_recomputed += len(cand_dets)
         _write_candidates_with_features(candidates, cand_path)
+        if apply_prefilter_refine:
+            log.info(
+                "[Stage3] %s: box_refine.apply_before_stage3_filtering -- refined %d candidate "
+                "box(es) (method=%s) before re-extracting their features.",
+                sample_id, n_boxes_refined, br_cfg.method,
+            )
         log.info(
             "[Stage3] %s: recompute_candidate_features -- re-extracted %d candidate "
             "feature(s) across %d keyframe(s), rewrote %s",
@@ -851,6 +920,14 @@ def run_stage3(cfg, sample_id: str) -> Path:
         # Re-read rather than hand-assemble feat_matrix here -- keeps this
         # path exercising the exact same load code every other run takes.
         candidates, feat_matrix = read_candidates_with_features(cand_path)
+    elif br_cfg.enabled and br_cfg.apply_before_stage3_filtering:
+        log.info(
+            "[Stage3] %s: box_refine.apply_before_stage3_filtering=true but "
+            "stage3.recompute_candidate_features=false (or no video found) -- no-op. "
+            "Refining box geometry without re-extracting its feature would leave "
+            "candidates.json's cached embedding mismatched with its own box.",
+            sample_id,
+        )
 
     if feat_matrix is None or feat_matrix.shape[0] == 0:
         log.warning("[Stage3] No candidate features found — writing empty detections.")

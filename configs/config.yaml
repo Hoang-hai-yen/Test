@@ -105,7 +105,7 @@ stage1:
   crop_to_object: false
   crop_context_margin: 0.5
   feature_extractor:
-    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dino+clip concat, see ensemble_dino_model below) | fgclip | radio
+    model: dinov2            # dinov2 | dinov3 | clip | siglip | ensemble (dino+clip concat, see ensemble_dino_model below) | fgclip | radio | siglip2 | evaclip | dinotxt
     dinov2_variant: vitb14   # vits14 (~22M, 384-d) | vitb14 (~86M, 768-d) | vitl14 (~300M, 1024-d) | vitg14 (~1.1B, 1536-d)
                               # larger variants = stronger features but much slower/heavier; vitl14 is a reasonable next step to try
     # "With registers" DINOv2 (dinov2_{variant}_reg on torch.hub / HF
@@ -185,6 +185,31 @@ stage1:
     # Open Model License (commercial use allowed); radio-*/e-radio are
     # NSCLv1 (non-commercial only). NOT YET VALIDATED.
     radio_variant: c-radio_v3-b   # c-radio_v3-{b,l,h,g} | c-radio_v4-{so400m,h} | radio-{b,l,g} | e-radio
+    # SigLIP2 (arXiv:2502.14786): adds Global-Local + Masked Prediction
+    # losses over SigLIP for better LOCAL/dense semantics -- 2nd-strongest
+    # evidenced fine-grained/near-duplicate discrimination family after
+    # FG-CLIP, but standard transformers classes (no trust_remote_code,
+    # much lower integration risk than FG-CLIP's troubled 4-bug history).
+    # Used only when model=siglip2. NOT YET VALIDATED.
+    siglip2_variant: base    # base (google/siglip2-base-patch16-224) | so400m (google/siglip2-so400m-patch14-384)
+    # EVA02-CLIP-B/16 (~150M) via open_clip_torch (NEW dependency, `pip
+    # install open_clip_torch` -- not needed by any other extractor here).
+    # Weaker direct fine-grained evidence than FG-CLIP/SigLIP2 (only
+    # large-scale zero-shot classification numbers found, not an FG-OVD-
+    # style benchmark), but lower integration risk (stable LAION library,
+    # not trust_remote_code). Used only when model=evaclip. Only "base" is
+    # wired. NOT YET VALIDATED.
+    evaclip_variant: base
+    # dino.txt / "DINOv2 Meets Text" (arXiv:2412.16334): LiT-aligned text
+    # encoder over a FROZEN DINOv2 ViT-L/14 (w/ registers) -- adds language/
+    # semantic grounding without leaving the DINO family, unlike every
+    # other non-DINO option above. Same torch.hub mechanism as model=dinov2
+    # (facebookresearch/dinov2 repo), no trust_remote_code, no new
+    # dependency. Used only when model=dinotxt; no variant field (only one
+    # public size). NOT YET VALIDATED -- see DinoTxtFeatureExtractor's own
+    # docstring (aero_eyes/models/features.py) for preprocessing/output
+    # details that could not be independently verified without a live
+    # download.
     weights: null            # null = load from torch.hub / hf
     image_size: 224
     # Optional small trained head on top of the frozen backbone above (see
@@ -1682,7 +1707,7 @@ box_refine:
   #               outright -- a known FastSAM weak point on small objects).
   #               Not yet benchmarked -- compare with
   #               scripts/check_box_refine_effect.py before trusting it.
-  method: sam                # "sam" | "sam_dense" | "grabcut" | "sam2_dense" | "fastsam_dense" | "sam2_native"
+  method: fastsam_dense                # "sam" | "sam_dense" | "grabcut" | "sam2_dense" | "fastsam_dense" | "sam2_native"
   # "sam"/"grabcut": padding kept around the box when CROPPING to segment.
   # "sam_dense": padding added to the box PROMPT itself before querying SAM
   #   -- without this, an undersized detector box rarely gets expanded back
@@ -1761,6 +1786,20 @@ box_refine:
   # stage4.verify_interval > 0) -- re-inits the tracker from the refined
   # box too. More expensive: runs during tracking, not just at keyframes.
   apply_in_stage4: false
+  # Refine EVERY surviving candidate box (not just the per-keyframe WINNER
+  # apply_in_stage3 refines) BEFORE Stage 3's cosine matching/threshold
+  # decision -- so a tighter box also feeds a cleaner re-extracted
+  # embedding into the verification decision itself, not just into the
+  # final box shape. ONLY takes effect when stage3.recompute_candidate_
+  # features is ALSO true (no-op otherwise, logged) -- refining geometry
+  # without re-extracting its feature would leave candidates.json's cached
+  # embedding mismatched with its own box. Reuses the SAME method/
+  # context_margin/min_iou_with_original/adaptive_context_margin/
+  # use_center_point_prompt settings above as apply_in_stage3.
+  # NOT YET VALIDATED, and more expensive than apply_in_stage3 (every
+  # candidate across every keyframe, not just topk_per_keyframe winners) --
+  # compare against apply_in_stage3-only on your own footage first.
+  apply_before_stage3_filtering: false
 
 # ----------------------------------------------------------------------------
 # ACCURACY MODE — progressively enables domain-gap mitigations.

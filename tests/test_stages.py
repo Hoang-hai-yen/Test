@@ -535,6 +535,112 @@ def test_stage3_box_refine_produces_detections(cfg, synth_fixture):
     assert "frames" in pre_data
 
 
+def test_stage3_box_refine_before_filtering_runs_with_recompute(cfg, synth_fixture):
+    """box_refine.apply_before_stage3_filtering=True (method=grabcut, no
+    model needed) + stage3.recompute_candidate_features=True: refines
+    EVERY candidate box before Stage 3 re-extracts its feature, not just
+    the per-keyframe winner apply_in_stage3 refines. Grabcut falls back to
+    the unchanged box on failure (never raises -- see refine_box_with_
+    grabcut's own docstring), so this only asserts the new wiring
+    completes end-to-end and detections.json comes out valid, same
+    assertion depth test_stage3_box_refine_produces_detections uses for
+    apply_in_stage3. Also checks no detections_prerefine.json is written --
+    that snapshot belongs to apply_in_stage3 only, which is off here."""
+    cfg.box_refine.enabled = True
+    cfg.box_refine.method = "grabcut"
+    cfg.box_refine.apply_in_stage3 = False
+    cfg.box_refine.apply_before_stage3_filtering = True
+    cfg.stage3.recompute_candidate_features = True
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+    mock_prop = _mock_proposals()
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop):
+        from aero_eyes.stages.stage2 import run_stage2
+        run_stage2(cfg, FIXTURE_ID)
+
+    from aero_eyes.stages.stage3 import run_stage3
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor):
+        det_path = run_stage3(cfg, FIXTURE_ID)
+
+    assert det_path.exists(), f"detections.json not found at {det_path}"
+    with open(det_path) as f:
+        data = json.load(f)
+    assert "schema_version" in data
+    assert "frames" in data
+
+    prerefine_path = det_path.parent / "detections_prerefine.json"
+    assert not prerefine_path.exists(), (
+        "apply_in_stage3 is off in this test -- only apply_before_stage3_filtering "
+        "ran, which has no detections_prerefine.json snapshot of its own"
+    )
+
+
+def test_stage3_box_refine_before_filtering_noop_without_recompute(cfg, synth_fixture):
+    """apply_before_stage3_filtering=True but recompute_candidate_features
+    left at its default (False): the new pre-filter refine must be a
+    no-op -- candidates.json's box geometry stays byte-identical. Refining
+    geometry without also re-extracting its feature would leave the
+    cached embedding mismatched with its own box, strictly worse than
+    doing neither (see BoxRefineConfig.apply_before_stage3_filtering's
+    own docstring)."""
+    cfg.box_refine.enabled = True
+    cfg.box_refine.method = "grabcut"
+    cfg.box_refine.apply_in_stage3 = False
+    cfg.box_refine.apply_before_stage3_filtering = True
+    assert cfg.stage3.recompute_candidate_features is False
+
+    feat_dim = 384
+    mock_extractor = _mock_dinov2(feat_dim)
+    mock_prop = _mock_proposals()
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.segmentation.MobileSAMSegmenter") as mock_seg_cls:
+        mock_seg = MagicMock()
+        mock_seg.segment.return_value = np.ones((224, 224), dtype=bool)
+        mock_seg_cls.return_value = mock_seg
+        from aero_eyes.stages.stage1 import run_stage1
+        run_stage1(cfg, FIXTURE_ID)
+
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor), \
+         patch("aero_eyes.models.proposals.build_proposal_model", return_value=mock_prop):
+        from aero_eyes.stages.stage2 import run_stage2
+        run_stage2(cfg, FIXTURE_ID)
+
+    from aero_eyes.stages.stage2 import read_candidates_with_features
+    work_dir = Path(cfg.project.work_dir) / FIXTURE_ID
+    candidates_before, _ = read_candidates_with_features(work_dir / "candidates.json")
+    boxes_before = {
+        fi: [(d.box.x1, d.box.y1, d.box.x2, d.box.y2) for d in dets]
+        for fi, dets in candidates_before.items()
+    }
+
+    from aero_eyes.stages.stage3 import run_stage3
+    with patch("aero_eyes.models.features.build_feature_extractor", return_value=mock_extractor):
+        det_path = run_stage3(cfg, FIXTURE_ID)
+    assert det_path.exists()
+
+    candidates_after, _ = read_candidates_with_features(work_dir / "candidates.json")
+    boxes_after = {
+        fi: [(d.box.x1, d.box.y1, d.box.x2, d.box.y2) for d in dets]
+        for fi, dets in candidates_after.items()
+    }
+    assert boxes_after == boxes_before, (
+        "candidates.json box geometry must stay untouched when "
+        "recompute_candidate_features is off, even with apply_before_stage3_filtering=True"
+    )
+
+
 def test_pool_sims():
     """accuracy.cheap_boosters.multi_ref_pooling: 'mean' averages per-ref
     scores (diluted by a weak ref), 'max' keeps the single best-matching

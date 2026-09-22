@@ -195,7 +195,10 @@ class ProjectionHeadConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble", "fgclip", "radio"] = "dinov2"
+    model: Literal[
+        "dinov2", "dinov3", "clip", "siglip", "ensemble", "fgclip", "radio",
+        "siglip2", "evaclip", "dinotxt",
+    ] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     # DINOv2 "with registers" (torch.hub dinov2_{variant}_reg / HF
     # facebook/dinov2-with-registers-*): Meta found a handful of patch tokens
@@ -309,6 +312,49 @@ class FeatureExtractorConfig(BaseModel):
         "c-radio_v4-so400m", "c-radio_v4-h",
         "radio-b", "radio-l", "radio-g", "e-radio",
     ] = "c-radio_v3-b"
+    # SigLIP2 (arXiv:2502.14786, Google DeepMind) -- adds a Global-Local +
+    # Masked Prediction loss on top of SigLIP's sigmoid image-text loss,
+    # specifically to improve LOCAL/dense semantics (not just global
+    # category alignment) -- second-strongest evidenced fine-grained/
+    # near-duplicate discrimination family found after FG-CLIP, and used in
+    # NVIDIA's own production video-analytics stack for cosine-similarity
+    # re-identification. Unlike FG-CLIP, loads via STANDARD transformers
+    # classes (AutoModel/AutoProcessor, no trust_remote_code) -- see
+    # Siglip2FeatureExtractor's own docstring (aero_eyes/models/features.py)
+    # for why this is a materially lower integration-risk choice. Only
+    # "base"/"so400m" are wired here (the two checkpoint ids confirmed to
+    # exist at implementation time) -- NOT YET VALIDATED on this project's
+    # own footage.
+    siglip2_variant: Literal["base", "so400m"] = "base"
+    # EVA02-CLIP (BAAI, via the open_clip_torch library -- a NEW dependency
+    # for this project, not needed by any other extractor here) -- a CLIP
+    # variant whose vision tower initializes from an EVA (self-supervised
+    # masked-image-modeling) backbone before contrastive image-text
+    # fine-tuning, i.e. itself a hybrid of self-supervised + contrastive
+    # training. Only "base" (EVA02-B-16, ~150M params, closest in scale to
+    # this project's DINOv2 ViT-B/14 baseline) is wired here -- weaker
+    # DIRECT evidence for fine-grained/near-duplicate discrimination than
+    # FG-CLIP/SigLIP2 (only large-scale zero-shot classification numbers
+    # were found, not a comparable FG-OVD-style benchmark), but lower
+    # integration risk than FG-CLIP's trust_remote_code path (open_clip is
+    # a stable, widely-used LAION library, not per-repo custom code) -- see
+    # EVACLIPFeatureExtractor's own docstring. NOT YET VALIDATED.
+    evaclip_variant: Literal["base"] = "base"
+    # dino.txt / "DINOv2 Meets Text" (arXiv:2412.16334) -- adds a text
+    # encoder trained via LiT (Locked-image Text tuning) to align with a
+    # FROZEN DINOv2 ViT-L/14 (with registers) backbone, i.e. retrofits
+    # language/semantic grounding onto DINOv2 while keeping its dense/
+    # pixel-level task quality -- directly targets this project's original
+    # framing of DINOv2's own limitation (pure self-supervised texture
+    # clustering, no notion of "object" vs "clutter") without switching
+    # away from the DINO family entirely. Loads via the SAME torch.hub
+    # mechanism as this project's own dinov2 model= option (facebookresearch/
+    # dinov2 repo) -- no trust_remote_code, no new dependency. Only one
+    # size exists publicly at implementation time (ViT-L/14 w/ registers,
+    # ~300M) -- no variant field. See DinoTxtFeatureExtractor's own
+    # docstring for real, unresolved uncertainty about its exact output
+    # layout (CLS-concat-patch-average per the paper) that couldn't be
+    # independently verified without a live download. NOT YET VALIDATED.
     weights: Optional[str] = None
     image_size: int = 224
     projection_head: ProjectionHeadConfig = ProjectionHeadConfig()
@@ -2848,6 +2894,32 @@ class BoxRefineConfig(BaseModel):
     sam2_dense_select_best_mask: bool = False
     apply_in_stage3: bool = True
     apply_in_stage4: bool = False
+    # Refines EVERY surviving candidate box (not just the per-keyframe
+    # WINNER apply_in_stage3 refines) BEFORE Stage 3's cosine matching/
+    # threshold decision -- distinct axis from apply_in_stage3, which only
+    # tightens the box AFTER verification already picked it (purely a
+    # localization/ST-IoU fix, never feeds back into the decision itself).
+    # Rationale: stage3.recompute_candidate_features re-extracts each
+    # candidate's embedding from its CURRENT box geometry (see that field's
+    # own docstring) -- a loose/undersized candidate box crops in extra
+    # background/clutter (or cuts off part of the object) that can leak
+    # into and dominate that embedding, degrading the very similarity score
+    # used to accept/reject it. Refining the box FIRST, then recomputing
+    # its feature from the TIGHTENED crop, means the verification decision
+    # itself is judged on a cleaner embedding -- not just a cleaner final
+    # box shape.
+    # Only takes effect when stage3.recompute_candidate_features is ALSO
+    # true (logged as a no-op otherwise) -- refining geometry without also
+    # re-extracting the feature from it would leave candidates.json's
+    # cached embedding mismatched with its own box, which is strictly
+    # worse than doing neither. Reuses this SAME box_refine.method/
+    # context_margin/min_iou_with_original/adaptive_context_margin/
+    # use_center_point_prompt configuration as apply_in_stage3 -- one
+    # segmenter setup serves both gates.
+    # NOT YET VALIDATED -- more expensive than apply_in_stage3 (every
+    # candidate across every keyframe, not just topk_per_keyframe winners)
+    # -- compare against apply_in_stage3-only on your own footage first.
+    apply_before_stage3_filtering: bool = False
     # Reject a refined box whose IoU with the ORIGINAL (pre-refine) box
     # falls below this -- guards against the segmenter latching onto a
     # sub-part, a nearby confuser, or background clutter within the padded

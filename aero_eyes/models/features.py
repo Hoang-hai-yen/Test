@@ -28,6 +28,17 @@ Supported models:
   radio    — NVIDIA RADIO / C-RADIO, a backbone distilled from multiple
              teacher VFMs at once (DINOv2/v3 + CLIP/SigLIP2 + SAM/SAM3),
              pooled "summary" embedding. NOT YET VALIDATED.
+  siglip2  — SigLIP2 (base/so400m), adds Global-Local + Masked Prediction
+             losses over SigLIP for better local/dense semantics. Standard
+             transformers classes, no trust_remote_code. NOT YET VALIDATED.
+  evaclip  — EVA02-CLIP-B/16 (~150M) via the open_clip_torch library (a new
+             dependency). NOT YET VALIDATED.
+  dinotxt  — dino.txt: a text encoder LiT-aligned to a FROZEN DINOv2
+             ViT-L/14 (w/ registers) backbone -- adds language/semantic
+             grounding without leaving the DINO family. Same torch.hub
+             mechanism as model="dinov2". NOT YET VALIDATED -- see
+             DinoTxtFeatureExtractor's own docstring for details that could
+             not be independently verified without a live download.
 
 All extractors return L2-normalized float32 feature vectors.
 """
@@ -966,6 +977,314 @@ class RadioFeatureExtractor:
 
 
 # ---------------------------------------------------------------------------
+# SigLIP2 (Google DeepMind, arXiv:2502.14786)
+# ---------------------------------------------------------------------------
+
+class Siglip2FeatureExtractor:
+    """SigLIP2 vision encoder (arXiv:2502.14786) -- vision-only, returns
+    L2-normalized image embeddings.
+
+    Adds a Global-Local Loss + Masked Prediction Loss on top of SigLIP's
+    original sigmoid image-text loss, specifically to improve LOCAL/dense
+    semantics rather than just global category alignment -- the second-
+    strongest evidenced fine-grained/near-duplicate discrimination family
+    found (after FG-CLIP) for this project's object-vs-clutter problem, and
+    used in NVIDIA's own production video-analytics stack for cosine-
+    similarity re-identification.
+
+    Unlike FG-CLIP (qihoo360/fg-clip-*, this project's own earlier,
+    troubled integration -- 4 separate remote-code compatibility bugs
+    fixed in turn), SigLIP2 is a STANDARD, first-party transformers
+    architecture: loaded via plain AutoModel/AutoProcessor, no
+    trust_remote_code, no vendored/community modeling code -- materially
+    lower integration risk.
+
+    Uses model.get_image_features(**inputs) -- the officially documented
+    API (transformers docs' own dedicated example calls exactly this),
+    NOT a hand-pooled hidden_state -- SigLIP2's checkpoints (even the
+    fixed-resolution "FixRes" ones used here) are patch-count-based
+    internally (see Siglip2VisionConfig.num_patches), so get_image_features
+    is the one call guaranteed to handle whatever pixel_values/
+    pixel_attention_mask/spatial_shapes the processor actually produced,
+    without this class needing to special-case that.
+
+    Only "base" (google/siglip2-base-patch16-224) and "so400m"
+    (google/siglip2-so400m-patch14-384) are wired -- the two checkpoint
+    ids directly confirmed to exist at implementation time; other sizes
+    (large/giant) were not independently verified and are deliberately
+    left out rather than guessed.
+
+    Output dimension is probed once at construction (real forward pass on
+    a dummy image) rather than hardcoded -- the transformers docs read
+    while implementing this did not surface a clean per-variant output_dim
+    table, and this project has already been burned once (FG-CLIP) by
+    trusting an assumed number instead of a measured one.
+
+    NOT YET VALIDATED on this project's own footage.
+    """
+
+    _VARIANT_MAP = {
+        "base":   "google/siglip2-base-patch16-224",
+        "so400m": "google/siglip2-so400m-patch14-384",
+    }
+
+    def __init__(self, variant: str = "base", device: str = "auto"):
+        if variant not in self._VARIANT_MAP:
+            raise ValueError(f"Unknown SigLIP2 variant '{variant}'. Must be one of {list(self._VARIANT_MAP)}.")
+        self.variant = variant
+        self.device  = _resolve_device(device)
+        self.model, self.processor = self._load(variant)
+        self.model.eval().to(self.device)
+        self._cached_dim = self._probe_dim()
+        log.info("SigLIP2 %s on %s  (dim=%d)", variant, self.device, self._cached_dim)
+
+    def _load(self, variant: str):
+        try:
+            from transformers import AutoModel, AutoProcessor
+        except ImportError:
+            raise RuntimeError(
+                "transformers not installed. Run: pip install transformers"
+            )
+        hf_name = self._VARIANT_MAP[variant]
+        processor = AutoProcessor.from_pretrained(hf_name)
+        model = AutoModel.from_pretrained(hf_name)
+        return model, processor
+
+    @torch.no_grad()
+    def _probe_dim(self) -> int:
+        dummy = Image.new("RGB", (224, 224))
+        inputs = self.processor(images=[dummy], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        feats = self.model.get_image_features(**inputs)
+        return int(feats.shape[-1])
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            inputs = self.processor(images=batch_pil, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            feats = self.model.get_image_features(**inputs)
+            out.append(F.normalize(feats, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._cached_dim
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
+# EVA02-CLIP (BAAI, via open_clip_torch)
+# ---------------------------------------------------------------------------
+
+class EVACLIPFeatureExtractor:
+    """EVA02-CLIP-B/16 (BAAI) -- vision-only, returns L2-normalized image
+    embeddings. Vision tower initializes from an EVA (self-supervised
+    masked-image-modeling) backbone before CLIP-style contrastive image-
+    text fine-tuning -- a hybrid of self-supervised + contrastive training,
+    unlike vanilla CLIP/SigLIP (purely contrastive).
+
+    Loaded via `open_clip_torch` (LAION's library) -- CONFIRMED (checked
+    open_clip's own model registry/pretrained-tag table while implementing
+    this) rather than assumed: model name "EVA02-B-16", pretrained tag
+    "merged2b_s8b_b131k" (weights auto-fetched from the `timm/` HF hub
+    namespace). This is NOT the narrow, sparsely-maintained BAAI `eva_clip`
+    package (a different, higher-risk dependency this project deliberately
+    avoided), and NOT transformers/trust_remote_code -- open_clip is a
+    stable, widely-used, actively-maintained library, though it IS a NEW
+    dependency for this project (not required by any other extractor here).
+
+    Weaker DIRECT evidence for fine-grained/near-duplicate discrimination
+    than FG-CLIP/SigLIP2 -- only large-scale zero-shot classification
+    numbers were found for the EVA-CLIP family (and only for the 18B
+    flagship, not this ~150M base size), not a comparable FG-OVD-style
+    benchmark. Included as a lower-integration-risk alternative to try
+    empirically, not because of stronger cited evidence.
+
+    Output dimension is probed once at construction (real forward pass on
+    a dummy image) rather than hardcoded.
+
+    NOT YET VALIDATED on this project's own footage.
+    """
+
+    _OPEN_CLIP_NAME = "EVA02-B-16"
+    _PRETRAINED_TAG = "merged2b_s8b_b131k"
+
+    def __init__(self, variant: str = "base", device: str = "auto"):
+        if variant != "base":
+            raise ValueError(f"Unknown EVA-CLIP variant '{variant}'. Only 'base' is wired.")
+        self.variant = variant
+        self.device  = _resolve_device(device)
+        self.model, self.preprocess = self._load()
+        self.model.eval().to(self.device)
+        self._cached_dim = self._probe_dim()
+        log.info("EVA02-CLIP-B/16 on %s  (dim=%d)", self.device, self._cached_dim)
+
+    def _load(self):
+        try:
+            import open_clip
+        except ImportError:
+            raise RuntimeError(
+                "open_clip_torch not installed. Run: pip install open_clip_torch"
+            )
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            self._OPEN_CLIP_NAME, pretrained=self._PRETRAINED_TAG,
+        )
+        return model, preprocess
+
+    @torch.no_grad()
+    def _probe_dim(self) -> int:
+        dummy = Image.new("RGB", (224, 224))
+        batch = self.preprocess(dummy).unsqueeze(0).to(self.device)
+        feats = self.model.encode_image(batch)
+        return int(feats.shape[-1])
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        out: list[np.ndarray] = []
+        for i in range(0, len(pil_imgs), batch_size):
+            batch_pil = pil_imgs[i:i+batch_size]
+            batch = torch.stack([self.preprocess(im) for im in batch_pil]).to(self.device)
+            feats = self.model.encode_image(batch)
+            out.append(F.normalize(feats, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._cached_dim
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
+# dino.txt / "DINOv2 Meets Text" (arXiv:2412.16334)
+# ---------------------------------------------------------------------------
+
+class DinoTxtFeatureExtractor:
+    """dino.txt (arXiv:2412.16334, "DINOv2 Meets Text") -- vision-only,
+    returns L2-normalized image embeddings.
+
+    Adds a text encoder trained via LiT (Locked-image Text tuning) to
+    align with a FROZEN DINOv2 ViT-L/14 (with registers) backbone --
+    retrofits language/semantic grounding onto DINOv2 while keeping its
+    dense/pixel-level task quality, rather than switching away from the
+    DINO family entirely (unlike CLIP/SigLIP2/FG-CLIP/EVA-CLIP, which are
+    all different architectures/training paradigms). Directly targets this
+    project's own original framing of DINOv2's limitation -- pure self-
+    supervised texture clustering, no notion of "this is an object" vs
+    "this is background clutter" -- while other candidates in this module
+    trade away DINO's dense-feature strength to get that notion.
+
+    Loaded via the SAME torch.hub mechanism as this project's own
+    model="dinov2" option (facebookresearch/dinov2 repo) -- no
+    trust_remote_code, no new dependency, same trust level as an
+    already-working extractor in this file.
+
+    HONESTY NOTE on things that could NOT be independently verified
+    without a live download (no GPU/network available while implementing
+    this): (1) the exact return type of torch.hub.load(...) for this
+    entrypoint -- handled defensively below for both a bare model and a
+    (model, tokenizer) tuple; (2) the exact image preprocessing this
+    checkpoint expects -- reuses _preprocess_dino (the same ImageNet-style
+    normalization this project's own DINOv2 torch.hub path already uses),
+    a reasoned assumption (the vision tower is a frozen, unmodified
+    DINOv2), not a confirmed one; (3) the exact output embedding
+    dimension -- probed dynamically rather than hardcoded, same pattern as
+    RadioFeatureExtractor/Siglip2FeatureExtractor/EVACLIPFeatureExtractor
+    above, specifically BECAUSE of this uncertainty.
+
+    Confirmed (not assumed): the hub entrypoint name itself, and
+    encode_image(images, normalize=True) as the method to call.
+
+    NOT YET VALIDATED on this project's own footage -- validate the
+    preprocessing assumption above FIRST if results look wrong, before
+    concluding the model itself is a poor fit.
+    """
+
+    _HUB_ENTRYPOINT = "dinov2_vitl14_reg4_dinotxt_tet1280d20h24l"
+
+    def __init__(self, variant: str = "default", device: str = "auto", image_size: int = 224):
+        self.variant    = variant
+        self.image_size = image_size
+        self.device     = _resolve_device(device)
+        self.model      = self._load()
+        self.model.eval().to(self.device)
+        self._cached_dim = self._probe_dim()
+        log.info("dino.txt (%s) on %s  (dim=%d)", self._HUB_ENTRYPOINT, self.device, self._cached_dim)
+
+    def _load(self):
+        loaded = torch.hub.load("facebookresearch/dinov2", self._HUB_ENTRYPOINT)
+        # Defensive: the confirmed usage pattern is `model, tokenizer =
+        # entrypoint()` when called directly as a Python function (per the
+        # dinov3 repo's own inference notebook for the analogous DINOv3
+        # entrypoint) -- torch.hub.load's own return convention for this
+        # specific entrypoint could not be independently verified without a
+        # live download, so both shapes are handled rather than assumed.
+        if isinstance(loaded, tuple):
+            return loaded[0]
+        return loaded
+
+    @torch.no_grad()
+    def _probe_dim(self) -> int:
+        dummy = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
+        feats = self._encode([dummy])
+        return int(feats.shape[-1])
+
+    @torch.no_grad()
+    def _encode(self, images: list[np.ndarray]) -> torch.Tensor:
+        tensors = [_preprocess_dino(im, self.image_size) for im in images]
+        batch = torch.stack(tensors).to(self.device).float()
+        return self.model.encode_image(batch, normalize=True)
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        out: list[np.ndarray] = []
+        for i in range(0, len(images), batch_size):
+            batch_imgs = images[i:i+batch_size]
+            feats = self._encode(batch_imgs)
+            # encode_image(..., normalize=True) already L2-normalizes --
+            # F.normalize again is a defensive no-op if so, not a
+            # correctness risk either way.
+            out.append(F.normalize(feats, dim=-1).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return self._cached_dim
+
+    def _feature_dim(self) -> int:
+        return self._dim()
+
+
+# ---------------------------------------------------------------------------
 # Candidate-crop background masking wrapper (opt-in, stage1.
 # feature_extractor.candidate_background_masking)
 # ---------------------------------------------------------------------------
@@ -1142,10 +1461,26 @@ def build_feature_extractor(cfg):
             device     = dev,
             image_size = fe.image_size,
         )
+    elif fe.model == "siglip2":
+        base = Siglip2FeatureExtractor(
+            variant = fe.siglip2_variant,
+            device  = dev,
+        )
+    elif fe.model == "evaclip":
+        base = EVACLIPFeatureExtractor(
+            variant = fe.evaclip_variant,
+            device  = dev,
+        )
+    elif fe.model == "dinotxt":
+        base = DinoTxtFeatureExtractor(
+            device     = dev,
+            image_size = fe.image_size,
+        )
     else:
         raise ValueError(
             f"Unknown feature extractor model '{fe.model}'. "
-            "Must be 'dinov2', 'dinov3', 'clip', 'siglip', 'ensemble', 'fgclip', or 'radio'."
+            "Must be 'dinov2', 'dinov3', 'clip', 'siglip', 'ensemble', 'fgclip', 'radio', "
+            "'siglip2', 'evaclip', or 'dinotxt'."
         )
 
     cbm = fe.candidate_background_masking
