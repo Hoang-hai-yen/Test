@@ -28,9 +28,11 @@ cached) no matter how many Stage-3-only combos are tested against it.
 
 Pass --ofat-only to fall back to the cheaper old behavior instead: every
 Stage-1 combo tested ONLY against the plain baseline Stage-3 config, and
-every Stage-3-only combo tested ONLY against the CURRENT on-disk (default)
-encoder -- the "row 0 + column 0" slice of the same matrix, ~52 runs
-instead of ~680.
+every Stage-3-only combo tested ONLY against config.yaml's own current
+stage1 settings (the "stage1_default" combo -- freshly rerun, NOT whatever
+prototype.npz happens to already be on disk, see build_stage1_combos's own
+docstring) -- the "row 0 + column 0" slice of the same matrix, ~53 runs
+instead of ~713.
 
 Only runs Stage 1 (when a combo touches the encoder/prototype/reference
 preprocessing) + Stage 3 (cosine matching -> detections.json). Reuses each
@@ -141,13 +143,24 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
     """Combos that touch Stage 1 (encoder + prototype construction +
     reference-image preprocessing) -- each costs one Stage 1 rerun, reused
     across every Stage-3-only combo paired with it (see module docstring).
-    Always includes "stage1_default" first: the CURRENT on-disk prototype/
-    candidates.json, unchanged -- no Stage 1 rerun, the encoder every
-    Stage-3-only combo is tested against."""
+    Always includes "stage1_default" first: NO stage1.* overrides at all,
+    so it reruns Stage 1 with exactly whatever configs/config.yaml's own
+    stage1: section currently says -- the encoder every Stage-3-only combo
+    is tested against. Deliberately NOT "reuse whatever prototype.npz is
+    already on disk" (needs_stage1=False) -- a work_dir from an earlier
+    manual run, or an earlier session with a different config.yaml, can
+    easily hold a prototype.npz built from a DIFFERENT stage1 config than
+    what's currently written, with no way to tell from the file alone;
+    forcing a rerun (project.use_cache is already forced off in
+    BASELINE_OVERRIDES, so this is never skipped) guarantees "stage1_default"
+    actually means "this file's own current stage1 settings", not
+    "whatever happened to be cached from some earlier, possibly different,
+    run"."""
     combos = [
-        Combo("stage1_default", "encoder", {}, needs_stage1=False,
-              note="current on-disk prototype/candidates.json, unchanged -- the baseline encoder "
-                   "every Stage-3-only combo is crossed against"),
+        Combo("stage1_default", "encoder", {}, needs_stage1=True,
+              note="no stage1.* overrides -- reruns Stage 1 fresh with config.yaml's own current "
+                   "stage1 settings, so it's guaranteed consistent with THIS run, not whatever a "
+                   "stale on-disk prototype.npz from some earlier config happens to hold"),
 
         # ---- encoder swaps (mục 1) -- needs Stage 1 + recompute ----
         Combo("E1a_dinov3_lvd1689m", "encoder", {
@@ -360,7 +373,6 @@ def build_pairs(stage1_combos: list[Combo], stage3_combos: list[Combo],
     matrix=False (--ofat-only): the "row 0 + column 0" slice of that same
     matrix -- every Stage-1 combo paired ONLY with the plain baseline
     Stage-3 config, and stage1_default paired with EVERY Stage-3 combo.
-    Reproduces this script's original (pre-matrix) behavior exactly.
     """
     if matrix:
         return [(s1, s3) for s1 in stage1_combos for s3 in stage3_combos]
