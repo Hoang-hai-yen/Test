@@ -2673,6 +2673,23 @@ class Geco2PeakContrastFilterConfig(BaseModel):
 
     NOT YET VALIDATED on real footage -- A/B test both modes against
     today's behavior (disabled) before trusting either.
+
+    REAL-FOOTAGE FINDING (2 IDCard samples, scripts/check_peak_contrast_
+    separation.py, fixed radius): the fixed-radius formula above is
+    CONFOUNDED by candidate box SIZE, not just real-vs-clutter identity --
+    a real object spanning many grid cells (e.g. an ID card) has several
+    ELEVATED neighbors inside its own footprint pulling its neighborhood
+    mean up and contrast DOWN, while a small/point-like clutter candidate
+    (of ANY identity) sits in a mostly-background neighborhood and gets
+    artificially HIGH contrast regardless of whether it's real. Measured
+    result: median REAL contrast was LOWER than median CLUTTER contrast on
+    both samples tested (inverted from the original hypothesis, which only
+    accounted for repetitive-texture clutter, not point-like clutter).
+    adaptive_radius below is the fix -- scale the window to each
+    candidate's OWN box footprint instead of a fixed constant, removing the
+    size confound. Re-run scripts/check_peak_contrast_separation.py with it
+    enabled before trusting min_contrast_z/peakiness_weight on this
+    checkpoint again -- the fixed-radius numbers above do not carry over.
     """
     enabled: bool = False
     # Neighborhood half-size, in centerness-grid cells (not pixels) --
@@ -2681,8 +2698,22 @@ class Geco2PeakContrastFilterConfig(BaseModel):
     # own side length. Too small: neighborhood is mostly the peak's own
     # footprint, contrast is meaninglessly high for everything. Too large:
     # washes out with unrelated regions of the frame, contrast collapses
-    # toward 0 for everything.
+    # toward 0 for everything. IGNORED when adaptive_radius=true below
+    # (kept as the fallback for any candidate whose box has zero grid
+    # footprint, a degenerate case that shouldn't happen in practice).
     radius: int = 4
+    # Opt-in fix for the box-size confound above (default off -- radius
+    # above, unchanged behavior, until you've re-validated with this on).
+    # true: each candidate's OWN window half-size = clamp(radius_scale *
+    # max(box_width, box_height) / 2 IN GRID CELLS, min_radius, max_radius)
+    # -- a real object's neighborhood now scales with ITS OWN size instead
+    # of a one-size-fits-all constant, so a large real object's own
+    # interior no longer inflates its neighborhood mean relative to a
+    # small clutter point's neighborhood.
+    adaptive_radius: bool = False
+    radius_scale: float = 1.0
+    min_radius: int = 2
+    max_radius: int = 12
     hard_reject: bool = False
     min_contrast_z: float = 0.5
 

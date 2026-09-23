@@ -939,11 +939,24 @@ stage123_geco2:
   # falls off cleanly on all sides -- high contrast. No extra GeCo2 forward
   # pass -- reuses the centerness tensor detect_frame() already computed.
   # See Geco2PeakContrastFilterConfig's own docstring (aero_eyes/config.py)
-  # for the full formula. NOT YET VALIDATED on real footage.
+  # for the full formula. REAL-FOOTAGE FINDING (2 IDCard samples, fixed
+  # radius): CONFOUNDED by candidate box size -- a real object spanning many
+  # grid cells has elevated neighbors inside its OWN footprint, so its
+  # contrast comes out LOWER than a small/point-like clutter candidate's,
+  # inverted from the original hypothesis. Use adaptive_radius below
+  # instead of the fixed radius -- re-validate with
+  # scripts/check_peak_contrast_separation.py before trusting either mode.
   # --------------------------------------------------------------------
   peak_contrast_filter:
     enabled: false
-    radius: 4            # neighborhood half-size, in centerness-GRID cells (not pixels) -- grid is image_size // reduction per side
+    radius: 4            # neighborhood half-size, in centerness-GRID cells (not pixels) -- grid is image_size // reduction per side -- IGNORED when adaptive_radius=true
+    # Opt-in fix for the box-size confound above (default off, unchanged
+    # radius behavior until re-validated). true: window half-size scales
+    # with EACH candidate's OWN box footprint instead of one constant.
+    adaptive_radius: false
+    radius_scale: 1.0     # candidate's own window half-size = radius_scale * max(box_w, box_h)/2, in grid cells
+    min_radius: 2
+    max_radius: 12
     # false (default): only ANNOTATE Box.peak_contrast, don't drop anything
     # here -- feeds dynamic_prototype.topk_fusion.peakiness_weight as a 3rd
     # fusion axis at Stage 3 instead.

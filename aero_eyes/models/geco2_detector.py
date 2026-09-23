@@ -82,6 +82,7 @@ def _ensure_geco2_on_path(repo_path: str) -> None:
 
 def _peak_contrast_scores(
     centerness: torch.Tensor, ref_points: torch.Tensor, radius: int,
+    per_candidate_radius: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """stage123_geco2.peak_contrast_filter's core primitive: for each
     ref_point (grid y,x -- exactly what GECO2/utils/box_ops.py::
@@ -99,6 +100,17 @@ def _peak_contrast_scores(
     texture -- pulls its own mean up and std down, so the peak barely
     stands out from a neighborhood that already contains it).
 
+    per_candidate_radius (optional, [N] int, one radius per ref_point):
+    peak_contrast_filter.adaptive_radius's fix for a confound a fixed
+    `radius` has -- REAL-FOOTAGE MEASURED (2 IDCard samples, see
+    Geco2PeakContrastFilterConfig's own docstring): a real object spanning
+    many grid cells has several elevated cells INSIDE its own footprint,
+    which a fixed small window counts as "neighborhood", inflating the
+    mean and deflating contrast -- median REAL contrast came out LOWER
+    than median CLUTTER contrast, inverted from the original hypothesis.
+    When given, overrides `radius` per-candidate instead of using one
+    constant for every candidate.
+
     centerness: [1,1,H,W] (or any leading dims that squeeze to that -- only
     the last 2 dims are read). ref_points: [N,2] grid (y,x) integer
     coordinates, N may be 0. Pure function, no model/gradient involved --
@@ -112,8 +124,9 @@ def _peak_contrast_scores(
     for i in range(ref_points.shape[0]):
         y = int(ref_points[i, 0].item())
         x = int(ref_points[i, 1].item())
-        y0, y1 = max(0, y - radius), min(h, y + radius + 1)
-        x0, x1 = max(0, x - radius), min(w, x + radius + 1)
+        r = int(per_candidate_radius[i].item()) if per_candidate_radius is not None else radius
+        y0, y1 = max(0, y - r), min(h, y + r + 1)
+        x0, x1 = max(0, x - r), min(w, x + r + 1)
         patch = grid[y0:y1, x0:x1].to(torch.float64)
         peak = grid[y, x].to(torch.float64)
         out[i] = (peak - patch.mean()) / (patch.std() + 1e-6)
@@ -147,6 +160,10 @@ class GeCo2Detector:
         pcf = g.peak_contrast_filter
         self.peak_contrast_filter_enabled = pcf.enabled
         self.peak_contrast_radius = pcf.radius
+        self.peak_contrast_adaptive_radius = pcf.adaptive_radius
+        self.peak_contrast_radius_scale = pcf.radius_scale
+        self.peak_contrast_min_radius = pcf.min_radius
+        self.peak_contrast_max_radius = pcf.max_radius
         self.peak_contrast_hard_reject = pcf.hard_reject
         self.peak_contrast_min_z = pcf.min_contrast_z
         # peak_contrast_filter diagnostic counters -- see log_peak_contrast_
@@ -582,8 +599,25 @@ class GeCo2Detector:
 
         peak_contrasts = None
         if self.peak_contrast_filter_enabled and cand_ref_points is not None and centerness is not None:
+            per_candidate_radius = None
+            if self.peak_contrast_adaptive_radius:
+                # cand_boxes are still normalized [0,1] canvas xyxy here
+                # (pixel conversion happens further below) -- the SAME
+                # normalized space centerness's own grid is defined over
+                # (box_ops.py's bbox_centers = ref_points / grid_shape), so
+                # multiplying by grid H/W gives each box's footprint
+                # directly in grid cells, no `scale` involved.
+                grid_h, grid_w = centerness.shape[-2], centerness.shape[-1]
+                box_w_grid = (cand_boxes[:, 2] - cand_boxes[:, 0]) * grid_w
+                box_h_grid = (cand_boxes[:, 3] - cand_boxes[:, 1]) * grid_h
+                half_extent = torch.maximum(box_w_grid, box_h_grid) / 2.0
+                per_candidate_radius = torch.clamp(
+                    torch.round(half_extent * self.peak_contrast_radius_scale),
+                    min=float(self.peak_contrast_min_radius), max=float(self.peak_contrast_max_radius),
+                ).to(torch.int64)
             peak_contrasts = _peak_contrast_scores(
                 centerness, cand_ref_points, self.peak_contrast_radius,
+                per_candidate_radius=per_candidate_radius,
             ).cpu().numpy()
 
         # Padded-canvas-normalized -> original frame pixel coords (matches
@@ -649,11 +683,15 @@ class GeCo2Detector:
         var = max(0.0, self._peak_contrast_sumsq / n - mean * mean)
         log.info(
             "[Stage123-GeCo2] %s: peak_contrast_filter summary -- n=%d mean=%.3f std=%.3f "
-            "min=%.3f max=%.3f -- %d/%d hard-rejected (hard_reject=%s, min_contrast_z=%.3f). "
-            "Use mean/std/min/max here to calibrate min_contrast_z on THIS sample/checkpoint "
-            "before trusting hard_reject=true on it.",
+            "min=%.3f max=%.3f -- %d/%d hard-rejected (hard_reject=%s, min_contrast_z=%.3f, "
+            "adaptive_radius=%s%s). This is an AGGREGATE over all candidates (real+clutter mixed) "
+            "-- does NOT by itself tell you whether real and clutter separate. Use "
+            "scripts/check_peak_contrast_separation.py against GT for that before setting "
+            "min_contrast_z/topk_fusion.peakiness_weight.",
             sample_id, n, mean, var ** 0.5, self._peak_contrast_min, self._peak_contrast_max,
             self._n_peak_contrast_hard_rejected, n, self.peak_contrast_hard_reject, self.peak_contrast_min_z,
+            self.peak_contrast_adaptive_radius,
+            f", radius_scale={self.peak_contrast_radius_scale:.2f}" if self.peak_contrast_adaptive_radius else "",
         )
 
     @torch.no_grad()

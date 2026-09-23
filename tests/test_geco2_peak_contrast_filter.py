@@ -1,13 +1,13 @@
 """Unit tests for stage123_geco2.peak_contrast_filter --
 GeCo2Detector._peak_contrast_scores (pure primitive) and its wiring into
-filter_boxes_by_threshold (annotate-only vs hard_reject modes). Runs
-without the real GECO2 repo, weights, or GPU -- see
+filter_boxes_by_threshold (annotate-only vs hard_reject modes, fixed vs
+adaptive_radius). Runs without the real GECO2 repo, weights, or GPU -- see
 Geco2PeakContrastFilterConfig's own docstring (aero_eyes/config.py) for the
-full rationale (a repetitive-texture confuser tends to produce several
-closely-spaced, comparably-high local maxima -- low CONTRAST against its
-own neighborhood -- even when its raw peak VALUE clears
-score_threshold_ratio; a real, isolated object's peak falls off cleanly on
-all sides -- high contrast)."""
+full rationale AND the real-footage finding that the original fixed-radius
+hypothesis (repetitive-texture clutter = low contrast, isolated real
+object = high contrast) came out INVERTED on 2 real samples, because a
+fixed radius is confounded by candidate box SIZE -- adaptive_radius (tested
+below) fixes this by scaling the window to each candidate's own footprint."""
 from __future__ import annotations
 
 import numpy as np
@@ -110,6 +110,29 @@ def test_radius_clips_at_grid_edges():
     assert float(out[0]) == pytest.approx(_expected_contrast(grid, 0, 0, 3), rel=1e-4)
 
 
+def test_per_candidate_radius_overrides_fixed_radius_per_point():
+    """adaptive_radius's mechanism at the primitive level: when
+    per_candidate_radius is given, EACH point uses its OWN radius instead
+    of the shared `radius` argument (which becomes dead/ignored)."""
+    rng = np.random.default_rng(0)
+    grid = rng.normal(loc=5.0, scale=1.0, size=(30, 30)).astype(np.float32)
+    grid[10, 10] = 20.0
+    grid[20, 20] = 20.0
+    centerness = torch.tensor(grid).view(1, 1, 30, 30)
+    ref_points = torch.tensor([[10, 10], [20, 20]])
+
+    out = _peak_contrast_scores(
+        centerness, ref_points, radius=2, per_candidate_radius=torch.tensor([2, 9]),
+    )
+
+    assert float(out[0]) == pytest.approx(_expected_contrast(grid, 10, 10, 2), rel=1e-4)
+    assert float(out[1]) == pytest.approx(_expected_contrast(grid, 20, 20, 9), rel=1e-4)
+    # Different radii on an irregular (random) background must not
+    # coincidentally agree -- confirms the override actually took effect,
+    # not silently ignored in favor of the shared `radius=2`.
+    assert float(out[1]) != pytest.approx(_expected_contrast(grid, 20, 20, 2), rel=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # filter_boxes_by_threshold wiring (annotate-only vs hard_reject)
 # ---------------------------------------------------------------------------
@@ -119,6 +142,10 @@ def _make_detector(
     peak_contrast_radius: int = 2,
     peak_contrast_hard_reject: bool = False,
     peak_contrast_min_z: float = 3.0,
+    peak_contrast_adaptive_radius: bool = False,
+    peak_contrast_radius_scale: float = 1.0,
+    peak_contrast_min_radius: int = 2,
+    peak_contrast_max_radius: int = 12,
 ) -> GeCo2Detector:
     """Same object.__new__ scaffolding as tests/test_geco2_min_box_area.py
     -- only the attributes filter_boxes_by_threshold itself touches."""
@@ -132,6 +159,10 @@ def _make_detector(
     det.peak_contrast_radius = peak_contrast_radius
     det.peak_contrast_hard_reject = peak_contrast_hard_reject
     det.peak_contrast_min_z = peak_contrast_min_z
+    det.peak_contrast_adaptive_radius = peak_contrast_adaptive_radius
+    det.peak_contrast_radius_scale = peak_contrast_radius_scale
+    det.peak_contrast_min_radius = peak_contrast_min_radius
+    det.peak_contrast_max_radius = peak_contrast_max_radius
     det._n_peak_contrast_seen = 0
     det._n_peak_contrast_hard_rejected = 0
     det._peak_contrast_sum = 0.0
@@ -236,6 +267,77 @@ def test_hard_reject_with_permissive_threshold_keeps_both():
     )
 
     assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# adaptive_radius (the box-size-confound fix)
+# ---------------------------------------------------------------------------
+
+def test_adaptive_radius_derives_window_from_box_footprint():
+    """adaptive_radius=true -- the window half-size actually used is
+    derived from THIS candidate's own box footprint on the centerness grid
+    (radius_scale * max(box_w, box_h)/2 grid cells), not the fixed `radius`
+    config value (which must be ignored here). Mechanical check: compare
+    filter_boxes_by_threshold's output against an independent numpy
+    computation using the radius this formula predicts."""
+    det = _make_detector(
+        peak_contrast_filter_enabled=True, peak_contrast_hard_reject=False,
+        peak_contrast_radius=2,  # fixed radius -- must be IGNORED when adaptive_radius=true
+        peak_contrast_adaptive_radius=True, peak_contrast_radius_scale=1.0,
+        peak_contrast_min_radius=1, peak_contrast_max_radius=20,
+    )
+    grid_size = 30
+    rng = np.random.default_rng(0)
+    grid = rng.normal(loc=5.0, scale=1.0, size=(grid_size, grid_size)).astype(np.float32)
+    grid[15, 15] = 20.0
+    centerness = torch.tensor(grid).view(1, 1, grid_size, grid_size)
+    ref_points = torch.tensor([[15, 15]])
+
+    # Box footprint: 16 grid cells wide/tall -> half-extent = 8 ->
+    # radius_scale=1.0 -> predicted radius = 8.
+    frac = 16.0 / grid_size
+    pred_boxes = torch.tensor([[0.5 - frac / 2, 0.5 - frac / 2, 0.5 + frac / 2, 0.5 + frac / 2]])
+    box_v = torch.tensor([0.9])
+    frame_bgr = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
+    det.image_size = float(grid_size)
+
+    results = det.filter_boxes_by_threshold(
+        pred_boxes, box_v, scale=1.0, frame_bgr=frame_bgr, threshold=0.5,
+        ref_points=ref_points, centerness=centerness,
+    )
+
+    assert len(results) == 1
+    assert results[0].peak_contrast == pytest.approx(_expected_contrast(grid, 15, 15, radius=8), rel=1e-4)
+    # Confirms the fixed radius=2 was NOT what got used (otherwise this
+    # test wouldn't actually be exercising adaptive_radius).
+    assert results[0].peak_contrast != pytest.approx(_expected_contrast(grid, 15, 15, radius=2), rel=1e-3)
+
+
+def test_adaptive_radius_is_clamped_to_max_radius():
+    det = _make_detector(
+        peak_contrast_filter_enabled=True, peak_contrast_hard_reject=False,
+        peak_contrast_adaptive_radius=True, peak_contrast_radius_scale=1.0,
+        peak_contrast_min_radius=1, peak_contrast_max_radius=3,  # smaller than the natural half-extent (8)
+    )
+    grid_size = 30
+    rng = np.random.default_rng(1)
+    grid = rng.normal(loc=5.0, scale=1.0, size=(grid_size, grid_size)).astype(np.float32)
+    grid[15, 15] = 20.0
+    centerness = torch.tensor(grid).view(1, 1, grid_size, grid_size)
+    ref_points = torch.tensor([[15, 15]])
+
+    frac = 16.0 / grid_size  # half-extent 8 -- would predict radius=8 without clamping
+    pred_boxes = torch.tensor([[0.5 - frac / 2, 0.5 - frac / 2, 0.5 + frac / 2, 0.5 + frac / 2]])
+    box_v = torch.tensor([0.9])
+    frame_bgr = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
+    det.image_size = float(grid_size)
+
+    results = det.filter_boxes_by_threshold(
+        pred_boxes, box_v, scale=1.0, frame_bgr=frame_bgr, threshold=0.5,
+        ref_points=ref_points, centerness=centerness,
+    )
+
+    assert results[0].peak_contrast == pytest.approx(_expected_contrast(grid, 15, 15, radius=3), rel=1e-4)
 
 
 def test_missing_ref_points_or_centerness_is_a_silent_noop():
