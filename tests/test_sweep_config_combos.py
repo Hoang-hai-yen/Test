@@ -72,6 +72,30 @@ def test_stage1_default_reruns_stage1_instead_of_trusting_stale_disk_state():
     assert default.overrides == {}
 
 
+def test_prototype_combos_ordered_before_encoder_swaps():
+    """Regression test: every "prototype" group combo (P1a-P7, same
+    encoder as stage1_default, recompute=False) must be ordered BEFORE
+    every "encoder" group combo other than stage1_default itself.
+    candidates.json is SHARED, mutable state across the whole sweep --
+    confirmed in practice: with encoder swaps (E1a...E10, each
+    recompute=True) ordered BEFORE the prototype group, every P* combo
+    inherited candidates.json's dimension from whichever encoder-swap
+    combo happened to run last (e.g. radio's 2048-d), not the default
+    768-d it actually needed -- every single prototype combo failed with a
+    `feats @ ref` dimension mismatch as a result."""
+    combos = build_stage1_combos(include_heavy=True)
+    groups = [c.group for c in combos]
+    last_prototype_idx = max(i for i, g in enumerate(groups) if g == "prototype")
+    first_real_encoder_idx = min(
+        i for i, c in enumerate(combos) if c.group == "encoder" and c.id != "stage1_default"
+    )
+    assert last_prototype_idx < first_real_encoder_idx, (
+        "prototype group must be fully ordered before any real encoder swap -- "
+        f"last prototype combo at index {last_prototype_idx}, "
+        f"first encoder swap at index {first_real_encoder_idx}"
+    )
+
+
 def test_build_pairs_matrix_is_full_cross_product():
     stage1 = [Combo("stage1_default", "encoder", {}), Combo("E_a", "encoder", {}, needs_stage1=True)]
     stage3 = [Combo("s3a", "threshold", {}), Combo("s3b", "threshold", {}), Combo("s3c", "threshold", {})]

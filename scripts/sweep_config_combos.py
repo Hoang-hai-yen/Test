@@ -174,6 +174,62 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
                    "consistent with THIS run, not whatever a stale on-disk prototype.npz/"
                    "candidates.json from some earlier config happens to hold"),
 
+        # ---- prototype construction (mục 2) -- needs Stage 1, SAME encoder
+        # as stage1_default, deliberately placed BEFORE the encoder-swap
+        # group below. candidates.json is SHARED, mutable state across every
+        # Stage-1 combo in this sweep -- confirmed in practice: with this
+        # group placed AFTER the encoder swaps instead, every P* combo here
+        # (recompute=False, correctly assuming the DEFAULT encoder's
+        # candidates.json needs no re-extraction) inherited whatever
+        # dimension the LAST encoder-swap combo happened to leave
+        # candidates.json in (e.g. radio's 2048-d), not the default's 768-d
+        # -- every single P* combo failed with a `feats @ ref` dimension
+        # mismatch as a result. Placing this group right after
+        # stage1_default (which forces recompute=True) and before any
+        # encoder swap keeps candidates.json correctly dimensioned for the
+        # default encoder throughout this entire group.
+        # fusion="mean" is config.yaml's own default, already covered by
+        # stage1_default (no override needed) -- "max"/"concat_then_pca"/
+        # "agreement_weighted" are the 3 non-default alternatives.
+        Combo("P1a_fusion_max", "prototype",
+              {"stage1.prototype.fusion": "max"}, needs_stage1=True),
+        Combo("P1b_fusion_concat_then_pca", "prototype",
+              {"stage1.prototype.fusion": "concat_then_pca"}, needs_stage1=True,
+              note="literature favors this for COMPLEMENTARY views -- weaker fit + "
+                   "statistically unstable for 3 near-duplicate close-ups per this project's own notes"),
+        Combo("P1_agreement_weighted_fusion", "prototype",
+              {"stage1.prototype.fusion": "agreement_weighted"}, needs_stage1=True),
+        # domain_calibration.filter_target_like_frames only takes effect
+        # INSIDE the `if dc_cfg.enabled:` block (aero_eyes/stages/stage1.py)
+        # -- enabled=false (config.yaml default) makes the whole domain
+        # calibration step, filter_target_like_frames included, a no-op.
+        # Both must be set together or this combo silently does nothing.
+        # P2a isolates "does domain_calibration itself help" (plain
+        # np.linspace frame sampling, filter_target_like_frames stays at
+        # its own false default) from P2's "does the smart filter help
+        # FURTHER on top of it".
+        Combo("P2a_domain_calibration_plain", "prototype",
+              {"stage1.domain_calibration.enabled": True}, needs_stage1=True,
+              note="domain_calibration on, filter_target_like_frames left at its own "
+                   "default (false, naive np.linspace sampling) -- comparison point for P2"),
+        Combo("P2_filter_target_like_frames", "prototype", {
+            "stage1.domain_calibration.enabled": True,
+            "stage1.domain_calibration.filter_target_like_frames": True,
+        }, needs_stage1=True),
+        Combo("P3_P1_plus_P2", "prototype", {
+            "stage1.prototype.fusion": "agreement_weighted",
+            "stage1.domain_calibration.enabled": True,
+            "stage1.domain_calibration.filter_target_like_frames": True,
+        }, needs_stage1=True),
+        Combo("P4_aerial_sim", "prototype", {"stage1.aerial_sim.enabled": True},
+              needs_stage1=True, sweep_downscale=True),
+        Combo("P5_background_keep_real", "prototype",
+              {"stage1.segmentation.background_mode": "keep_real"}, needs_stage1=True),
+        Combo("P6_crop_to_object_margin0.0", "prototype",
+              {"stage1.crop_to_object": True, "stage1.crop_context_margin": 0.0}, needs_stage1=True),
+        Combo("P7_crop_to_object_margin0.2", "prototype",
+              {"stage1.crop_to_object": True, "stage1.crop_context_margin": 0.2}, needs_stage1=True),
+
         # ---- encoder swaps (mục 1) -- needs Stage 1 + recompute ----
         Combo("E1a_dinov3_lvd1689m", "encoder", {
             "stage1.feature_extractor.model": "dinov3",
@@ -237,49 +293,6 @@ def build_stage1_combos(include_heavy: bool) -> list[Combo]:
               note="LiT-aligned text encoder over a frozen DINOv2 ViT-L/14 -- adds language/"
                    "semantic grounding without leaving the DINO family; no new dependency, but "
                    "preprocessing/output details not independently verified without a live download"),
-
-        # ---- prototype construction (mục 2) -- needs Stage 1, same encoder ----
-        # fusion="mean" is config.yaml's own default, already covered by
-        # stage1_default (no override needed) -- "max"/"concat_then_pca"/
-        # "agreement_weighted" are the 3 non-default alternatives.
-        Combo("P1a_fusion_max", "prototype",
-              {"stage1.prototype.fusion": "max"}, needs_stage1=True),
-        Combo("P1b_fusion_concat_then_pca", "prototype",
-              {"stage1.prototype.fusion": "concat_then_pca"}, needs_stage1=True,
-              note="literature favors this for COMPLEMENTARY views -- weaker fit + "
-                   "statistically unstable for 3 near-duplicate close-ups per this project's own notes"),
-        Combo("P1_agreement_weighted_fusion", "prototype",
-              {"stage1.prototype.fusion": "agreement_weighted"}, needs_stage1=True),
-        # domain_calibration.filter_target_like_frames only takes effect
-        # INSIDE the `if dc_cfg.enabled:` block (aero_eyes/stages/stage1.py)
-        # -- enabled=false (config.yaml default) makes the whole domain
-        # calibration step, filter_target_like_frames included, a no-op.
-        # Both must be set together or this combo silently does nothing.
-        # P2a isolates "does domain_calibration itself help" (plain
-        # np.linspace frame sampling, filter_target_like_frames stays at
-        # its own false default) from P2's "does the smart filter help
-        # FURTHER on top of it".
-        Combo("P2a_domain_calibration_plain", "prototype",
-              {"stage1.domain_calibration.enabled": True}, needs_stage1=True,
-              note="domain_calibration on, filter_target_like_frames left at its own "
-                   "default (false, naive np.linspace sampling) -- comparison point for P2"),
-        Combo("P2_filter_target_like_frames", "prototype", {
-            "stage1.domain_calibration.enabled": True,
-            "stage1.domain_calibration.filter_target_like_frames": True,
-        }, needs_stage1=True),
-        Combo("P3_P1_plus_P2", "prototype", {
-            "stage1.prototype.fusion": "agreement_weighted",
-            "stage1.domain_calibration.enabled": True,
-            "stage1.domain_calibration.filter_target_like_frames": True,
-        }, needs_stage1=True),
-        Combo("P4_aerial_sim", "prototype", {"stage1.aerial_sim.enabled": True},
-              needs_stage1=True, sweep_downscale=True),
-        Combo("P5_background_keep_real", "prototype",
-              {"stage1.segmentation.background_mode": "keep_real"}, needs_stage1=True),
-        Combo("P6_crop_to_object_margin0.0", "prototype",
-              {"stage1.crop_to_object": True, "stage1.crop_context_margin": 0.0}, needs_stage1=True),
-        Combo("P7_crop_to_object_margin0.2", "prototype",
-              {"stage1.crop_to_object": True, "stage1.crop_context_margin": 0.2}, needs_stage1=True),
     ]
     if not include_heavy:
         combos = [c for c in combos if not c.heavy]
