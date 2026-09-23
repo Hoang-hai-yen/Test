@@ -27,16 +27,29 @@ class Box:
     x2: float
     y2: float
     score: float = 1.0
+    # Set only by GeCo2Detector.filter_boxes_by_threshold when
+    # stage123_geco2.peak_contrast_filter.enabled -- how sharply this box's
+    # GeCo2 centerness peak stands out from its local neighborhood (peak -
+    # neighborhood_mean) / neighborhood_std, as opposed to `score`'s raw peak
+    # VALUE. None everywhere else (old behavior, no shape change to callers
+    # that never set it). See Geco2PeakContrastFilterConfig's own docstring.
+    peak_contrast: float | None = None
 
     def area(self) -> float:
         return max(0.0, self.x2 - self.x1) * max(0.0, self.y2 - self.y1)
 
     def to_dict(self) -> dict:
-        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2, "score": self.score}
+        d = {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2, "score": self.score}
+        if self.peak_contrast is not None:
+            d["peak_contrast"] = self.peak_contrast
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Box":
-        return cls(x1=d["x1"], y1=d["y1"], x2=d["x2"], y2=d["y2"], score=d.get("score", 1.0))
+        return cls(
+            x1=d["x1"], y1=d["y1"], x2=d["x2"], y2=d["y2"], score=d.get("score", 1.0),
+            peak_contrast=d.get("peak_contrast"),
+        )
 
     def clip(self, w: float, h: float) -> "Box":
         return Box(
@@ -45,6 +58,7 @@ class Box:
             x2=max(0.0, min(self.x2, w)),
             y2=max(0.0, min(self.y2, h)),
             score=self.score,
+            peak_contrast=self.peak_contrast,
         )
 
 

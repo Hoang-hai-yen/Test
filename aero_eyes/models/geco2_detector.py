@@ -80,6 +80,46 @@ def _ensure_geco2_on_path(repo_path: str) -> None:
     _geco2_repo_on_path = repo
 
 
+def _peak_contrast_scores(
+    centerness: torch.Tensor, ref_points: torch.Tensor, radius: int,
+) -> torch.Tensor:
+    """stage123_geco2.peak_contrast_filter's core primitive: for each
+    ref_point (grid y,x -- exactly what GECO2/utils/box_ops.py::
+    boxes_with_scores's local-max selection already produced, aligned
+    index-for-index with its own outputs[0]["box_v"]/["pred_boxes"]), how
+    sharply that peak stands out from its own local neighborhood on the
+    dense centerness map:
+
+        (peak_value - neighborhood_mean) / (neighborhood_std + eps)
+
+    over a (2*radius+1)x(2*radius+1) window centered on the peak (clipped
+    at the grid edges), INCLUDING the peak cell itself in the neighborhood
+    stats (a real, isolated object still has a dominant single cell even
+    with itself counted; a plateau of near-equal cells -- e.g. repetitive
+    texture -- pulls its own mean up and std down, so the peak barely
+    stands out from a neighborhood that already contains it).
+
+    centerness: [1,1,H,W] (or any leading dims that squeeze to that -- only
+    the last 2 dims are read). ref_points: [N,2] grid (y,x) integer
+    coordinates, N may be 0. Pure function, no model/gradient involved --
+    testable with a plain synthetic tensor.
+    """
+    if ref_points.numel() == 0:
+        return torch.zeros(0, dtype=torch.float64, device=centerness.device)
+    grid = centerness.reshape(centerness.shape[-2], centerness.shape[-1])
+    h, w = grid.shape
+    out = torch.empty(ref_points.shape[0], dtype=torch.float64, device=centerness.device)
+    for i in range(ref_points.shape[0]):
+        y = int(ref_points[i, 0].item())
+        x = int(ref_points[i, 1].item())
+        y0, y1 = max(0, y - radius), min(h, y + radius + 1)
+        x0, x1 = max(0, x - radius), min(w, x + radius + 1)
+        patch = grid[y0:y1, x0:x1].to(torch.float64)
+        peak = grid[y, x].to(torch.float64)
+        out[i] = (peak - patch.mean()) / (patch.std() + 1e-6)
+    return out
+
+
 class GeCo2Detector:
     """Loads the GeCo2 CNT model once; exposes encode_exemplars()/detect_frame()."""
 
@@ -104,6 +144,11 @@ class GeCo2Detector:
         self.topk_per_keyframe = g.topk_per_keyframe
         self.min_box_area_enabled = g.min_box_area_enabled
         self.min_box_area = g.min_box_area
+        pcf = g.peak_contrast_filter
+        self.peak_contrast_filter_enabled = pcf.enabled
+        self.peak_contrast_radius = pcf.radius
+        self.peak_contrast_hard_reject = pcf.hard_reject
+        self.peak_contrast_min_z = pcf.min_contrast_z
         self.use_shape_token = g.use_shape_token
         self.emb_dim = g.emb_dim
         self.reduction = g.reduction
@@ -395,11 +440,15 @@ class GeCo2Detector:
         half of CNT.forward on one frame, cross-attend with the precomputed
         exemplar tokens, and return the RAW (unfiltered) dense predictions.
         Returns (pred_boxes [N,4] normalized xyxy in padded canvas, box_v
-        [N] raw score, scale, feats) -- feats is the raw backbone output
-        dict (m.backbone(x): vision_features/backbone_fpn/vision_pos_enc),
-        needed by sam2_refine_boxes to run GECO2's own SAM2 mask_decoder on
-        this SAME forward pass without re-running the backbone a second
-        time; every other caller ignores it.
+        [N] raw score, scale, feats, centerness, ref_points) -- feats is the
+        raw backbone output dict (m.backbone(x): vision_features/
+        backbone_fpn/vision_pos_enc), needed by sam2_refine_boxes to run
+        GECO2's own SAM2 mask_decoder on this SAME forward pass without
+        re-running the backbone a second time; centerness [1,1,H,W] and
+        ref_points [N,2] (grid y,x, aligned index-for-index with pred_boxes/
+        box_v) are the dense map + per-candidate peak locations
+        peak_contrast_filter needs (see _peak_contrast_scores) -- every
+        other caller ignores both.
         """
         from utils.box_ops import boxes_with_scores  # GECO2/utils/box_ops.py
 
@@ -425,8 +474,13 @@ class GeCo2Detector:
         adapted_f = adapted_f.view(bs, m.emb_dim, -1).permute(0, 2, 1)
         centerness = m.class_embed(adapted_f).view(bs, w, h, 1).permute(0, 3, 1, 2)
         outputs_coord = m.bbox_embed(adapted_f).sigmoid().view(bs, w, h, 4).permute(0, 3, 1, 2)
-        outputs, _ = boxes_with_scores(centerness, outputs_coord, sort=False, validate=True)
-        return outputs[0]["pred_boxes"], outputs[0]["box_v"], scale, feats
+        outputs, ref_points = boxes_with_scores(centerness, outputs_coord, sort=False, validate=True)
+        # boxes_with_scores returns ref_points_batch[i] as [2,N] (its own
+        # `ref_points.T`, see GECO2/utils/box_ops.py) -- transpose back to
+        # [N,2] here so every consumer of this method's return value can
+        # treat N as ref_points' dim-0, matching pred_boxes/box_v's own
+        # per-candidate axis, without re-deriving this convention itself.
+        return outputs[0]["pred_boxes"], outputs[0]["box_v"], scale, feats, centerness, ref_points[0].T
 
     @torch.no_grad()
     def raw_scores(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> np.ndarray:
@@ -443,7 +497,7 @@ class GeCo2Detector:
         "nothing here" -- it always keeps at least the single highest-
         scoring point.
         """
-        _, box_v, _, _ = self._forward_scores(frame_bgr, prototype)
+        _, box_v, _, _, _, _ = self._forward_scores(frame_bgr, prototype)
         return box_v.cpu().numpy()
 
     @torch.no_grad()
@@ -460,7 +514,7 @@ class GeCo2Detector:
         two-pass shape as stage3.py's own adaptive_threshold, applied to
         GeCo2's score instead of DINOv2 cosine similarity.
         """
-        pred_boxes, box_v, scale, _ = self._forward_scores(frame_bgr, prototype)
+        pred_boxes, box_v, scale, _, _, _ = self._forward_scores(frame_bgr, prototype)
         return pred_boxes, box_v, scale
 
     def filter_boxes_by_threshold(
@@ -470,6 +524,8 @@ class GeCo2Detector:
         scale: float,
         frame_bgr: np.ndarray,
         threshold: float,
+        ref_points: torch.Tensor | None = None,
+        centerness: torch.Tensor | None = None,
     ) -> list[Box]:
         """Threshold (by an EXPLICIT absolute score value, not a per-frame
         ratio) + NMS + top-K + coordinate conversion -- the second half of
@@ -477,6 +533,19 @@ class GeCo2Detector:
         computed externally (e.g. stage123_geco2.py's global adaptive
         threshold, pooled across a whole video) instead of only
         detect_frame()'s own per-frame-relative one.
+
+        ref_points/centerness (both optional, default None -- every existing
+        caller that doesn't pass them is unaffected): the SAME per-candidate
+        peak locations [N,2] and dense centerness map [1,1,H,W]
+        _forward_scores() produced this frame, needed only for
+        peak_contrast_filter (see Geco2PeakContrastFilterConfig). Threaded
+        through the SAME keep_mask/NMS/top-K index operations as
+        pred_boxes/box_v so peak_contrast_scores[i] always corresponds to
+        the SAME candidate as px_boxes[i]/scores[i] below. If
+        peak_contrast_filter.enabled but either is None (a caller that
+        doesn't supply them -- e.g. stage123_geco2.global_adaptive_threshold's
+        two-pass path today), the filter is silently skipped for this call
+        (no peak_contrast attached, no rejection) rather than erroring.
         """
         from torchvision.ops import nms as torch_nms
 
@@ -488,14 +557,25 @@ class GeCo2Detector:
             return []
         cand_boxes = torch.clamp(pred_boxes[keep_mask], 0, 1)
         cand_scores = box_v[keep_mask]
+        cand_ref_points = ref_points[keep_mask.reshape(-1)] if ref_points is not None else None
 
         keep_idx = torch_nms(cand_boxes, cand_scores, self.nms_iou)
         cand_boxes = cand_boxes[keep_idx]
         cand_scores = cand_scores[keep_idx]
+        if cand_ref_points is not None:
+            cand_ref_points = cand_ref_points[keep_idx]
         if cand_boxes.shape[0] > self.topk_per_keyframe:
             top = torch.topk(cand_scores, self.topk_per_keyframe).indices
             cand_boxes = cand_boxes[top]
             cand_scores = cand_scores[top]
+            if cand_ref_points is not None:
+                cand_ref_points = cand_ref_points[top]
+
+        peak_contrasts = None
+        if self.peak_contrast_filter_enabled and cand_ref_points is not None and centerness is not None:
+            peak_contrasts = _peak_contrast_scores(
+                centerness, cand_ref_points, self.peak_contrast_radius,
+            ).cpu().numpy()
 
         # Padded-canvas-normalized -> original frame pixel coords (matches
         # GECO2/demo_gradio.py::post_process's `pred_boxes / scale * img.shape[-1]`).
@@ -504,8 +584,18 @@ class GeCo2Detector:
 
         h_frame, w_frame = frame_bgr.shape[:2]
         results: list[Box] = []
-        for (x1, y1, x2, y2), s in zip(px_boxes, scores):
-            box = Box(float(x1), float(y1), float(x2), float(y2), score=float(s)).clip(w_frame, h_frame)
+        for i, ((x1, y1, x2, y2), s) in enumerate(zip(px_boxes, scores)):
+            pc = float(peak_contrasts[i]) if peak_contrasts is not None else None
+            # hard_reject (stage-2-style cut): drop right here, before this
+            # candidate ever becomes a Box at all. annotate-only mode
+            # (hard_reject=False) falls through and just carries pc on the
+            # Box below, for topk_fusion.peakiness_weight to consume later.
+            if (
+                self.peak_contrast_filter_enabled and self.peak_contrast_hard_reject
+                and pc is not None and pc < self.peak_contrast_min_z
+            ):
+                continue
+            box = Box(float(x1), float(y1), float(x2), float(y2), score=float(s), peak_contrast=pc).clip(w_frame, h_frame)
             if box.area() <= 0:
                 continue
             # stage123_geco2.min_box_area_enabled: reject a degenerate,
@@ -538,7 +628,7 @@ class GeCo2Detector:
         stage123_geco2.global_adaptive_threshold for a whole-video
         alternative to this per-frame-relative decision.
         """
-        pred_boxes, box_v, scale, _ = self._forward_scores(frame_bgr, prototype)
+        pred_boxes, box_v, scale, _, centerness, ref_points = self._forward_scores(frame_bgr, prototype)
         if pred_boxes.numel() == 0:
             return []
 
@@ -547,7 +637,10 @@ class GeCo2Detector:
             return []
 
         threshold = max_score * self.score_threshold_ratio
-        return self.filter_boxes_by_threshold(pred_boxes, box_v, scale, frame_bgr, threshold)
+        return self.filter_boxes_by_threshold(
+            pred_boxes, box_v, scale, frame_bgr, threshold,
+            ref_points=ref_points, centerness=centerness,
+        )
 
     # ------------------------------------------------------------------
     # box_refine.method == "sam2_dense": GeCo2-native SAM2 mask refinement
@@ -644,7 +737,7 @@ class GeCo2Detector:
         if mask_processor is None:
             return boxes
 
-        _, _, scale, feats = self._forward_scores(frame_bgr, prototype)
+        _, _, scale, feats, _, _ = self._forward_scores(frame_bgr, prototype)
 
         if context_margin == 0.0 and adaptive_context_margin_cfg is None and not use_center_point and not select_best_mask:
             return self._sam2_refine_boxes_legacy(frame_bgr, boxes, scale, feats, mask_processor)
@@ -972,6 +1065,15 @@ class GeCo2DynamicPrototypeTracker:
         self._cross_per_ref_features = cross_check_per_ref_features
         self._cross_prototype_path = work_dir / cfg.stage1.prototype.cache_name
         self._warned_cross_unavailable = False
+        # dynamic_prototype.cluster_verification.embedding_source=
+        # "dave_verification" -- lazily built on first _offer_topk_cluster()
+        # call, same "avoid loading a model that may never be needed"
+        # rationale as _cross_extractor above. See
+        # ClusterVerificationConfig.embedding_source's own docstring
+        # (aero_eyes/config.py) and DaveVerificationExtractor
+        # (aero_eyes/models/dave_verification.py).
+        self._dave_extractor = None
+        self._dave_ref_feats: np.ndarray | None = None
         # Debug viz (gated by cfg.runtime.save_visualizations, same
         # opt-out convention every other stage's viz already uses): saves
         # the crop + full-frame context for every ACCEPTED token, so a
@@ -1017,6 +1119,14 @@ class GeCo2DynamicPrototypeTracker:
         tk_cfg = dp_cfg.topk_fusion
         self._topk_cosine_history: deque = deque(maxlen=tk_cfg.running_window)
         self._topk_geco2_history: deque = deque(maxlen=tk_cfg.running_window)
+        # topk_fusion.peakiness_weight (opt-in, 3rd fusion axis -- see that
+        # field's own docstring): running history for peak_contrast, same
+        # shape/lifecycle as the cosine/geco2 histories above. Only ever
+        # populated when peakiness_weight > 0 AND every candidate this run
+        # has a peak_contrast (stage123_geco2.peak_contrast_filter.enabled);
+        # otherwise stays empty and the peakiness term is skipped.
+        self._topk_peakiness_history: deque = deque(maxlen=tk_cfg.running_window)
+        self._warned_peakiness_unavailable = False
         self._n_topk_offers = 0
         self._n_topk_warmup = 0
         self._n_topk_fused_selected_non_top1 = 0
@@ -1306,6 +1416,31 @@ class GeCo2DynamicPrototypeTracker:
         cosines = np.array([self._cosine_from_feature(feats[i]) for i in range(len(boxes))])
         geco2_scores = np.array([b.score for b in boxes], dtype=np.float64)
 
+        # peakiness_weight (opt-in 3rd fusion axis): needs EVERY candidate
+        # this keyframe to carry a peak_contrast (stage123_geco2.
+        # peak_contrast_filter.enabled) -- if even one is missing (filter
+        # off, or annotate-only mode never reached this box e.g. hiera
+        # cross_check_source path), silently drop the peakiness term for the
+        # rest of this run (one-time warning) rather than crash or produce a
+        # NaN-poisoned fused score.
+        peak_active = tk_cfg.peakiness_weight > 0
+        peaks = None
+        if peak_active:
+            raw_peaks = [b.peak_contrast for b in boxes]
+            if any(p is None for p in raw_peaks):
+                if not self._warned_peakiness_unavailable:
+                    log.warning(
+                        "[Stage123-GeCo2] %s: dynamic_prototype.topk_fusion.peakiness_weight > 0 "
+                        "but some candidates this run have no peak_contrast (stage123_geco2."
+                        "peak_contrast_filter.enabled is probably false) -- ignoring the "
+                        "peakiness term for the rest of this run, falling back to the 2-way "
+                        "cosine/geco2 formula.", self.sample_id,
+                    )
+                    self._warned_peakiness_unavailable = True
+                peak_active = False
+            else:
+                peaks = np.array(raw_peaks, dtype=np.float64)
+
         # Baseline priority: intra_frame_baseline (this frame's OWN
         # candidates -- same domain, no accumulated history needed, immune
         # to a past frame's confuser poisoning it) when enabled and this
@@ -1313,17 +1448,24 @@ class GeCo2DynamicPrototypeTracker:
         # the temporal running_window history (today's original behavior);
         # else cold start (baseline stays None).
         baseline = None
+        peak_baseline = None
         if tk_cfg.intra_frame_baseline and len(boxes) >= tk_cfg.intra_frame_min_boxes:
             baseline = (
                 float(np.mean(cosines)), float(np.std(cosines)) + 1e-8,
                 float(np.mean(geco2_scores)), float(np.std(geco2_scores)) + 1e-8,
             )
+            if peak_active:
+                peak_baseline = (float(np.mean(peaks)), float(np.std(peaks)) + 1e-8)
             self._n_topk_intra_frame_baseline += 1
         elif len(self._topk_cosine_history) >= tk_cfg.min_window_for_zscore:
             baseline = (
                 float(np.mean(self._topk_cosine_history)), float(np.std(self._topk_cosine_history)) + 1e-8,
                 float(np.mean(self._topk_geco2_history)), float(np.std(self._topk_geco2_history)) + 1e-8,
             )
+            if peak_active and len(self._topk_peakiness_history) >= tk_cfg.min_window_for_zscore:
+                peak_baseline = (
+                    float(np.mean(self._topk_peakiness_history)), float(np.std(self._topk_peakiness_history)) + 1e-8,
+                )
 
         fused_chosen: float | None = None
         if baseline is None:
@@ -1333,7 +1475,13 @@ class GeCo2DynamicPrototypeTracker:
             cosine_mean, cosine_std, geco2_mean, geco2_std = baseline
             cosine_z = (cosines - cosine_mean) / cosine_std
             geco2_z = (geco2_scores - geco2_mean) / geco2_std
-            fused = tk_cfg.cosine_weight * cosine_z + (1.0 - tk_cfg.cosine_weight) * geco2_z
+            if peak_baseline is not None:
+                peak_mean, peak_std = peak_baseline
+                peak_z = (peaks - peak_mean) / peak_std
+                geco2_weight = 1.0 - tk_cfg.cosine_weight - tk_cfg.peakiness_weight
+                fused = tk_cfg.cosine_weight * cosine_z + geco2_weight * geco2_z + tk_cfg.peakiness_weight * peak_z
+            else:
+                fused = tk_cfg.cosine_weight * cosine_z + (1.0 - tk_cfg.cosine_weight) * geco2_z
             chosen_idx = int(np.argmax(fused))
             fused_chosen = float(fused[chosen_idx])
             if chosen_idx != 0:
@@ -1349,6 +1497,8 @@ class GeCo2DynamicPrototypeTracker:
         if not tk_cfg.history_update_on_append_only:
             self._topk_cosine_history.append(float(cosines[chosen_idx]))
             self._topk_geco2_history.append(float(geco2_scores[chosen_idx]))
+            if peak_active:
+                self._topk_peakiness_history.append(float(peaks[chosen_idx]))
 
         if self.dp_cfg.margin_verification.enabled and len(boxes) >= 2:
             selection_scores = fused if baseline is not None else cosines
@@ -1425,6 +1575,8 @@ class GeCo2DynamicPrototypeTracker:
         if tk_cfg.history_update_on_append_only:
             self._topk_cosine_history.append(float(cosines[chosen_idx]))
             self._topk_geco2_history.append(float(geco2_scores[chosen_idx]))
+            if peak_active:
+                self._topk_peakiness_history.append(float(peaks[chosen_idx]))
 
         self._n_appended += 1
         self._dynamic_tokens.append(new_tokens)
@@ -1465,6 +1617,43 @@ class GeCo2DynamicPrototypeTracker:
         self._n_offers += 1
         self._n_cluster_offers += 1
 
+        # embedding_source="dave_verification": swap ONLY this offer's
+        # cluster-verify embedding to DAVE's own verify-stage encoder -- see
+        # ClusterVerificationConfig.embedding_source's own docstring
+        # (aero_eyes/config.py). `feats`/`ref_feats` args stay untouched for
+        # every OTHER caller of this method's surrounding logic (topk_fusion
+        # etc. never reach here); only the local variables used below are
+        # re-embedded.
+        using_dave = self.dp_cfg.cluster_verification.embedding_source == "dave_verification"
+        if using_dave:
+            if self._dave_extractor is None:
+                from aero_eyes.models.dave_verification import build_dave_verification_extractor
+
+                self._dave_extractor = build_dave_verification_extractor(self.cfg)
+            if self._dave_ref_feats is None:
+                import cv2
+
+                refs_dir = Path(self.cfg.data.data_root) / self.sample_id / self.cfg.data.refs_subdir
+                exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+                ref_paths = sorted(
+                    p for p in (refs_dir.iterdir() if refs_dir.is_dir() else [])
+                    if p.suffix.lower() in exts
+                )[: self.cfg.data.num_references]
+                ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
+                self._dave_ref_feats = self._dave_extractor.extract(ref_imgs)
+                log.info(
+                    "[Stage123-GeCo2] %s: dynamic_prototype cluster_verification."
+                    "embedding_source=dave_verification -- re-encoded %d reference "
+                    "image(s) with DAVE's own verify-stage embedding (dim=%d)",
+                    self.sample_id, len(ref_imgs), self._dave_ref_feats.shape[-1],
+                )
+            feats = self._dave_extractor.extract_crops(
+                frame_bgr, boxes,
+                pad_ratio=self.cfg.stage2.candidate.feature_crop_pad,
+                batch_size=self.cfg.runtime.batch_size,
+            )
+            ref_feats = self._dave_ref_feats
+
         def _fallback_keep_mask(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
             # Too few candidates this keyframe for clustering to find
             # meaningful structure -- fall back to a threshold RELATIVE to
@@ -1475,9 +1664,21 @@ class GeCo2DynamicPrototypeTracker:
             # (confirmed in practice on this project's own footage), which
             # would silently zero out every fallback-path keyframe exactly
             # like it did for stage3.py's own equivalent fallback.
-            del ref_feats_frame  # _cosine_from_feature already pools against self._cross_per_ref_features
             self._n_cluster_fallback += 1
-            sims = np.array([self._cosine_from_feature(f) for f in cand_feats_frame])
+            if using_dave:
+                # cand_feats_frame/ref_feats_frame here are DAVE's own
+                # verify-stage embeddings, not stage1.feature_extractor's --
+                # self._cosine_from_feature pools against
+                # self._cross_per_ref_features (the OTHER space), so it does
+                # not apply here. Both are L2-normalized (every extractor's
+                # own .extract()/.extract_crops() contract), so plain cosine
+                # (dot product) against ref_feats_frame directly is correct.
+                sims = (
+                    np.max(cand_feats_frame @ ref_feats_frame.T, axis=1)
+                    if cand_feats_frame.size else np.zeros(0)
+                )
+            else:
+                sims = np.array([self._cosine_from_feature(f) for f in cand_feats_frame])
             if sims.size == 0:
                 return sims.astype(bool)
             return sims >= float(sims.max()) * self.dp_cfg.cluster_verification.fallback_relative_ratio
@@ -1509,7 +1710,18 @@ class GeCo2DynamicPrototypeTracker:
             # ties within the already-cluster-verified set and says
             # nothing about identity ambiguity between two verified
             # candidates.
-            cosines_verified = np.array([self._cosine_from_feature(feats[i]) for i in verified_idxs])
+            if using_dave:
+                # feats here are DAVE's own verify-stage embeddings (see
+                # embedding_source="dave_verification" above) --
+                # self._cosine_from_feature pools against
+                # self._cross_per_ref_features (stage1.feature_extractor's
+                # space), so it does not apply; use ref_feats (=
+                # self._dave_ref_feats, same DAVE space) directly instead.
+                cosines_verified = np.array([
+                    float(np.max(feats[i] @ ref_feats.T)) for i in verified_idxs
+                ])
+            else:
+                cosines_verified = np.array([self._cosine_from_feature(feats[i]) for i in verified_idxs])
             top_two = np.sort(cosines_verified)[::-1][:2]
             margin = float(top_two[0] - top_two[1])
             if margin < self.dp_cfg.margin_verification.tau_margin:

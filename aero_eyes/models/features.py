@@ -39,6 +39,12 @@ Supported models:
              mechanism as model="dinov2". NOT YET VALIDATED -- see
              DinoTxtFeatureExtractor's own docstring for details that could
              not be independently verified without a live download.
+  dave_verification — DAVE's (arXiv:2404.16622) OWN verify-stage embedding:
+             ResNet50+SWaV backbone + its learned `feat_comp` projection
+             (weights from verification.pth, this project's vendored DAVE/
+             checkout) -- see aero_eyes.models.dave_verification's own
+             module docstring and DaveVerificationConfig (aero_eyes/
+             config.py) for setup/rationale. NOT YET VALIDATED.
 
 All extractors return L2-normalized float32 feature vectors.
 """
@@ -1532,11 +1538,14 @@ def build_feature_extractor(cfg):
             device     = dev,
             image_size = fe.image_size,
         )
+    elif fe.model == "dave_verification":
+        from aero_eyes.models.dave_verification import build_dave_verification_extractor
+        base = build_dave_verification_extractor(cfg)
     else:
         raise ValueError(
             f"Unknown feature extractor model '{fe.model}'. "
             "Must be 'dinov2', 'dinov3', 'clip', 'siglip', 'ensemble', 'fgclip', 'radio', "
-            "'siglip2', 'evaclip', or 'dinotxt'."
+            "'siglip2', 'evaclip', 'dinotxt', or 'dave_verification'."
         )
 
     cbm = fe.candidate_background_masking

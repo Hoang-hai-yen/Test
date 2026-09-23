@@ -78,7 +78,7 @@ class _FakeMaskProcessor:
 
 def _rig(det, mask_processor):
     det._get_mask_processor = lambda: mask_processor
-    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {"sentinel": True})
+    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {"sentinel": True}, None, None)
 
 
 def test_legacy_path_used_when_no_new_options_requested():
@@ -90,7 +90,7 @@ def test_legacy_path_used_when_no_new_options_requested():
     det._sam2_refine_boxes_legacy = lambda *a, **k: (called.__setitem__("legacy", True), [])[1]
     det._sam2_refine_boxes_custom = lambda *a, **k: (called.__setitem__("custom", True), [])[1]
     det._get_mask_processor = lambda: object()  # non-None, non-callable-checked here
-    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {})
+    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {}, None, None)
 
     det.sam2_refine_boxes(np.zeros((10, 10, 3), dtype=np.uint8), {}, [Box(1, 1, 5, 5, score=0.5)])
 
@@ -104,7 +104,7 @@ def test_custom_path_used_when_context_margin_requested():
     det._sam2_refine_boxes_legacy = lambda *a, **k: (called.__setitem__("legacy", True), [])[1]
     det._sam2_refine_boxes_custom = lambda *a, **k: (called.__setitem__("custom", True), [])[1]
     det._get_mask_processor = lambda: object()
-    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {})
+    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {}, None, None)
 
     det.sam2_refine_boxes(
         np.zeros((10, 10, 3), dtype=np.uint8), {}, [Box(1, 1, 5, 5, score=0.5)], context_margin=0.2,

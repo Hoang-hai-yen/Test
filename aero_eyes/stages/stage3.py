@@ -1126,6 +1126,51 @@ def run_stage3(cfg, sample_id: str) -> Path:
             np.stack(per_ref_features, axis=0) if use_multi_ref else prototype[None, :]
         )
 
+        # embedding_source="dave_verification": swap ONLY this affinity
+        # matrix's embedding to DAVE's own verify-stage encoder -- see
+        # ClusterVerificationConfig.embedding_source's own docstring
+        # (aero_eyes/config.py). all_feats/per_ref_features/all_sims (used
+        # everywhere else in this function -- matching/threshold scoring,
+        # logging, etc.) stay in stage1.feature_extractor's own space,
+        # completely unchanged; only cand_feats_frame/ref_feats_for_cluster
+        # fed into cluster_verify_candidates below are re-embedded.
+        dave_extractor = None
+        if s3.cluster_verification.embedding_source == "dave_verification":
+            if s3.cluster_verification.pairwise_metric == "mahalanobis":
+                raise ValueError(
+                    "stage3.cluster_verification.embedding_source='dave_verification' is not "
+                    "compatible with pairwise_metric='mahalanobis' -- precision_matrix is fit "
+                    "in stage1.feature_extractor's own embedding space (_fit_rmd_background on "
+                    "all_feats), not DAVE's verify-stage embedding space. Use pairwise_metric="
+                    "'cosine' (or 'l1') with embedding_source='dave_verification'."
+                )
+            if video_path is None:
+                raise FileNotFoundError(
+                    "stage3.cluster_verification.embedding_source='dave_verification' needs the "
+                    f"sample's own video (to RoI-Align candidate boxes out of DAVE's backbone "
+                    f"feature map) but no video file was found for {sample_id!r} matching "
+                    f"{cfg.data.video_glob!r}."
+                )
+            import cv2
+
+            from aero_eyes.models.dave_verification import build_dave_verification_extractor
+
+            dave_extractor = build_dave_verification_extractor(cfg)
+
+            refs_dir = Path(cfg.data.data_root) / sample_id / cfg.data.refs_subdir
+            exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            ref_paths = sorted(
+                p for p in (refs_dir.iterdir() if refs_dir.is_dir() else [])
+                if p.suffix.lower() in exts
+            )[: cfg.data.num_references]
+            ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
+            ref_feats_for_cluster = dave_extractor.extract(ref_imgs)
+            log.info(
+                "[Stage3] %s: cluster_verification.embedding_source=dave_verification -- "
+                "re-encoded %d reference image(s) with DAVE's own verify-stage embedding "
+                "(dim=%d)", sample_id, len(ref_imgs), ref_feats_for_cluster.shape[-1],
+            )
+
         def _fallback_keep_mask(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
             # Too few candidates this keyframe for clustering to find
             # meaningful structure -- fall back to a threshold RELATIVE to
@@ -1137,6 +1182,21 @@ def run_stage3(cfg, sample_id: str) -> Path:
             # project's own footage, where a whole video's max candidate
             # similarity (0.335) stayed under match_threshold's default
             # (0.55), silently zeroing out every fallback-path keyframe.
+            if dave_extractor is not None:
+                # cand_feats_frame/ref_feats_frame here are in DAVE's own
+                # verify-stage embedding space (see embedding_source=
+                # "dave_verification" above), not stage1.feature_extractor's
+                # -- _score_against_ref's s3.similarity metrics (rmd/l1/l2/
+                # etc.) are defined/calibrated for that OTHER space, so they
+                # do not apply here. Both extractors' outputs are
+                # L2-normalized (see every *FeatureExtractor.extract's own
+                # contract), so plain cosine (dot product) is always valid,
+                # regardless of s3.similarity.
+                sims_frame = np.max(cand_feats_frame @ ref_feats_frame.T, axis=1)
+                if sims_frame.size == 0:
+                    return sims_frame.astype(bool)
+                relative_floor = float(sims_frame.max()) * s3.cluster_verification.fallback_relative_ratio
+                return sims_frame >= relative_floor
             sims_per_ref_frame = [
                 _score_against_ref(cand_feats_frame, rf, s3.similarity, background=background)
                 for rf in ref_feats_frame
@@ -1153,8 +1213,22 @@ def run_stage3(cfg, sample_id: str) -> Path:
         method_counts: dict[str, int] = _defaultdict(int)
         for fi in sorted(frame_to_indices):
             idxs = frame_to_indices[fi]
+            if dave_extractor is not None:
+                # Re-embed THIS keyframe's own candidates with DAVE's verify-
+                # stage encoder -- one backbone forward pass over the frame,
+                # shared across every box in it (see DaveVerificationExtractor.
+                # extract_crops's own docstring for why this differs from every
+                # other extractor's independent-crop approach).
+                frame_bgr = read_frame(video_path, fi)
+                cand_feats_frame = dave_extractor.extract_crops(
+                    frame_bgr, [all_dets[i].box for i in idxs],
+                    pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+                    batch_size=cfg.runtime.batch_size,
+                )
+            else:
+                cand_feats_frame = all_feats[idxs]
             frame_keep, method_label = cluster_verify_candidates(
-                all_feats[idxs], ref_feats_for_cluster, s3.cluster_verification,
+                cand_feats_frame, ref_feats_for_cluster, s3.cluster_verification,
                 fallback_keep_mask_fn=_fallback_keep_mask, precision_matrix=precision_matrix,
             )
             method_counts[method_label] += 1
@@ -1333,6 +1407,16 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # for the full empirical rationale.
     csf_cfg = s3.cluster_secondary_filter
     if csf_cfg.enabled and s3.verification_method == "threshold":
+        if csf_cfg.cluster_verification.embedding_source == "dave_verification":
+            raise NotImplementedError(
+                "stage3.cluster_secondary_filter.cluster_verification.embedding_source="
+                "'dave_verification' is not wired here yet -- only "
+                "stage3.cluster_verification (verification_method='cluster') and "
+                "stage123_geco2.dynamic_prototype.cluster_verification support it. This "
+                "filter always clusters against all_feats (stage1.feature_extractor's own "
+                "space). Set embedding_source back to 'extractor', or ask for this call "
+                "site to be wired up too."
+            )
         from collections import defaultdict as _defaultdict
         from collections import deque as _deque
 

@@ -197,8 +197,31 @@ class ProjectionHeadConfig(BaseModel):
 class FeatureExtractorConfig(BaseModel):
     model: Literal[
         "dinov2", "dinov3", "clip", "siglip", "ensemble", "fgclip", "radio",
-        "siglip2", "evaclip", "dinotxt",
+        "siglip2", "evaclip", "dinotxt", "dave_verification",
     ] = "dinov2"
+    # "dave_verification": uses DAVE's (arXiv:2404.16622) OWN backbone
+    # (ResNet50 + SWaV) + its learned verify-stage projection `feat_comp`,
+    # weights from verification.pth -- both classes COPIED verbatim into
+    # aero_eyes/models/_dave_vendor.py (under DAVE's own MIT license, no
+    # full DAVE checkout/git submodule needed at runtime) -- AS the feature
+    # extractor for the WHOLE pipeline (Stage 1 prototype, Stage 2/3/4
+    # candidate scoring, and -- when stage3.cluster_verification.
+    # embedding_source="extractor" (the default) -- the cluster-verify
+    # affinity matrix too). No variant field of its own; see the top-level
+    # dave_verification: section below for
+    # verification_weights_path/image_size/reduction/kernel_dim.
+    # This is the "drop DINOv2 entirely, use only DAVE's own encoder"
+    # option -- see stage3.cluster_verification.embedding_source's own
+    # comment for the OTHER option (keep this extractor as-is for
+    # everything else, swap ONLY the cluster-verify embedding to DAVE's).
+    # Unlike every other extractor here, `feat_comp`'s weights are a
+    # LEARNED projection trained specifically for DAVE's own verify-stage
+    # clustering (FSC147 domain), not a general-purpose embedding -- expect
+    # it to behave differently (better OR worse) from DINOv2/CLIP/etc. on
+    # this project's own footage. NOT YET VALIDATED -- requires manually
+    # downloading verification.pth (Google Drive link in DAVE/README.md);
+    # the SWaV backbone checkpoint itself auto-downloads via torch.hub on
+    # first use (needs internet).
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     # DINOv2 "with registers" (torch.hub dinov2_{variant}_reg / HF
     # facebook/dinov2-with-registers-*): Meta found a handful of patch tokens
@@ -723,6 +746,41 @@ class ClusterVerificationConfig(BaseModel):
     # near-ties. Purely local to this keyframe (no batch/online state), so
     # this stays exactly as causal as clustering itself.
     fallback_relative_ratio: float = 0.9
+    # Which embedding the CLUSTER-VERIFY DECISION ITSELF is built from --
+    # independent of stage1.feature_extractor.model="dave_verification"
+    # (that field swaps the extractor for the WHOLE pipeline; this one only
+    # swaps the input to this one affinity matrix).
+    #   "extractor" (default, unchanged): reuse whatever embedding
+    #     stage1.feature_extractor already computed for this
+    #     candidate/exemplar (all_feats/per_ref_features in stage3.py,
+    #     feats/ref_feats in geco2_detector.py's offer_topk) -- same
+    #     embedding used for prototype building and matching/threshold
+    #     scoring elsewhere in the pipeline.
+    #   "dave_verification": run DAVE's (arXiv:2404.16622) OWN backbone
+    #     (ResNet50+SWaV) + its learned verify-stage projection `feat_comp`
+    #     (verification.pth) SIDE BY SIDE with stage1.feature_extractor --
+    #     that extractor keeps doing prototype/matching/threshold scoring
+    #     completely unchanged; ONLY the embedding fed into THIS cluster's
+    #     affinity matrix is swapped to DAVE's own verify-stage embedding
+    #     (aero_eyes.models.dave_verification.DaveVerificationExtractor,
+    #     configured via the top-level dave_verification: section). Costs 1
+    #     extra CNN forward pass per keyframe (stage3.py: needs the
+    #     original video frame, re-read via read_frame() -- raises if no
+    #     video file was found for the sample) plus one one-time forward
+    #     pass per reference image (cached for the whole sample/video). The
+    #     min_candidates_for_cluster fallback path above is NOT affected by
+    #     this field -- it always stays in stage1.feature_extractor's own
+    #     embedding space (see stage3.py/geco2_detector.py's own
+    #     _fallback_keep_mask comments for why). NOT YET VALIDATED --
+    #     requires manually downloading verification.pth (Google Drive link
+    #     in DAVE/README.md).
+    #   Currently only wired at stage3.py's verification_method="cluster"
+    #     and stage123_geco2.dynamic_prototype.cluster_verification call
+    #     sites -- stage3.cluster_secondary_filter's own copy of this field
+    #     raises NotImplementedError if set to "dave_verification" (that
+    #     call site always clusters against stage1.feature_extractor's own
+    #     all_feats; not wired to DaveVerificationExtractor yet).
+    embedding_source: Literal["extractor", "dave_verification"] = "extractor"
 
 
 class ClusterSecondaryFilterConfig(BaseModel):
@@ -2294,8 +2352,20 @@ class Geco2DynamicPrototypeTopKFusionConfig(BaseModel):
     together with either.
     """
     enabled: bool = False
-    # w in the formula above; GeCo2's own weight is implicitly (1 - this).
+    # w in the formula above; GeCo2's own weight is implicitly
+    # (1 - cosine_weight - peakiness_weight) when peakiness_weight > 0.
     cosine_weight: float = 0.5
+    # Optional 3rd fusion axis (0.0 = disabled, today's 2-way formula
+    # unchanged): weight on peak_z, the Z-scored peak_contrast_filter
+    # signal (see Geco2PeakContrastFilterConfig) -- fused_score_i becomes
+    # cosine_weight*cosine_z_i + (1-cosine_weight-peakiness_weight)*geco2_z_i
+    # + peakiness_weight*peak_z_i. Needs
+    # stage123_geco2.peak_contrast_filter.enabled=true (so boxes actually
+    # carry a peak_contrast value) -- if any surviving candidate this
+    # keyframe has none, the peakiness term is silently dropped for the
+    # rest of the run (one-time warning), falling back to the 2-way
+    # formula, rather than erroring.
+    peakiness_weight: float = 0.0
     # How many past keyframes' CHOSEN-candidate raw cosine/geco2 values to
     # keep for the running Z-score baseline (a simple deque, oldest evicted
     # once exceeded) -- larger is a more stable baseline but slower to
@@ -2571,6 +2641,52 @@ class Geco2DynamicPrototypeConfig(BaseModel):
     margin_verification: MarginVerificationConfig = MarginVerificationConfig()
 
 
+class Geco2PeakContrastFilterConfig(BaseModel):
+    """stage123_geco2.peak_contrast_filter -- an alternative signal to tell a
+    real object from clutter, using GeCo2's OWN centerness map instead of
+    cosine similarity or the map's raw peak VALUE (already used via
+    score_threshold_ratio/score_threshold_abs and
+    dynamic_prototype.topk_fusion's geco2 term). Real-footage diagnosis
+    (docs/GECO2_precision_improvements_plan.md) found repetitive-texture
+    confusers (e.g. a leaf cluster) dominating false positives -- that kind
+    of clutter tends to produce several closely-spaced, comparably-high
+    local maxima on the centerness map (low contrast against its own
+    neighborhood) even when the single best pixel's VALUE clears
+    score_threshold_ratio. A real, isolated object instead produces one
+    peak that falls off cleanly to background on all sides -- high
+    contrast. Computed once per surviving candidate as
+    (peak - neighborhood_mean) / neighborhood_std over a
+    (2*radius+1)x(2*radius+1) window on the centerness grid (image_size //
+    reduction per side, e.g. 1024/16=64) around that candidate's own peak
+    location -- reuses the SAME centerness tensor detect_frame() already
+    computed, no extra GeCo2 forward pass.
+
+    enabled=True, hard_reject=False (default): ANNOTATES every surviving
+    Box.peak_contrast only -- does not change which boxes
+    filter_boxes_by_threshold returns. Feeds
+    dynamic_prototype.topk_fusion.peakiness_weight downstream as a 3rd
+    fusion axis alongside cosine/geco2 score.
+    hard_reject=True: additionally DROPS any surviving candidate whose
+    peak_contrast < min_contrast_z right here in filter_boxes_by_threshold
+    -- shrinks the candidate pool before it ever reaches cosine/topk_fusion,
+    i.e. a stage-2-level cut instead of a stage-3-level one.
+
+    NOT YET VALIDATED on real footage -- A/B test both modes against
+    today's behavior (disabled) before trusting either.
+    """
+    enabled: bool = False
+    # Neighborhood half-size, in centerness-grid cells (not pixels) --
+    # image_size // reduction per side (e.g. 1024 // 16 = 64 total cells),
+    # so radius=4 covers roughly a 9x9-cell window, ~1/7th of the grid's
+    # own side length. Too small: neighborhood is mostly the peak's own
+    # footprint, contrast is meaninglessly high for everything. Too large:
+    # washes out with unrelated regions of the frame, contrast collapses
+    # toward 0 for everything.
+    radius: int = 4
+    hard_reject: bool = False
+    min_contrast_z: float = 0.5
+
+
 class Stage123Geco2Config(BaseModel):
     """Only used when pipeline.detector == 'geco2'. Requires the vendored
     GECO2/ repo's own dependencies (hydra-core, omegaconf, its sam2 package)
@@ -2623,6 +2739,7 @@ class Stage123Geco2Config(BaseModel):
     # analysis) rather than guessing.
     min_box_area_enabled: bool = False
     min_box_area: int = 24
+    peak_contrast_filter: Geco2PeakContrastFilterConfig = Geco2PeakContrastFilterConfig()
     prototype_cache_name: str = "geco2_prototype.pt"
     # Shrink each reference image before encoding it as an exemplar, to
     # narrow the ground-to-aerial domain gap (close-up ref photos are
@@ -2770,6 +2887,57 @@ class AdaptiveContextMarginConfig(BaseModel):
     # treated as anomalously undersized rather than genuinely small.
     relative_undersize_ratio: float = 0.5
     min_ratio: float = 0.0      # fraction of context_margin used at/below min_size_px (0.0 = no margin at all)
+
+
+class DaveVerificationConfig(BaseModel):
+    """Infrastructure for DAVE's (arXiv:2404.16622) OWN verify-stage
+    embedding -- ResNet50+SWaV backbone + its learned `feat_comp`
+    projection (weights from verification.pth), wrapped by
+    aero_eyes.models.dave_verification.DaveVerificationExtractor. Both
+    classes are COPIED (verbatim, under DAVE's own MIT license -- see
+    aero_eyes/models/_dave_vendor.py's own header for the full notice),
+    not cloned from the full DAVE repo -- this project only ever reuses
+    DAVE's verify stage, so no git submodule / full checkout is needed at
+    runtime.
+
+    Two independent switches consume this section (pick one or both):
+      - stage1.feature_extractor.model="dave_verification": uses it as the
+        extractor for the WHOLE pipeline (drops DINOv2/etc. entirely).
+      - stage3.cluster_verification.embedding_source="dave_verification"
+        (also consumed by stage123_geco2.dynamic_prototype.
+        cluster_verification, same ClusterVerificationConfig primitive):
+        uses it ONLY for the cluster-verify affinity matrix, alongside
+        whatever stage1.feature_extractor is already doing elsewhere.
+
+    Setup required before either switch works:
+      1. Download verification.pth (Google Drive link in DAVE's own
+         README, https://github.com/jerpelhan/DAVE -- cannot be
+         automated) and point verification_weights_path at it. Only its
+         `feat_comp.*` weights are read (same extraction DAVE/main.py
+         itself does) -- DAVE's own detector checkpoint (DAVE_3_shot.pth
+         etc.) is NOT needed.
+      2. The ResNet50 SWaV backbone checkpoint auto-downloads via
+         torch.hub on first use (needs internet, ~100MB, cached by
+         torch.hub afterward) -- same mechanism DAVE's own backbone code
+         uses, nothing project-specific.
+
+    NOT YET VALIDATED against this project's own footage, same as every
+    other opt-in accuracy knob here -- feat_comp was trained on FSC147
+    (natural-image counting), not this project's own domain.
+    """
+    verification_weights_path: str = "./verification.pth"
+    # Frame/reference-image resize before the backbone forward pass --
+    # DAVE's own default (models/dave.py / utils/arg_parser.py).
+    image_size: int = 1024
+    # Backbone output stride -- DAVE's own default (models/backbone.py).
+    # Must match whatever verification.pth was actually trained with, or
+    # feat_comp receives RoI-Align features from a different spatial scale
+    # than it learned on.
+    reduction: int = 8
+    # RoI-Align output size (kernel_dim x kernel_dim) fed into feat_comp --
+    # DAVE's own default. Must match verification.pth's training config,
+    # same reasoning as reduction above.
+    kernel_dim: int = 3
 
 
 class BoxRefineConfig(BaseModel):
@@ -3002,6 +3170,7 @@ class AeroEyesConfig(BaseModel):
     accuracy: AccuracyConfig = AccuracyConfig()
     eval: EvalConfig = EvalConfig()
     box_refine: BoxRefineConfig = BoxRefineConfig()
+    dave_verification: DaveVerificationConfig = DaveVerificationConfig()
 
     @model_validator(mode="after")
     def check_litetrack_path(self) -> "AeroEyesConfig":

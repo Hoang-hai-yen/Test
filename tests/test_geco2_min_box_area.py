@@ -28,6 +28,10 @@ def _make_detector(
     det.topk_per_keyframe = topk_per_keyframe
     det.min_box_area_enabled = min_box_area_enabled
     det.min_box_area = min_box_area
+    det.peak_contrast_filter_enabled = False
+    det.peak_contrast_radius = 4
+    det.peak_contrast_hard_reject = False
+    det.peak_contrast_min_z = 0.5
     return det
 
 

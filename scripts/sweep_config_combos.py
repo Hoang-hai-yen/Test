@@ -390,6 +390,18 @@ def build_stage3_combos() -> list[Combo]:
         Combo("M3_min", "multi_ref_pooling", {"accuracy.cheap_boosters.multi_ref_pooling": "min"}),
         Combo("M4_agreement_weighted", "multi_ref_pooling",
               {"accuracy.cheap_boosters.multi_ref_pooling": "agreement_weighted"}),
+        # M5 -- multi_reference_embedding itself OFF (config.yaml default:
+        # true). M1/M3/M4 above only vary the POOLING FORMULA, always
+        # assuming per-ref prototypes are kept in the first place; this
+        # instead falls back to a single fused prototype (mean/max/... per
+        # stage1.prototype.fusion) for scoring, no per-ref pooling at all --
+        # the comparison point M1/M3/M4 are themselves implicitly measured
+        # against (stage1_default/baseline never turns this off either).
+        Combo("M5_multi_reference_embedding_off", "multi_ref_pooling",
+              {"accuracy.cheap_boosters.multi_reference_embedding": False},
+              note="falls back to scoring against the single FUSED prototype only -- no "
+                   "per-ref scoring/pooling at all, the comparison point M1/M3/M4 (and every "
+                   "other combo, which all leave this at its own true default) are measured against"),
     ]
 
 

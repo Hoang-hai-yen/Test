@@ -24,7 +24,8 @@ def _make_cfg(
     **dp_overrides,
 ):
     tk_defaults = dict(
-        enabled=False, cosine_weight=0.5, running_window=50, min_window_for_zscore=5, acceptance_z_threshold=0.0,
+        enabled=False, cosine_weight=0.5, peakiness_weight=0.0,
+        running_window=50, min_window_for_zscore=5, acceptance_z_threshold=0.0,
         intra_frame_baseline=False, intra_frame_min_boxes=3, history_update_on_append_only=False,
         min_absolute_cosine_floor_enabled=False, min_absolute_cosine_floor=0.05,
         min_absolute_cosine_floor_self_calibrate=False, min_absolute_cosine_floor_self_calibrate_ratio=0.3,

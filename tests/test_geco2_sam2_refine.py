@@ -35,7 +35,7 @@ def test_sam2_refine_boxes_converts_coordinates_both_directions():
     scale = 2.0  # canvas_px = frame_px * scale
     frame_bgr = np.zeros((50, 50, 3), dtype=np.uint8)
 
-    det._forward_scores = lambda frame_bgr, prototype: (None, None, scale, {"sentinel": True})
+    det._forward_scores = lambda frame_bgr, prototype: (None, None, scale, {"sentinel": True}, None, None)
 
     captured = {}
 
@@ -82,7 +82,7 @@ def test_sam2_refine_boxes_falls_back_when_mask_processor_unavailable():
 
 def test_sam2_refine_boxes_falls_back_when_forward_pass_raises():
     det = _make_detector(image_size=100.0)
-    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {})
+    det._forward_scores = lambda frame_bgr, prototype: (None, None, 1.0, {}, None, None)
 
     class _RaisingMaskProcessor:
         def __call__(self, feats, outputs_wrapped):
