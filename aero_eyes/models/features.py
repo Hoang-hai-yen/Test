@@ -1066,7 +1066,7 @@ class Siglip2FeatureExtractor:
     NOT a hand-pooled hidden_state -- SigLIP2's checkpoints (even the
     fixed-resolution "FixRes" ones used here) are patch-count-based
     internally (see Siglip2VisionConfig.num_patches), so get_image_features
-    is the one call guaranteed to handle whatever pixel_values/
+    is the one call meant to handle whatever pixel_values/
     pixel_attention_mask/spatial_shapes the processor actually produced,
     without this class needing to special-case that.
 
@@ -1081,6 +1081,12 @@ class Siglip2FeatureExtractor:
     while implementing this did not surface a clean per-variant output_dim
     table, and this project has already been burned once (FG-CLIP) by
     trusting an assumed number instead of a measured one.
+
+    CONFIRMED IN PRACTICE (not just theoretical): on at least one real
+    transformers/checkpoint combination, get_image_features() returns the
+    raw BaseModelOutputWithPooling instead of the documented projected
+    Tensor -- see _get_image_features's own docstring for the fallback
+    (pooler_output) this class uses when that happens.
 
     NOT YET VALIDATED on this project's own footage.
     """
@@ -1112,12 +1118,39 @@ class Siglip2FeatureExtractor:
         model = AutoModel.from_pretrained(hf_name)
         return model, processor
 
+    def _get_image_features(self, **inputs) -> torch.Tensor:
+        """Wraps model.get_image_features(**inputs) -- confirmed in practice
+        (not just theoretical) that on at least one transformers/checkpoint
+        combination, AutoModel.from_pretrained(hf_name) for a SigLIP2
+        checkpoint resolves get_image_features() to something that returns
+        the raw BaseModelOutputWithPooling (vision tower output) instead of
+        the documented projected embedding Tensor -- contradicts this
+        class's own docstring assumption ("the officially documented API").
+        Falls back to pooler_output (SigLIP's own per-image pooled
+        representation, the closest equivalent to what get_image_features
+        should have returned) when that happens, so a transformers-version-
+        specific quirk doesn't hard-crash Stage 1/3 -- raises a clear,
+        actionable error if even that isn't available."""
+        feats = self.model.get_image_features(**inputs)
+        if torch.is_tensor(feats):
+            return feats
+        pooled = getattr(feats, "pooler_output", None)
+        if pooled is not None:
+            return pooled
+        raise TypeError(
+            f"Siglip2FeatureExtractor: model.get_image_features() returned {type(feats).__name__!r} "
+            "instead of a Tensor, and it has no .pooler_output to fall back to -- this transformers "
+            "version's SigLIP2 API differs from what this class assumed. Inspect "
+            f"transformers.__version__ and this checkpoint's model class ({type(self.model).__name__}) "
+            "to find the right accessor."
+        )
+
     @torch.no_grad()
     def _probe_dim(self) -> int:
         dummy = Image.new("RGB", (224, 224))
         inputs = self.processor(images=[dummy], return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        feats = self.model.get_image_features(**inputs)
+        feats = self._get_image_features(**inputs)
         return int(feats.shape[-1])
 
     @torch.no_grad()
@@ -1130,7 +1163,7 @@ class Siglip2FeatureExtractor:
             batch_pil = pil_imgs[i:i+batch_size]
             inputs = self.processor(images=batch_pil, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            feats = self.model.get_image_features(**inputs)
+            feats = self._get_image_features(**inputs)
             out.append(F.normalize(feats, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
 

@@ -773,13 +773,13 @@ class ClusterVerificationConfig(BaseModel):
     #     embedding space (see stage3.py/geco2_detector.py's own
     #     _fallback_keep_mask comments for why). NOT YET VALIDATED --
     #     requires manually downloading verification.pth (Google Drive link
-    #     in DAVE/README.md).
-    #   Currently only wired at stage3.py's verification_method="cluster"
-    #     and stage123_geco2.dynamic_prototype.cluster_verification call
-    #     sites -- stage3.cluster_secondary_filter's own copy of this field
-    #     raises NotImplementedError if set to "dave_verification" (that
-    #     call site always clusters against stage1.feature_extractor's own
-    #     all_feats; not wired to DaveVerificationExtractor yet).
+    #     in DAVE's own README, https://github.com/jerpelhan/DAVE).
+    #   Wired at all 3 call sites that share this config: stage3.py's
+    #     verification_method="cluster", stage3.cluster_secondary_filter,
+    #     and stage123_geco2.dynamic_prototype.cluster_verification -- each
+    #     builds its OWN DaveVerificationExtractor instance and its own
+    #     DAVE-space re-encoding of the 3 reference images (not shared
+    #     across call sites, even within the same run).
     embedding_source: Literal["extractor", "dave_verification"] = "extractor"
 
 

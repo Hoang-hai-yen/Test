@@ -132,6 +132,12 @@ def _make_detector(
     det.peak_contrast_radius = peak_contrast_radius
     det.peak_contrast_hard_reject = peak_contrast_hard_reject
     det.peak_contrast_min_z = peak_contrast_min_z
+    det._n_peak_contrast_seen = 0
+    det._n_peak_contrast_hard_rejected = 0
+    det._peak_contrast_sum = 0.0
+    det._peak_contrast_sumsq = 0.0
+    det._peak_contrast_min = None
+    det._peak_contrast_max = None
     return det
 
 
@@ -244,3 +250,38 @@ def test_missing_ref_points_or_centerness_is_a_silent_noop():
 
     assert len(results) == 2
     assert all(b.peak_contrast is None for b in results)
+
+
+# ---------------------------------------------------------------------------
+# log_peak_contrast_summary
+# ---------------------------------------------------------------------------
+
+def test_log_summary_reports_stats_and_reject_count(caplog):
+    import logging
+
+    det = _make_detector(peak_contrast_filter_enabled=True, peak_contrast_hard_reject=True, peak_contrast_min_z=3.0)
+    pred_boxes, box_v, frame_bgr, centerness, ref_points = _scene()
+    det.filter_boxes_by_threshold(
+        pred_boxes, box_v, scale=1.0, frame_bgr=frame_bgr, threshold=0.5,
+        ref_points=ref_points, centerness=centerness,
+    )
+
+    with caplog.at_level(logging.INFO):
+        det.log_peak_contrast_summary("sample_x")
+
+    assert "peak_contrast_filter summary" in caplog.text
+    assert "n=2" in caplog.text
+    assert "1/2 hard-rejected" in caplog.text
+
+
+def test_log_summary_is_a_noop_when_disabled():
+    det = _make_detector(peak_contrast_filter_enabled=False)
+    det.log_peak_contrast_summary("sample_x")  # must not raise even with no data at all
+
+
+def test_log_summary_is_a_noop_when_nothing_was_ever_scored():
+    """enabled=true but filter_boxes_by_threshold was never called with
+    ref_points/centerness (e.g. only the global_adaptive_threshold path ran
+    this whole video) -- n_seen stays 0, must not raise or log."""
+    det = _make_detector(peak_contrast_filter_enabled=True)
+    det.log_peak_contrast_summary("sample_x")

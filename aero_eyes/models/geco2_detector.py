@@ -149,6 +149,15 @@ class GeCo2Detector:
         self.peak_contrast_radius = pcf.radius
         self.peak_contrast_hard_reject = pcf.hard_reject
         self.peak_contrast_min_z = pcf.min_contrast_z
+        # peak_contrast_filter diagnostic counters -- see log_peak_contrast_
+        # summary() below. Running sum/sumsq (not a stored list) so this
+        # doesn't grow unbounded over a long video's worth of candidates.
+        self._n_peak_contrast_seen = 0
+        self._n_peak_contrast_hard_rejected = 0
+        self._peak_contrast_sum = 0.0
+        self._peak_contrast_sumsq = 0.0
+        self._peak_contrast_min: float | None = None
+        self._peak_contrast_max: float | None = None
         self.use_shape_token = g.use_shape_token
         self.emb_dim = g.emb_dim
         self.reduction = g.reduction
@@ -586,6 +595,17 @@ class GeCo2Detector:
         results: list[Box] = []
         for i, ((x1, y1, x2, y2), s) in enumerate(zip(px_boxes, scores)):
             pc = float(peak_contrasts[i]) if peak_contrasts is not None else None
+            if pc is not None:
+                # log_peak_contrast_summary()'s running stats -- counts
+                # every candidate a peak_contrast was actually COMPUTED for
+                # (annotate-only and hard_reject modes both land here),
+                # regardless of whether it then survives the reject check
+                # below.
+                self._n_peak_contrast_seen += 1
+                self._peak_contrast_sum += pc
+                self._peak_contrast_sumsq += pc * pc
+                self._peak_contrast_min = pc if self._peak_contrast_min is None else min(self._peak_contrast_min, pc)
+                self._peak_contrast_max = pc if self._peak_contrast_max is None else max(self._peak_contrast_max, pc)
             # hard_reject (stage-2-style cut): drop right here, before this
             # candidate ever becomes a Box at all. annotate-only mode
             # (hard_reject=False) falls through and just carries pc on the
@@ -594,6 +614,7 @@ class GeCo2Detector:
                 self.peak_contrast_filter_enabled and self.peak_contrast_hard_reject
                 and pc is not None and pc < self.peak_contrast_min_z
             ):
+                self._n_peak_contrast_hard_rejected += 1
                 continue
             box = Box(float(x1), float(y1), float(x2), float(y2), score=float(s), peak_contrast=pc).clip(w_frame, h_frame)
             if box.area() <= 0:
@@ -609,6 +630,31 @@ class GeCo2Detector:
                 continue
             results.append(box)
         return results
+
+    def log_peak_contrast_summary(self, sample_id: str) -> None:
+        """stage123_geco2.peak_contrast_filter's own observability -- the
+        computation itself is otherwise completely silent (no per-frame log
+        line), unlike every other opt-in mechanism in this file
+        (dynamic_prototype's log_summary(), topk_fusion's counters). Call
+        once at the end of a sample's detect_frame() sweep (both
+        run_stage123_geco2 and run_stage12_geco2_candidates do). No-op if
+        the filter never ran (disabled, or a caller path that doesn't
+        supply ref_points/centerness -- see filter_boxes_by_threshold's own
+        docstring) so this is always safe to call unconditionally.
+        """
+        if not self.peak_contrast_filter_enabled or self._n_peak_contrast_seen == 0:
+            return
+        n = self._n_peak_contrast_seen
+        mean = self._peak_contrast_sum / n
+        var = max(0.0, self._peak_contrast_sumsq / n - mean * mean)
+        log.info(
+            "[Stage123-GeCo2] %s: peak_contrast_filter summary -- n=%d mean=%.3f std=%.3f "
+            "min=%.3f max=%.3f -- %d/%d hard-rejected (hard_reject=%s, min_contrast_z=%.3f). "
+            "Use mean/std/min/max here to calibrate min_contrast_z on THIS sample/checkpoint "
+            "before trusting hard_reject=true on it.",
+            sample_id, n, mean, var ** 0.5, self._peak_contrast_min, self._peak_contrast_max,
+            self._n_peak_contrast_hard_rejected, n, self.peak_contrast_hard_reject, self.peak_contrast_min_z,
+        )
 
     @torch.no_grad()
     def detect_frame(self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor]) -> list[Box]:

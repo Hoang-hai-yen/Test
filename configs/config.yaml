@@ -710,12 +710,12 @@ stage3:
       min_candidates_for_cluster: 4
       max_candidates_for_cluster: 500
       fallback_relative_ratio: 0.9
-      # NOT WIRED HERE YET -- setting this to dave_verification raises
-      # NotImplementedError. This filter always clusters against
-      # stage1.feature_extractor's own all_feats; only
-      # stage3.cluster_verification and stage123_geco2.dynamic_prototype.
-      # cluster_verification support dave_verification today.
-      embedding_source: extractor   # extractor | dave_verification (unsupported here)
+      # extractor | dave_verification -- see stage3.cluster_verification's
+      # own comment above. When set, this filter re-embeds each keyframe's
+      # threshold-survivors AND the accumulated trusted_window with DAVE's
+      # own encoder (a separate DaveVerificationExtractor instance from
+      # verification_method="cluster"'s own, even in the same run).
+      embedding_source: extractor
     # Corroboration gate on WINDOW ADMISSION (docs/GECO2_precision_
     # improvements_plan.md Phase 1 item 2) -- reuses aero_eyes.utils.
     # detection_confirm.DetectionConfirmer, the SAME consecutive-hit

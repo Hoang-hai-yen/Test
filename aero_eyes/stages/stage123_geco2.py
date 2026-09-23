@@ -951,6 +951,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     # either way, so recording effective_threshold here is informational
     # only (for inspecting detections.json), not consumed downstream.
     write_detections(detections, det_path, threshold=effective_threshold)
+    detector.log_peak_contrast_summary(sample_id)
 
     elapsed = time.time() - t0
     log.info("[Stage123-GeCo2] %s done in %.1fs -> %s (%d detection frames)",
@@ -1141,6 +1142,7 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
             )
 
     _write_candidates_with_features(candidates, cand_path)
+    detector.log_peak_contrast_summary(sample_id)
 
     elapsed = time.time() - t0
     log.info("[Stage12-GeCo2] %s done in %.1fs -> %s (%d keyframes)",

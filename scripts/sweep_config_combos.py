@@ -82,6 +82,14 @@ Usage:
 
     # include fgclip/radio/evaclip too (needs their own deps/HF access already set up)
     python -m scripts.sweep_config_combos --config configs/config.yaml --include-heavy-encoders
+
+    # rerun only ONE Stage-1 combo's pairs (e.g. after fixing a bug that broke
+    # it) instead of the whole matrix -- --stage1-id/--stage3-id filter to an
+    # exact combo id AFTER z/downscale-sweep expansion (see --dry-run for the
+    # exact ids, e.g. "baseline_z2.0" not "baseline"); repeat either flag for
+    # more than one id. Both default to "every combo" when omitted.
+    python -m scripts.sweep_config_combos --config configs/config.yaml \\
+        --stage1-id E8_siglip2
 """
 from __future__ import annotations
 
@@ -637,6 +645,14 @@ def main() -> None:
     p.add_argument("--ofat-only", action="store_true",
                     help="cheaper row-0+column-0 slice instead of the full Stage1 x Stage3 matrix "
                          "(~52 runs instead of ~680) -- see module docstring")
+    p.add_argument("--stage1-id", action="append", default=[],
+                    help="repeat to restrict to specific Stage-1 combo id(s) (post-sweep-expansion, "
+                         "e.g. E8_siglip2) instead of every combo -- e.g. to rerun just one combo "
+                         "after fixing a bug that broke it, without redoing the whole matrix. "
+                         "See --dry-run for the exact ids.")
+    p.add_argument("--stage3-id", action="append", default=[],
+                    help="repeat to restrict to specific Stage-3 combo id(s) (post-sweep-expansion, "
+                         "e.g. baseline_z2.0), same idea as --stage1-id.")
     p.add_argument("--dry-run", action="store_true", help="print the combo/pair counts and exit")
     p.add_argument("--out", default=None, help="JSON report path (default: <work_dir>/combo_sweep_report.json)")
     p.add_argument("--out-md", default=None, help="Markdown leaderboard path (default: <work_dir>/combo_sweep_leaderboard.md)")
@@ -648,7 +664,24 @@ def main() -> None:
     downscale_values = [float(d) for d in args.downscale_values.split(",")]
     stage1_combos = expand_sweeps(build_stage1_combos(args.include_heavy_encoders), z_values, downscale_values)
     stage3_combos = expand_sweeps(build_stage3_combos(), z_values, downscale_values)
+
+    if args.stage1_id:
+        wanted = set(args.stage1_id)
+        missing = wanted - {c.id for c in stage1_combos}
+        if missing:
+            p.error(f"--stage1-id: unknown id(s) {sorted(missing)} -- see --dry-run for valid ids")
+        stage1_combos = [c for c in stage1_combos if c.id in wanted]
+    if args.stage3_id:
+        wanted = set(args.stage3_id)
+        missing = wanted - {c.id for c in stage3_combos}
+        if missing:
+            p.error(f"--stage3-id: unknown id(s) {sorted(missing)} -- see --dry-run for valid ids")
+        stage3_combos = [c for c in stage3_combos if c.id in wanted]
+
     matrix = not args.ofat_only
+    if not matrix and not any(c.id == "stage1_default" for c in stage1_combos):
+        p.error("--ofat-only needs stage1_default to still be present -- either drop --stage1-id "
+                "or add --stage1-id stage1_default, or omit --ofat-only to use the full matrix instead")
     pairs = build_pairs(stage1_combos, stage3_combos, matrix)
 
     if args.dry_run:
@@ -686,8 +719,15 @@ def main() -> None:
         print(f"\n{n_errors} pair(s) failed and were skipped -- see log above / \"error\" field in the JSON report.")
 
     work_dir = Path(cfg0.project.work_dir)
-    out_path = Path(args.out) if args.out else work_dir / "combo_sweep_report.json"
-    out_md_path = Path(args.out_md) if args.out_md else work_dir / "combo_sweep_leaderboard.md"
+    # Filtered reruns (--stage1-id/--stage3-id) default to a DIFFERENT
+    # filename than the full sweep's own -- otherwise a filtered rerun
+    # (e.g. redoing just E8_siglip2 after a bug fix) would silently
+    # clobber an earlier full matrix run's report/leaderboard.
+    filtered = bool(args.stage1_id or args.stage3_id)
+    default_json = "combo_sweep_report_filtered.json" if filtered else "combo_sweep_report.json"
+    default_md = "combo_sweep_leaderboard_filtered.md" if filtered else "combo_sweep_leaderboard.md"
+    out_path = Path(args.out) if args.out else work_dir / default_json
+    out_md_path = Path(args.out_md) if args.out_md else work_dir / default_md
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({
         "mode": mode,

@@ -66,6 +66,74 @@ def test_siglip2_extract_empty_returns_correctly_shaped_array(monkeypatch):
     assert out.shape == (0, 1152)
 
 
+class _FakeModelOutputWithPooling:
+    """Stand-in for transformers.modeling_outputs.BaseModelOutputWithPooling
+    -- confirmed in practice (not just theoretical) that at least one real
+    transformers/checkpoint combination makes model.get_image_features()
+    return this instead of the documented projected embedding Tensor."""
+    def __init__(self, pooler_output):
+        self.pooler_output = pooler_output
+        self.last_hidden_state = pooler_output
+
+
+class _FakeSiglip2ModelReturningModelOutput:
+    """get_image_features() returns a BaseModelOutputWithPooling-like
+    object instead of a plain Tensor -- the real-world failure mode
+    Siglip2FeatureExtractor._get_image_features's own fallback handles."""
+    def __init__(self, dim: int):
+        self._dim = dim
+
+    def eval(self):
+        return self
+
+    def to(self, device):
+        return self
+
+    def get_image_features(self, **inputs):
+        pixel_values = inputs["pixel_values"]
+        return _FakeModelOutputWithPooling(torch.ones(pixel_values.shape[0], self._dim))
+
+
+class _FakeSiglip2ModelReturningUnusableOutput:
+    """get_image_features() returns something with neither .shape nor
+    .pooler_output -- must raise a clear, actionable TypeError instead of
+    an opaque AttributeError deep inside numpy/torch."""
+    def eval(self):
+        return self
+
+    def to(self, device):
+        return self
+
+    def get_image_features(self, **inputs):
+        return object()
+
+
+def test_siglip2_falls_back_to_pooler_output_when_get_image_features_returns_model_output(monkeypatch):
+    """Regression test for the real bug: on the affected transformers
+    version, get_image_features() returned BaseModelOutputWithPooling
+    (raising 'BaseModelOutputWithPooling has no attribute shape' at
+    feats.shape[-1]) instead of a Tensor. The fallback must transparently
+    recover the per-image embedding from .pooler_output."""
+    monkeypatch.setattr(
+        features_mod.Siglip2FeatureExtractor, "_load",
+        lambda self, variant: (_FakeSiglip2ModelReturningModelOutput(768), _FakeSiglip2Processor()),
+    )
+    ext = features_mod.Siglip2FeatureExtractor(variant="base")
+    assert ext._dim() == 768
+    out = ext.extract([np.zeros((10, 10, 3), dtype=np.uint8)])
+    assert out.shape == (1, 768)
+    assert np.isclose(np.linalg.norm(out[0]), 1.0)
+
+
+def test_siglip2_raises_clear_error_when_get_image_features_output_is_unusable(monkeypatch):
+    monkeypatch.setattr(
+        features_mod.Siglip2FeatureExtractor, "_load",
+        lambda self, variant: (_FakeSiglip2ModelReturningUnusableOutput(), _FakeSiglip2Processor()),
+    )
+    with pytest.raises(TypeError, match="get_image_features\\(\\) returned"):
+        features_mod.Siglip2FeatureExtractor(variant="base")
+
+
 # ---------------------------------------------------------------------------
 # EVA02-CLIP
 # ---------------------------------------------------------------------------

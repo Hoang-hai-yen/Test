@@ -1407,16 +1407,6 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # for the full empirical rationale.
     csf_cfg = s3.cluster_secondary_filter
     if csf_cfg.enabled and s3.verification_method == "threshold":
-        if csf_cfg.cluster_verification.embedding_source == "dave_verification":
-            raise NotImplementedError(
-                "stage3.cluster_secondary_filter.cluster_verification.embedding_source="
-                "'dave_verification' is not wired here yet -- only "
-                "stage3.cluster_verification (verification_method='cluster') and "
-                "stage123_geco2.dynamic_prototype.cluster_verification support it. This "
-                "filter always clusters against all_feats (stage1.feature_extractor's own "
-                "space). Set embedding_source back to 'extractor', or ask for this call "
-                "site to be wired up too."
-            )
         from collections import defaultdict as _defaultdict
         from collections import deque as _deque
 
@@ -1431,6 +1421,52 @@ def run_stage3(cfg, sample_id: str) -> Path:
         ref_feats_base = (
             np.stack(per_ref_features, axis=0) if use_multi_ref else prototype[None, :]
         )
+
+        # embedding_source="dave_verification": same swap as
+        # stage3.verification_method="cluster" above (see that branch's own
+        # comment) -- this filter's own separate dave_extractor/ref_feats_base
+        # (a DIFFERENT instance, since this branch only ever runs when
+        # verification_method="threshold", i.e. the cluster branch above
+        # never executes in the same run). all_sims/all_feats (threshold's own
+        # decision + the ranking used to pick each keyframe's window-admission
+        # candidate below) stay in stage1.feature_extractor's space,
+        # unchanged; only the accept/reject clustering itself is re-embedded.
+        csf_dave_extractor = None
+        if csf_cfg.cluster_verification.embedding_source == "dave_verification":
+            if csf_cfg.cluster_verification.pairwise_metric == "mahalanobis":
+                raise ValueError(
+                    "stage3.cluster_secondary_filter.cluster_verification.embedding_source="
+                    "'dave_verification' is not compatible with pairwise_metric='mahalanobis' "
+                    "-- precision_matrix is fit in stage1.feature_extractor's own embedding "
+                    "space, not DAVE's verify-stage embedding space. Use pairwise_metric="
+                    "'cosine' (or 'l1') with embedding_source='dave_verification'."
+                )
+            if video_path is None:
+                raise FileNotFoundError(
+                    "stage3.cluster_secondary_filter.cluster_verification.embedding_source="
+                    f"'dave_verification' needs the sample's own video but no video file was "
+                    f"found for {sample_id!r} matching {cfg.data.video_glob!r}."
+                )
+            import cv2
+
+            from aero_eyes.models.dave_verification import build_dave_verification_extractor
+
+            csf_dave_extractor = build_dave_verification_extractor(cfg)
+
+            refs_dir = Path(cfg.data.data_root) / sample_id / cfg.data.refs_subdir
+            exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            ref_paths = sorted(
+                p for p in (refs_dir.iterdir() if refs_dir.is_dir() else [])
+                if p.suffix.lower() in exts
+            )[: cfg.data.num_references]
+            ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
+            ref_feats_base = csf_dave_extractor.extract(ref_imgs)
+            log.info(
+                "[Stage3] %s: cluster_secondary_filter.cluster_verification."
+                "embedding_source=dave_verification -- re-encoded %d reference image(s) "
+                "with DAVE's own verify-stage embedding (dim=%d)",
+                sample_id, len(ref_imgs), ref_feats_base.shape[-1],
+            )
 
         def _keep_everyone(cand_feats_frame: np.ndarray, ref_feats_frame: np.ndarray) -> np.ndarray:
             # Too few threshold-survivors this keyframe to add meaningful
@@ -1455,17 +1491,32 @@ def run_stage3(cfg, sample_id: str) -> Path:
         n_window_admitted = 0
         for fi in sorted(idx_by_frame):
             idxs = idx_by_frame[fi]
+            if csf_dave_extractor is not None:
+                # Re-embed THIS keyframe's own threshold-survivors with
+                # DAVE's verify-stage encoder -- same one-forward-pass-per-
+                # frame approach as verification_method="cluster" above (see
+                # DaveVerificationExtractor.extract_crops's own docstring).
+                frame_bgr = read_frame(video_path, fi)
+                cand_feats_frame = csf_dave_extractor.extract_crops(
+                    frame_bgr, [all_dets[i].box for i in idxs],
+                    pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+                    batch_size=cfg.runtime.batch_size,
+                )
+            else:
+                cand_feats_frame = all_feats[idxs]
             ref_feats_for_frame = (
                 np.concatenate([ref_feats_base, np.stack(trusted_window, axis=0)], axis=0)
                 if trusted_window else ref_feats_base
             )
             frame_keep, _ = cluster_verify_candidates(
-                all_feats[idxs], ref_feats_for_frame, csf_cfg.cluster_verification,
+                cand_feats_frame, ref_feats_for_frame, csf_cfg.cluster_verification,
                 fallback_keep_mask_fn=_keep_everyone, precision_matrix=precision_matrix,
             )
+            verified_local_idxs = []
             verified_global_idxs = []
             for local_i, global_i in enumerate(idxs):
                 if frame_keep[local_i]:
+                    verified_local_idxs.append(local_i)
                     verified_global_idxs.append(global_i)
                 else:
                     keep_mask[global_i] = False
@@ -1479,10 +1530,22 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 # accumulate_new_anchors=False -- trusted_window then stays
                 # permanently empty, so every keyframe clusters against
                 # ONLY the 3 original exemplars for the whole video.
+                # Ranking is ALWAYS by all_sims (stage1.feature_extractor's
+                # own score) regardless of embedding_source -- clustering
+                # only ever decides accept/reject here, never ranking (same
+                # split as verification_method="cluster" + NMS/topk_per_
+                # keyframe downstream).
                 best_i = max(verified_global_idxs, key=lambda i: all_sims[i])
                 confirmed_box = window_confirmer.offer(all_dets[best_i].box)
                 if confirmed_box is not None:
-                    trusted_window.append(all_feats[best_i])
+                    # The window must stay in the SAME embedding space this
+                    # keyframe clustered against -- cand_feats_frame[local_i]
+                    # (not all_feats[best_i]) when using DAVE, since a
+                    # window mixing DINOv2-space and DAVE-space vectors
+                    # would silently corrupt every later keyframe's affinity
+                    # matrix.
+                    best_local_i = verified_local_idxs[verified_global_idxs.index(best_i)]
+                    trusted_window.append(cand_feats_frame[best_local_i])
                     n_window_admitted += 1
             # No verified candidate this keyframe: the confirmer is simply
             # not offered anything (same "gap keyframes don't reset the
