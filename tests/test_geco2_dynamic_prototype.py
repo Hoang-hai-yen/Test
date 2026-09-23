@@ -34,7 +34,7 @@ def _make_cfg(
     cv_defaults = dict(
         enabled=False, cluster_method="hdbscan", pairwise_metric="cosine", min_cluster_size=2, min_samples=None,
         spectral_egv_threshold=0.132, max_candidates_for_cluster=500,
-        min_candidates_for_cluster=4, fallback_relative_ratio=0.9,
+        min_candidates_for_cluster=4, fallback_relative_ratio=0.9, embedding_source="extractor",
     )
     cv_defaults.update(cluster_verification_overrides or {})
     mv_defaults = dict(enabled=False, tau_margin=0.05)

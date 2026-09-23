@@ -380,6 +380,65 @@ class FeatureExtractorConfig(BaseModel):
     # independently verified without a live download. NOT YET VALIDATED.
     weights: Optional[str] = None
     image_size: int = 224
+    # "stretch" (default, unchanged behavior): resize directly to
+    # image_size x image_size, distorting non-square crops' aspect ratio.
+    # This is what BOTH DINOv2's torch.hub path (_preprocess_dino) AND
+    # DINOv3's default HuggingFace AutoImageProcessor actually do --
+    # VERIFIED directly against facebook/dinov2-base's own preprocessor_
+    # config.json (shortest_edge/crop_size) vs. facebook/dinov3-vitb16-
+    # pretrain-lvd1689m's own preprocessor_config.json (confirmed via an
+    # authenticated fetch: "default_to_square": true, "do_center_crop":
+    # null, "size": {"height":224,"width":224} -- i.e. DINOv3's own
+    # published HF processor ALSO stretches, not crops).
+    # "resize_then_crop": DINOv2's OWN documented eval protocol (repo
+    # dinov2/data/transforms.py::make_classification_eval_transform,
+    # Resize(256)+CenterCrop(224)) AND the DINOv3 PAPER's own instance-
+    # retrieval evaluation protocol (Appendix D.7/D.8, arXiv:2508.10104 --
+    # resize preserving aspect ratio to a side length, then center-crop) --
+    # NEITHER of which the "stretch" default above actually replicates,
+    # despite that being how the paper's own reported SOTA retrieval
+    # numbers were produced. Resizes the SHORTER side to
+    # round(image_size * 256/224) (the exact DINOv2 ratio), then center-
+    # crops to image_size x image_size. Applies to DINOv2 (both hub/HF
+    # backends), DINOv3 source=kaggle, and DINOv3 source=huggingface (via
+    # per-call size/do_center_crop/crop_size overrides passed to
+    # self.processor(), not a config.json edit).
+    # "pad_to_square": resize preserving aspect ratio so the LARGER side
+    # fits image_size, then PAD the shorter side (centered, filled with
+    # the image's own mean color) -- unlike resize_then_crop, this never
+    # discards any object content, only adds neutral padding. Matches what
+    # the Oxford/Paris arm of the DINOv3 paper's own protocol (Appendix
+    # D.8: "resize such that the larger side is 224... then take a full
+    # center crop, yielding 224x224") almost certainly ACTUALLY means --
+    # if the larger side is already exactly 224, the shorter side is <=224
+    # and a literal center CROP to 224x224 is mathematically impossible
+    # without losing pixels, so "full center crop" there most likely means
+    # centering within a padded 224x224 canvas, not cropping content away
+    # (contrast with AmsterTime's own protocol in the same appendix,
+    # "shorter side=256, then center crop to 224", which IS a genuine
+    # content-discarding crop -- resize_then_crop above follows that one).
+    # Relevant because this project's own reference-vs-Oxford/Paris-query
+    # discussion (research notes) found candidate crops (crop_with_pad
+    # around a detector's box) can have far more extreme, variable aspect
+    # ratios than a deliberately-framed close-up reference photo -- a
+    # genuine content-discarding center-crop risks cutting off real object
+    # edges for an elongated crop, which pad_to_square avoids entirely at
+    # the cost of some wasted (padded) canvas area instead.
+    # NOT YET VALIDATED on real footage -- A/B against "stretch" and
+    # "resize_then_crop" before trusting it changes anything.
+    preprocess_mode: Literal["stretch", "resize_then_crop", "pad_to_square"] = "stretch"
+    # Reference photos (stage1.py, deliberately close-up/object-framed) and
+    # candidate crops (crop_with_pad around a detector's proposed box, far
+    # more variable/extreme aspect ratios -- see preprocess_mode's own
+    # docstring above) are different enough in composition that the SAME
+    # preprocess_mode may not be the right choice for both. None (default)
+    # = inherit preprocess_mode above for candidate crops too (today's
+    # single-knob behavior, unchanged). Set independently (e.g. "stretch"
+    # for candidates + "resize_then_crop" for references) to A/B the two
+    # separately. Only extract_crops() (candidate path) is affected --
+    # extract() (reference path, called directly by stage1.py) always uses
+    # preprocess_mode above.
+    candidate_preprocess_mode: Optional[Literal["stretch", "resize_then_crop", "pad_to_square"]] = None
     projection_head: ProjectionHeadConfig = ProjectionHeadConfig()
     # Opt-in preprocessing for CANDIDATE crops (video detections), NOT the
     # reference photos (stage1.segmentation already masks those separately)

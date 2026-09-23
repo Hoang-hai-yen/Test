@@ -212,6 +212,33 @@ stage1:
     # download.
     weights: null            # null = load from torch.hub / hf
     image_size: 224
+    # --------------------------------------------------------------------
+    # How a raw crop/photo is resized to image_size x image_size before
+    # the backbone forward pass. VERIFIED (direct paper/repo/HF-config
+    # reads) that the DEFAULT below does NOT match either DINOv2's own
+    # documented eval protocol or the DINOv3 paper's own retrieval eval
+    # protocol -- see FeatureExtractorConfig.preprocess_mode's own
+    # docstring (aero_eyes/config.py) for the full citation trail.
+    #   stretch        (default, unchanged): resize straight to a square,
+    #                  distorting non-square crops' aspect ratio.
+    #   resize_then_crop: resize preserving aspect ratio then CENTER-CROP
+    #                  (DINOv2 repo/HF convention, AmsterTime's own D.8
+    #                  protocol) -- can cut off real content for a crop
+    #                  with an extreme/variable aspect ratio.
+    #   pad_to_square: resize preserving aspect ratio then PAD (mean-color
+    #                  fill) -- never discards content, likely closer to
+    #                  what the Oxford/Paris arm of D.8 actually means.
+    # NOT YET VALIDATED on real footage -- A/B before trusting any of this.
+    # --------------------------------------------------------------------
+    preprocess_mode: stretch
+    # Reference photos (stage1.py, deliberately close-up/object-framed)
+    # and candidate crops (crop_with_pad around a detector's proposed box,
+    # far more variable/extreme aspect ratios) may warrant DIFFERENT
+    # modes -- null (default) = candidate crops inherit preprocess_mode
+    # above too (today's single-knob behavior). Only affects
+    # extract_crops() (candidate path); extract() (reference path, called
+    # directly by stage1.py) always uses preprocess_mode above.
+    candidate_preprocess_mode: null   # stretch | resize_then_crop | pad_to_square | null (inherit)
     # Optional small trained head on top of the frozen backbone above (see
     # scripts/train_projection_head.py) -- closes the domain gap between
     # close-up reference photos and tiny aerial crops WITHOUT fine-tuning

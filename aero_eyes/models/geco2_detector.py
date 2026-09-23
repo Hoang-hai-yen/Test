@@ -129,7 +129,13 @@ def _peak_contrast_scores(
         x0, x1 = max(0, x - r), min(w, x + r + 1)
         patch = grid[y0:y1, x0:x1].to(torch.float64)
         peak = grid[y, x].to(torch.float64)
-        out[i] = (peak - patch.mean()) / (patch.std() + 1e-6)
+        # unbiased=False (population std, divide by N) -- torch's .std()
+        # default (unbiased=True, divide by N-1) disagreed with numpy's own
+        # default (ddof=0) used in this module's own tests'
+        # independent-reference reimplementation of this exact formula,
+        # caught by a real pytest run: small but real numeric mismatch,
+        # more visible on small patches (low N makes N vs N-1 matter more).
+        out[i] = (peak - patch.mean()) / (patch.std(unbiased=False) + 1e-6)
     return out
 
 

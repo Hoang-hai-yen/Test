@@ -19,7 +19,7 @@ class _FakeExtractor:
         self.init_args = args
         self.init_kwargs = kwargs
 
-    def extract(self, images, batch_size: int = 16) -> np.ndarray:
+    def extract(self, images, batch_size: int = 16, preprocess_mode=None) -> np.ndarray:
         return np.ones((len(images), self._d), dtype=np.float32)
 
     def _dim(self) -> int:

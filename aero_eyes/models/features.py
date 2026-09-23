@@ -73,9 +73,67 @@ _DINO_STD  = (0.229, 0.224, 0.225)
 # Preprocessing helpers
 # ---------------------------------------------------------------------------
 
-def _preprocess_dino(img_bgr: np.ndarray, image_size: int = 224) -> torch.Tensor:
+def _resize_shorter_side_then_center_crop(img_pil: "Image.Image", size: int) -> "Image.Image":
+    """stage1.feature_extractor.preprocess_mode="resize_then_crop"'s core
+    transform -- DINOv2's OWN documented eval protocol (repo dinov2/data/
+    transforms.py::make_classification_eval_transform: torchvision
+    Resize(256)+CenterCrop(224), i.e. resize_size/crop_size = 256/224)
+    and the DINOv3 PAPER's own instance-retrieval evaluation protocol
+    (Appendix D.7/D.8, arXiv:2508.10104) -- resize the SHORTER side to a
+    value preserving aspect ratio, then take the CENTRAL size x size crop.
+    Never pads: if the shorter side is already below `size`, the resize
+    still scales UP (BICUBIC), so the crop always has enough pixels.
+    """
+    resize_size = round(size * 256 / 224)
+    w, h = img_pil.size
+    if w <= h:
+        new_w = resize_size
+        new_h = max(resize_size, round(h * resize_size / w))
+    else:
+        new_h = resize_size
+        new_w = max(resize_size, round(w * resize_size / h))
+    resized = img_pil.resize((new_w, new_h), Image.BICUBIC)
+    left = (new_w - size) // 2
+    top = (new_h - size) // 2
+    return resized.crop((left, top, left + size, top + size))
+
+
+def _resize_and_pad_to_square(img_pil: "Image.Image", size: int) -> "Image.Image":
+    """stage1.feature_extractor.preprocess_mode="pad_to_square"'s core
+    transform: resize preserving aspect ratio so the LARGER side fits
+    `size`, then PAD the shorter side (centered, filled with the image's
+    own mean color) to reach size x size -- unlike
+    _resize_shorter_side_then_center_crop, this never discards any object
+    content, only adds neutral padding around it. Safer than a genuine
+    center-crop for a crop with an extreme/variable aspect ratio (e.g. a
+    detector's box around an elongated object), where a real crop risks
+    cutting off real object edges -- see this field's own config docstring
+    (aero_eyes/config.py) for the full rationale, including why this is
+    likely what the DINOv3 paper's own Oxford/Paris protocol actually
+    means despite being WORDED as "center crop" there.
+    """
+    w, h = img_pil.size
+    scale = size / max(w, h)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = img_pil.resize((new_w, new_h), Image.BICUBIC)
+    arr = np.array(resized)
+    mean_color = tuple(int(c) for c in arr.reshape(-1, arr.shape[-1]).mean(axis=0))
+    canvas = Image.new("RGB", (size, size), mean_color)
+    left = (size - new_w) // 2
+    top = (size - new_h) // 2
+    canvas.paste(resized, (left, top))
+    return canvas
+
+
+def _preprocess_dino(img_bgr: np.ndarray, image_size: int = 224, mode: str = "stretch") -> torch.Tensor:
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_pil = Image.fromarray(img_rgb).resize((image_size, image_size), Image.BICUBIC)
+    img_pil = Image.fromarray(img_rgb)
+    if mode == "resize_then_crop":
+        img_pil = _resize_shorter_side_then_center_crop(img_pil, image_size)
+    elif mode == "pad_to_square":
+        img_pil = _resize_and_pad_to_square(img_pil, image_size)
+    else:
+        img_pil = img_pil.resize((image_size, image_size), Image.BICUBIC)
     mean = np.array(_DINO_MEAN, dtype=np.float32)
     std  = np.array(_DINO_STD,  dtype=np.float32)
     arr  = np.array(img_pil, dtype=np.float32) / 255.0
@@ -349,7 +407,8 @@ class DINOv2FeatureExtractor:
 
     def __init__(
         self, variant: str = "vitb14", device: str = "auto", image_size: int = 224,
-        use_registers: bool = False, pooling: str = "cls",
+        use_registers: bool = False, pooling: str = "cls", preprocess_mode: str = "stretch",
+        candidate_preprocess_mode: str | None = None,
     ):
         if pooling not in ("cls", "multiscale_attn"):
             raise ValueError(f"Unknown DINOv2 pooling '{pooling}'. Must be 'cls' or 'multiscale_attn'.")
@@ -357,6 +416,13 @@ class DINOv2FeatureExtractor:
         self.image_size    = image_size
         self.use_registers = use_registers
         self.pooling       = pooling
+        self.preprocess_mode = preprocess_mode
+        # None (default) = inherit preprocess_mode for candidate crops too
+        # (today's single-knob behavior) -- see FeatureExtractorConfig.
+        # candidate_preprocess_mode's own docstring.
+        self.candidate_preprocess_mode = (
+            candidate_preprocess_mode if candidate_preprocess_mode is not None else preprocess_mode
+        )
         self.device        = _resolve_device(device)
         self.processor: Any = None
         self._scale_layers: list[int] = []
@@ -402,12 +468,15 @@ class DINOv2FeatureExtractor:
         return model, processor
 
     @torch.no_grad()
-    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+    def extract(
+        self, images: list[np.ndarray], batch_size: int = 16, preprocess_mode: str | None = None,
+    ) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
         if self.pooling == "multiscale_attn":
             return self._extract_multiscale_attn(images, batch_size)
-        tensors = [_preprocess_dino(im, self.image_size) for im in images]
+        mode = preprocess_mode if preprocess_mode is not None else self.preprocess_mode
+        tensors = [_preprocess_dino(im, self.image_size, mode) for im in images]
         out: list[np.ndarray] = []
         for i in range(0, len(tensors), batch_size):
             batch = torch.stack(tensors[i:i+batch_size]).to(self.device).float()
@@ -438,7 +507,10 @@ class DINOv2FeatureExtractor:
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+        return self.extract(
+            [crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size,
+            preprocess_mode=self.candidate_preprocess_mode,
+        )
 
     _DIMS = {"vits14": 384, "vitb14": 768, "vitl14": 1024, "vitg14": 1536}
 
@@ -508,7 +580,8 @@ class DINOv3FeatureExtractor:
         self, variant: str = "vitb16", device: str = "auto",
         source: str = "huggingface", pretrain_dataset: str = "lvd1689m",
         kaggle_model_id: str | None = None, image_size: int = 224,
-        pooling: str = "cls",
+        pooling: str = "cls", preprocess_mode: str = "stretch",
+        candidate_preprocess_mode: str | None = None,
     ):
         if variant not in self._ARCHS:
             raise ValueError(f"Unknown DINOv3 variant '{variant}'. Must be one of {self._ARCHS}.")
@@ -531,6 +604,10 @@ class DINOv3FeatureExtractor:
         self.source           = source
         self.image_size       = image_size
         self.pooling          = pooling
+        self.preprocess_mode  = preprocess_mode
+        self.candidate_preprocess_mode = (
+            candidate_preprocess_mode if candidate_preprocess_mode is not None else preprocess_mode
+        )
         self.device           = _resolve_device(device)
         self.processor        = None
         self._scale_layers: list[int] = []
@@ -588,30 +665,72 @@ class DINOv3FeatureExtractor:
         )
 
     @torch.no_grad()
-    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+    def extract(
+        self, images: list[np.ndarray], batch_size: int = 16, preprocess_mode: str | None = None,
+    ) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
         if self.pooling == "multiscale_attn":
             return self._extract_multiscale_attn(images, batch_size)
-        if self.source == "kaggle":
-            # Raw torch.hub model, plain tensor in/CLS tensor out -- same
-            # calling convention as DINOv2FeatureExtractor's own hub path.
-            tensors = [_preprocess_dino(im, self.image_size) for im in images]
+        mode = preprocess_mode if preprocess_mode is not None else self.preprocess_mode
+        if self.source == "kaggle" or mode == "pad_to_square":
+            # Raw torch.hub model (kaggle source), OR pad_to_square on the
+            # huggingface source: the HF AutoImageProcessor's resize()/
+            # center_crop() calls have no built-in "resize + pad" combo
+            # (see TorchvisionBackend.pad()/resize() -- DINOv3ViTImageProcessor's
+            # own _preprocess() never calls pad()), so pad_to_square always
+            # bypasses self.processor() and builds normalized pixel_values
+            # manually via _preprocess_dino, same convention as the kaggle
+            # path already uses -- confirmed compatible with the HF model's
+            # own expected normalization (mean/std/rescale_factor all match
+            # _DINO_MEAN/_DINO_STD, verified against facebook/dinov3-vitb16-
+            # pretrain-lvd1689m's own preprocessor_config.json).
+            tensors = [_preprocess_dino(im, self.image_size, mode) for im in images]
             out: list[np.ndarray] = []
             for i in range(0, len(tensors), batch_size):
                 batch = torch.stack(tensors[i:i+batch_size]).to(self.device).float()
-                feats = self.model(batch)
+                if self.source == "kaggle":
+                    feats = self.model(batch)
+                else:
+                    feats = self.model(pixel_values=batch).pooler_output
                 out.append(F.normalize(feats, dim=-1).cpu().numpy())
             return np.concatenate(out, axis=0).astype(np.float32)
         pil_imgs = [_bgr_to_pil(im) for im in images]
         out: list[np.ndarray] = []
         for i in range(0, len(pil_imgs), batch_size):
             batch_pil = pil_imgs[i:i+batch_size]
-            inputs = self.processor(images=batch_pil, return_tensors="pt")
+            inputs = self.processor(images=batch_pil, return_tensors="pt", **self._processor_kwargs(mode))
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             pooled = self.model(**inputs).pooler_output
             out.append(F.normalize(pooled, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
+
+    def _processor_kwargs(self, mode: str) -> dict:
+        """preprocess_mode="resize_then_crop" override for the HuggingFace
+        AutoImageProcessor path (source="huggingface", stretch/
+        resize_then_crop only -- pad_to_square bypasses self.processor()
+        entirely, see extract() above) -- VERIFIED (authenticated fetch of
+        facebook/dinov3-vitb16-pretrain-lvd1689m's own preprocessor_
+        config.json) that the DEFAULT config is "default_to_square": true,
+        "do_center_crop": null, "size": {"height": image_size, "width":
+        image_size} -- i.e. a direct stretch-to-square, NOT the resize-
+        then-crop protocol the DINOv3 paper's own retrieval evaluation
+        (Appendix D.7/D.8) actually used to produce its reported SOTA
+        numbers. transformers' image processors accept size/do_center_crop/
+        crop_size as PER-CALL overrides (layered on top of the loaded
+        config, see TorchvisionBackend.resize()'s `size.shortest_edge`
+        branch) -- no need to edit/bypass the processor itself for this
+        mode. {} (mode="stretch") preserves today's exact behavior,
+        unchanged.
+        """
+        if mode != "resize_then_crop":
+            return {}
+        resize_size = round(self.image_size * 256 / 224)
+        return {
+            "size": {"shortest_edge": resize_size},
+            "do_center_crop": True,
+            "crop_size": {"height": self.image_size, "width": self.image_size},
+        }
 
     @torch.no_grad()
     def _extract_multiscale_attn(self, images: list[np.ndarray], batch_size: int) -> np.ndarray:
@@ -633,7 +752,10 @@ class DINOv3FeatureExtractor:
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+        return self.extract(
+            [crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size,
+            preprocess_mode=self.candidate_preprocess_mode,
+        )
 
     def _dim(self) -> int:
         base = self._DIMS.get(self.variant, 768)
@@ -798,26 +920,32 @@ class EnsembleFeatureExtractor:
         dinov3_kaggle_model_id: str | None = None,
         dinov2_pooling: str = "cls",
         dinov3_pooling: str = "cls",
+        preprocess_mode: str = "stretch",
+        candidate_preprocess_mode: str | None = None,
     ):
         if dino_model == "dinov3":
             self.dino = DINOv3FeatureExtractor(
                 variant=dinov3_variant, device=device, source=dinov3_source,
                 pretrain_dataset=dinov3_pretrain_dataset, kaggle_model_id=dinov3_kaggle_model_id,
-                image_size=image_size, pooling=dinov3_pooling,
+                image_size=image_size, pooling=dinov3_pooling, preprocess_mode=preprocess_mode,
+                candidate_preprocess_mode=candidate_preprocess_mode,
             )
         elif dino_model == "dinov2":
             self.dino = DINOv2FeatureExtractor(
                 dinov2_variant, device, image_size, dinov2_use_registers, pooling=dinov2_pooling,
+                preprocess_mode=preprocess_mode, candidate_preprocess_mode=candidate_preprocess_mode,
             )
         else:
             raise ValueError(f"Unknown ensemble dino_model '{dino_model}'. Must be 'dinov2' or 'dinov3'.")
         self.clip = CLIPFeatureExtractor(clip_variant, device)
         log.info("Ensemble %s+CLIP  dim=%d", dino_model.upper(), self._dim())
 
-    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+    def extract(
+        self, images: list[np.ndarray], batch_size: int = 16, preprocess_mode: str | None = None,
+    ) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        d = self.dino.extract(images, batch_size)  # [N, D1]
+        d = self.dino.extract(images, batch_size, preprocess_mode=preprocess_mode)  # [N, D1]
         c = self.clip.extract(images, batch_size)  # [N, D2]
         combined = np.concatenate([d, c], axis=-1)  # [N, D1+D2]
         norms = np.linalg.norm(combined, axis=-1, keepdims=True).clip(min=1e-8)
@@ -828,7 +956,7 @@ class EnsembleFeatureExtractor:
         if not boxes:
             return np.zeros((0, self._dim()), dtype=np.float32)
         crops = [crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes]
-        return self.extract(crops, batch_size)
+        return self.extract(crops, batch_size, preprocess_mode=self.dino.candidate_preprocess_mode)
 
     def _dim(self) -> int:
         return self.dino._dim() + self.clip._dim()
@@ -1509,6 +1637,8 @@ def build_feature_extractor(cfg):
             image_size    = fe.image_size,
             use_registers = fe.dinov2_use_registers,
             pooling       = fe.dinov2_pooling,
+            preprocess_mode = fe.preprocess_mode,
+            candidate_preprocess_mode = fe.candidate_preprocess_mode,
         )
     elif fe.model == "dinov3":
         base = DINOv3FeatureExtractor(
@@ -1519,6 +1649,8 @@ def build_feature_extractor(cfg):
             kaggle_model_id  = fe.dinov3_kaggle_model_id,
             image_size       = fe.image_size,
             pooling          = fe.dinov3_pooling,
+            preprocess_mode  = fe.preprocess_mode,
+            candidate_preprocess_mode = fe.candidate_preprocess_mode,
         )
     elif fe.model == "clip":
         base = CLIPFeatureExtractor(
@@ -1544,6 +1676,8 @@ def build_feature_extractor(cfg):
             dinov3_kaggle_model_id  = fe.dinov3_kaggle_model_id,
             dinov2_pooling          = fe.dinov2_pooling,
             dinov3_pooling          = fe.dinov3_pooling,
+            preprocess_mode         = fe.preprocess_mode,
+            candidate_preprocess_mode = fe.candidate_preprocess_mode,
         )
     elif fe.model == "fgclip":
         base = FGCLIPFeatureExtractor(
