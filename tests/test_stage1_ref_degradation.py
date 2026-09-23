@@ -80,3 +80,83 @@ def test_jpeg_quality_at_or_above_100_skips_compression_entirely():
     img = _checkerboard()
     out = apply_ref_degradation(img, downscale_factor=1.0, blur_ksize=0, jpeg_quality=500)
     assert np.array_equal(out, img)
+
+
+# ---------------------------------------------------------------------------
+# build_ref_views: replace-not-append semantics
+# ---------------------------------------------------------------------------
+
+from aero_eyes.stages.stage1 import build_ref_views
+
+
+def _mask_for(img):
+    return np.ones(img.shape[:2], dtype=bool)
+
+
+def test_no_levels_is_the_unchanged_clean_pyramid():
+    img = _checkerboard(size=80)
+    views = build_ref_views(img, _mask_for(img), levels=None)
+    assert len(views) == 3
+    assert np.array_equal(views[0], img)                 # 1.0x is the clean image
+    assert views[1].shape[:2] == (60, 60)                # 0.75x
+    assert views[2].shape[:2] == (40, 40)                # 0.5x
+
+
+def test_levels_replace_clean_pyramid_instead_of_appending():
+    """The core fix: with levels active there are n_levels x 3 views and
+    NONE of them is the clean image -- the old append behavior would have
+    left the clean 1.0x view (and 0.75x/0.5x) in the average."""
+    img = _checkerboard(size=80)
+    levels = [(0.2, 0, 100), (0.1, 0, 100)]
+    views = build_ref_views(img, _mask_for(img), levels=levels)
+    assert len(views) == len(levels) * 3
+    assert not any(np.array_equal(v, img) for v in views)
+    # No pyramid scale of the CLEAN image sneaks in either.
+    clean_half = build_ref_views(img, _mask_for(img), levels=None)[2]
+    assert not any(v.shape == clean_half.shape and np.array_equal(v, clean_half) for v in views)
+
+
+def test_each_levels_first_view_is_that_levels_degraded_base():
+    img = _checkerboard(size=80)
+    levels = [(0.2, 0, 100), (0.1, 3, 50)]
+    views = build_ref_views(img, _mask_for(img), levels=levels)
+    for k, lv in enumerate(levels):
+        expected = apply_ref_degradation(img, *lv)
+        assert np.array_equal(views[k * 3], expected)
+
+
+def test_pyramid_is_built_from_the_degraded_base_not_the_clean_image():
+    img = _checkerboard(size=80)
+    lv = (0.1, 0, 100)
+    views = build_ref_views(img, _mask_for(img), levels=[lv])
+    degraded = apply_ref_degradation(img, *lv)
+    half_of_degraded = cv2.resize(degraded, (40, 40))
+    assert np.array_equal(views[2], half_of_degraded)
+
+
+def test_identity_level_lets_a_clean_view_in_deliberately():
+    img = _checkerboard(size=80)
+    views = build_ref_views(img, _mask_for(img), levels=[(1.0, 0, 100), (0.1, 0, 100)])
+    assert len(views) == 6
+    assert np.array_equal(views[0], img)
+
+
+def test_synth_views_fn_runs_once_per_base_on_the_degraded_image():
+    img = _checkerboard(size=80)
+    calls = []
+
+    def fake_synth(base, mask):
+        calls.append(base)
+        return [base.copy()]
+
+    levels = [(0.2, 0, 100), (0.1, 0, 100)]
+    views = build_ref_views(img, _mask_for(img), levels=levels, synth_views_fn=fake_synth)
+    assert len(calls) == 2
+    assert len(views) == 2 * (3 + 1)
+    assert not any(np.array_equal(c, img) for c in calls)   # never the clean image
+
+
+def test_empty_levels_list_falls_back_to_clean():
+    img = _checkerboard(size=80)
+    views = build_ref_views(img, _mask_for(img), levels=[])
+    assert len(views) == 3 and np.array_equal(views[0], img)

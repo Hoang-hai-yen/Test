@@ -582,6 +582,7 @@ class DINOv3FeatureExtractor:
         kaggle_model_id: str | None = None, image_size: int = 224,
         pooling: str = "cls", preprocess_mode: str = "stretch",
         candidate_preprocess_mode: str | None = None,
+        lora_weights_path: str | None = None,
     ):
         if variant not in self._ARCHS:
             raise ValueError(f"Unknown DINOv3 variant '{variant}'. Must be one of {self._ARCHS}.")
@@ -618,6 +619,16 @@ class DINOv3FeatureExtractor:
         else:
             self.model = self._load_kaggle(variant, kaggle_model_id)
         self.model.eval().to(self.device)
+        if lora_weights_path:
+            if source != "huggingface":
+                raise ValueError(
+                    "dinov3_lora_weights_path needs dinov3_source='huggingface' -- the LoRA layers "
+                    "target transformers' DINOv3ViT module names (layer.<i>.attention.q_proj...), "
+                    "which the raw kaggle/torch.hub model does not have."
+                )
+            from aero_eyes.models.lora import load_lora
+            meta = load_lora(self.model, lora_weights_path)
+            log.info("DINOv3: loaded LoRA weights %s (%s)", lora_weights_path, meta)
         if pooling == "multiscale_attn":
             self._scale_layers = _select_multiscale_layers(self.model.config.num_hidden_layers)
         log.info(
@@ -673,37 +684,35 @@ class DINOv3FeatureExtractor:
         if self.pooling == "multiscale_attn":
             return self._extract_multiscale_attn(images, batch_size)
         mode = preprocess_mode if preprocess_mode is not None else self.preprocess_mode
-        if self.source == "kaggle" or mode == "pad_to_square":
-            # Raw torch.hub model (kaggle source), OR pad_to_square on the
-            # huggingface source: the HF AutoImageProcessor's resize()/
-            # center_crop() calls have no built-in "resize + pad" combo
-            # (see TorchvisionBackend.pad()/resize() -- DINOv3ViTImageProcessor's
-            # own _preprocess() never calls pad()), so pad_to_square always
-            # bypasses self.processor() and builds normalized pixel_values
-            # manually via _preprocess_dino, same convention as the kaggle
-            # path already uses -- confirmed compatible with the HF model's
-            # own expected normalization (mean/std/rescale_factor all match
-            # _DINO_MEAN/_DINO_STD, verified against facebook/dinov3-vitb16-
-            # pretrain-lvd1689m's own preprocessor_config.json).
-            tensors = [_preprocess_dino(im, self.image_size, mode) for im in images]
-            out: list[np.ndarray] = []
-            for i in range(0, len(tensors), batch_size):
-                batch = torch.stack(tensors[i:i+batch_size]).to(self.device).float()
-                if self.source == "kaggle":
-                    feats = self.model(batch)
-                else:
-                    feats = self.model(pixel_values=batch).pooler_output
-                out.append(F.normalize(feats, dim=-1).cpu().numpy())
-            return np.concatenate(out, axis=0).astype(np.float32)
-        pil_imgs = [_bgr_to_pil(im) for im in images]
         out: list[np.ndarray] = []
-        for i in range(0, len(pil_imgs), batch_size):
-            batch_pil = pil_imgs[i:i+batch_size]
-            inputs = self.processor(images=batch_pil, return_tensors="pt", **self._processor_kwargs(mode))
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            pooled = self.model(**inputs).pooler_output
-            out.append(F.normalize(pooled, dim=-1).cpu().numpy())
+        for i in range(0, len(images), batch_size):
+            pv = self.pixel_values(images[i:i+batch_size], mode).to(self.device)
+            out.append(F.normalize(self.forward_cls(pv), dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
+
+    def pixel_values(self, images: list[np.ndarray], mode: str | None = None) -> torch.Tensor:
+        """Preprocess BGR images into the model's input tensor [N,3,H,W] --
+        the exact same preprocessing extract() uses (kaggle source and
+        pad_to_square go through _preprocess_dino; huggingface stretch/
+        resize_then_crop go through the AutoImageProcessor with per-call
+        overrides), factored out so fine-tuning code
+        (scripts/train_lora_dinov3.py) cannot drift from inference."""
+        mode = mode if mode is not None else self.preprocess_mode
+        if self.source == "kaggle" or mode == "pad_to_square":
+            # pad_to_square bypasses the HF processor (it has no resize+pad
+            # combo -- see _processor_kwargs); mean/std/rescale match
+            # facebook/dinov3-vitb16-pretrain-lvd1689m's preprocessor_config.
+            return torch.stack([_preprocess_dino(im, self.image_size, mode) for im in images]).float()
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        inputs = self.processor(images=pil_imgs, return_tensors="pt", **self._processor_kwargs(mode))
+        return inputs["pixel_values"].float()
+
+    def forward_cls(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Global embedding (unnormalized) for a preprocessed batch. Not
+        decorated with no_grad, so it is differentiable for fine-tuning."""
+        if self.source == "kaggle":
+            return self.model(pixel_values)
+        return self.model(pixel_values=pixel_values).pooler_output
 
     def _processor_kwargs(self, mode: str) -> dict:
         """preprocess_mode="resize_then_crop" override for the HuggingFace
@@ -1651,6 +1660,7 @@ def build_feature_extractor(cfg):
             pooling          = fe.dinov3_pooling,
             preprocess_mode  = fe.preprocess_mode,
             candidate_preprocess_mode = fe.candidate_preprocess_mode,
+            lora_weights_path = fe.dinov3_lora_weights_path,
         )
     elif fe.model == "clip":
         base = CLIPFeatureExtractor(

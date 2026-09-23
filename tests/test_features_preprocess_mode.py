@@ -12,6 +12,8 @@ NOT resize-then-crop, despite that being the DINOv3 PAPER's own protocol).
 """
 from __future__ import annotations
 
+import types
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -307,3 +309,56 @@ def test_ensemble_forwards_preprocess_mode_to_dinov2(monkeypatch):
 
     features_mod.EnsembleFeatureExtractor(dino_model="dinov2", preprocess_mode="resize_then_crop")
     assert captured_kwargs.get("preprocess_mode") == "resize_then_crop"
+
+
+# ---------------------------------------------------------------------------
+# DINOv3 pixel_values / forward_cls (shared by extract() and LoRA training)
+# ---------------------------------------------------------------------------
+
+class _FakeProcessor:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, images, return_tensors, **kwargs):
+        import torch
+        self.calls.append(kwargs)
+        return {"pixel_values": torch.zeros(len(images), 3, 224, 224)}
+
+
+def _hf_extractor(mode: str):
+    ext = object.__new__(DINOv3FeatureExtractor)
+    ext.source, ext.preprocess_mode, ext.image_size = "huggingface", mode, 224
+    ext.processor = _FakeProcessor()
+    return ext
+
+
+def test_pixel_values_uses_processor_with_overrides_for_resize_then_crop():
+    ext = _hf_extractor("stretch")
+    pv = ext.pixel_values([np.zeros((30, 60, 3), np.uint8)], mode="resize_then_crop")
+    assert pv.shape == (1, 3, 224, 224)
+    assert ext.processor.calls[0]["do_center_crop"] is True
+
+
+def test_pixel_values_bypasses_processor_for_pad_to_square():
+    ext = _hf_extractor("pad_to_square")
+    pv = ext.pixel_values([np.zeros((30, 60, 3), np.uint8)])
+    assert pv.shape == (1, 3, 224, 224)
+    assert ext.processor.calls == []
+
+
+def test_forward_cls_returns_the_pooler_output_and_is_differentiable():
+    import torch
+
+    class _M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, pixel_values):
+            return types.SimpleNamespace(pooler_output=pixel_values.flatten(1) * self.w)
+
+    ext = object.__new__(DINOv3FeatureExtractor)
+    ext.source, ext.model = "huggingface", _M()
+    out = ext.forward_cls(torch.ones(2, 3))
+    out.sum().backward()
+    assert out.shape == (2, 3) and ext.model.w.grad is not None

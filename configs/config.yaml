@@ -239,6 +239,12 @@ stage1:
     # extract_crops() (candidate path); extract() (reference path, called
     # directly by stage1.py) always uses preprocess_mode above.
     candidate_preprocess_mode: null   # stretch | resize_then_crop | pad_to_square | null (inherit)
+    # LoRA checkpoint from scripts/train_lora_dinov3.py (frozen DINOv3 +
+    # a few trained low-rank attention adapters). null = plain pretrained.
+    # Needs model=dinov3, dinov3_source=huggingface, same variant/
+    # pretrain_dataset/preprocess modes as training; rebuild caches
+    # (project.use_cache=false). NOT YET VALIDATED -- eval on held-out data.
+    dinov3_lora_weights_path: null
     # Optional small trained head on top of the frozen backbone above (see
     # scripts/train_projection_head.py) -- closes the domain gap between
     # close-up reference photos and tiny aerial crops WITHOUT fine-tuning
@@ -311,23 +317,26 @@ stage1:
     downscale_factor: 1.0   # e.g. 0.5 = shrink to half then upscale back
     blur_ksize: 0            # Gaussian blur kernel size in px, 0 = off
   # --------------------------------------------------------------------
-  # Deep-research-backed fix (reports/"Mô hình Re-ID nhẹ thay cosine.md")
-  # for the reference-photo-vs-video-crop domain gap: published evidence
-  # found "diverse" degradation (blur+downscale+JPEG-compression combined,
-  # at SEVERAL severities) closes this exact clean-reference-vs-degraded-
-  # query gap much better than aerial_sim's single fixed transform. Unlike
-  # aerial_sim (which REPLACES the clean image), this APPENDS degraded
-  # variants alongside the clean multi-scale pyramid already built per ref
-  # -- averaged together in step 4, no training, no architecture change.
-  # Can be combined with aerial_sim. NOT YET VALIDATED on real footage --
-  # see RefDegradationEnsembleConfig's own docstring (aero_eyes/config.py).
-  # --------------------------------------------------------------------
+  # Several degradation severities in place of ONE aerial_sim transform.
+  # REPLACES the clean reference (no clean view mixed in): each level
+  # degrades the masked ref first, THEN the usual 1.0x/0.75x/0.5x pyramid
+  # is built from it, and every view from every level is averaged -- same
+  # degrade-then-pyramid order aerial_sim uses. (A first version APPENDED
+  # degraded views next to the clean pyramid; on real footage that scored
+  # WORSE than aerial_sim.downscale_factor=0.1 -- mixing clean+degraded
+  # embeddings blends two domains.) Defaults bracket 0.1, the factor
+  # already validated to beat clean refs here (pure downscale; blur_ksize/
+  # jpeg_quality are untested on this footage -- add them per level to
+  # try). Add {downscale_factor: 1.0} if you deliberately want a clean
+  # level. Can be combined with aerial_sim (its transform becomes the base
+  # every level degrades). NOT YET VALIDATED in this replace form -- see
+  # RefDegradationEnsembleConfig's docstring (aero_eyes/config.py).
   ref_degradation_ensemble:
     enabled: false
     levels:
-      - {downscale_factor: 0.5, blur_ksize: 3, jpeg_quality: 60}
-      - {downscale_factor: 0.25, blur_ksize: 5, jpeg_quality: 35}
-      - {downscale_factor: 0.15, blur_ksize: 7, jpeg_quality: 20}
+      - {downscale_factor: 0.2}
+      - {downscale_factor: 0.1}
+      - {downscale_factor: 0.05}
   # DINOv2 analog of stage123_geco2.domain_calibration: shifts the fused
   # prototype (and each per-ref vector, when multi_reference_embedding is
   # active) toward the mean DINOv2 embedding of a few RAW frames sampled

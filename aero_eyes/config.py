@@ -439,6 +439,16 @@ class FeatureExtractorConfig(BaseModel):
     # extract() (reference path, called directly by stage1.py) always uses
     # preprocess_mode above.
     candidate_preprocess_mode: Optional[Literal["stretch", "resize_then_crop", "pad_to_square"]] = None
+    # Path to a LoRA checkpoint written by scripts/train_lora_dinov3.py (a
+    # few low-rank attention adapters fine-tuned on this project's own
+    # labeled crops; the DINOv3 backbone itself stays frozen). null =
+    # plain pretrained DINOv3. Needs model=dinov3 + dinov3_source=
+    # huggingface, and a checkpoint trained with the SAME dinov3_variant/
+    # pretrain_dataset/preprocess modes you run with -- prototype.npz and
+    # candidates.json built without it are stale (use project.use_cache=
+    # false). NOT YET VALIDATED: with only 7 distinct objects, measure on
+    # held-out videos/objects before trusting it (see the script's docstring).
+    dinov3_lora_weights_path: Optional[str] = None
     projection_head: ProjectionHeadConfig = ProjectionHeadConfig()
     # Opt-in preprocessing for CANDIDATE crops (video detections), NOT the
     # reference photos (stage1.segmentation already masks those separately)
@@ -533,25 +543,36 @@ class RefDegradationEnsembleConfig(BaseModel):
     `aerial_sim` above only applies ONE (downscale, blur) pair uniformly,
     REPLACING the clean image outright, no JPEG-compression simulation.
 
-    When enabled, generates one ADDITIONAL degraded view per (ref image,
-    entry in `levels`) -- appended alongside the clean multi-scale pyramid
-    (1.0x/0.75x/0.5x) and any synthetic-viewpoint views already built per
-    ref in run_stage1 -- then averaged into that ref's single feature
-    vector exactly as those other views already are (no architecture
-    change, no training, no downstream code change). The clean image is
-    NEVER replaced, only supplemented -- unlike aerial_sim. Can be combined
-    with aerial_sim (aerial_sim's single transform becomes the "base" image
-    this ensemble's pyramid+levels are then built from).
+    When enabled, REPLACES the clean reference with degraded ones: for each
+    entry in `levels`, the masked reference photo is degraded first, THEN
+    the usual multi-scale pyramid (1.0x/0.75x/0.5x, plus any synthetic
+    viewpoint views) is built from that degraded image, and every view
+    from every level is averaged into the ref's single feature vector. No
+    clean view is ever mixed in (add an identity level 1.0/0/100 yourself
+    if you want one) -- same degrade-then-pyramid order aerial_sim uses,
+    repeated across several severities. Can be combined with aerial_sim
+    (aerial_sim's transform then becomes the base every level degrades).
 
-    Cheapest possible test of the domain-gap hypothesis (no training) --
-    NOT YET VALIDATED on this project's own real footage; the published
-    evidence above is from person/vehicle/animal re-ID, not this domain.
+    REAL-FOOTAGE FINDING that shaped this design: the first version
+    APPENDED degraded variants alongside the clean pyramid and averaged
+    everything together -- that scored WORSE than a single
+    aerial_sim.downscale_factor=0.1 (which degrades everything
+    consistently). Averaging clean and degraded embeddings mixes two
+    domains into one vector instead of committing to the degraded one.
+    Note the published evidence above uses degradation to TRAIN an adapter
+    or backbone; this is training-free averaging of frozen embeddings, a
+    different mechanism -- a weaker analogue, not a port.
+
+    NOT YET VALIDATED in its replace form on this project's own footage.
+    Default levels bracket 0.1, the one factor already validated to beat
+    clean references here (pure downscale, no blur/JPEG -- blur/JPEG are
+    untested on this footage; add them via levels if you want to try).
     """
     enabled: bool = False
     levels: list[RefDegradationLevel] = [
-        RefDegradationLevel(downscale_factor=0.5, blur_ksize=3, jpeg_quality=60),
-        RefDegradationLevel(downscale_factor=0.25, blur_ksize=5, jpeg_quality=35),
-        RefDegradationLevel(downscale_factor=0.15, blur_ksize=7, jpeg_quality=20),
+        RefDegradationLevel(downscale_factor=0.2),
+        RefDegradationLevel(downscale_factor=0.1),
+        RefDegradationLevel(downscale_factor=0.05),
     ]
 
 

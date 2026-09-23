@@ -158,6 +158,51 @@ def apply_ref_degradation(
     return out
 
 
+def build_ref_views(
+    masked: np.ndarray, mask: np.ndarray,
+    levels: list[tuple[float, int, int]] | None = None,
+    synth_views_fn=None,
+) -> list[np.ndarray]:
+    """All images whose features get averaged into ONE reference photo's
+    per-ref vector (run_stage1 step 3/4).
+
+    levels=None (default, ref_degradation_ensemble disabled): today's
+    exact behavior -- the clean multi-scale pyramid (1.0x/0.75x/0.5x) of
+    `masked`, plus any synthetic-viewpoint views.
+
+    levels=[(downscale_factor, blur_ksize, jpeg_quality), ...]
+    (ref_degradation_ensemble enabled): REPLACES the clean image -- each
+    level degrades `masked` first (apply_ref_degradation), THEN the same
+    pyramid (and synthetic views) is built from that degraded base, so
+    every view fed into the average is degraded and none is clean. This
+    mirrors what stage1.aerial_sim already does (degrade, then pyramid --
+    empirically validated to beat clean refs on this project's footage),
+    just repeated across several severities. The first version of this
+    feature APPENDED degraded variants alongside the clean pyramid and
+    averaged everything together; on real footage that scored WORSE than
+    a single aerial_sim.downscale_factor=0.1 -- averaging clean and
+    degraded embeddings mixes two domains into one vector instead of
+    committing to the degraded one. A clean view can still be included
+    deliberately by adding an identity level (1.0, 0, 100).
+
+    synth_views_fn(base_img, mask) -> list[ndarray], if given, is called
+    once per degraded/clean base so no clean-image content sneaks in when
+    levels is active.
+    """
+    bases = [apply_ref_degradation(masked, *lv) for lv in levels] if levels else [masked]
+    views: list[np.ndarray] = []
+    for base in bases:
+        for scale in (1.0, 0.75, 0.5):
+            if scale == 1.0:
+                views.append(base)
+            else:
+                h, w = base.shape[:2]
+                views.append(cv2.resize(base, (max(1, int(w * scale)), max(1, int(h * scale)))))
+        if synth_views_fn is not None:
+            views.extend(synth_views_fn(base, mask))
+    return views
+
+
 def run_stage1(cfg, sample_id: str) -> Path:
     """Run Stage 1 for the given sample. Returns path to prototype.npz."""
     from aero_eyes.config import load_config
@@ -280,46 +325,24 @@ def run_stage1(cfg, sample_id: str) -> Path:
     extractor = build_feature_extractor(cfg)
 
     images_per_ref: list[list[np.ndarray]] = []
+    deg_cfg = cfg.stage1.ref_degradation_ensemble
+    levels = (
+        [(lv.downscale_factor, lv.blur_ksize, lv.jpeg_quality) for lv in deg_cfg.levels]
+        if deg_cfg.enabled else None
+    )
+    acc = cfg.accuracy
     for i, (masked, mask) in enumerate(zip(masked_imgs, synth_masks)):
-        # Multi-scale pyramid: extract features at 1.0x/0.75x/0.5x of the
-        # masked reference image, then average over them (below) along with
-        # any synthetic views -- makes the fused per-ref feature more robust
-        # to how large the object appears (drone altitude/zoom varies the
-        # query video's apparent object scale in a way a single fixed-scale
-        # reference photo can't hedge against on its own).
-        imgs_this_ref = []
-        for scale in (1.0, 0.75, 0.5):
-            if scale == 1.0:
-                imgs_this_ref.append(masked)
-            else:
-                h, w = masked.shape[:2]
-                scaled = cv2.resize(masked, (max(1, int(w * scale)), max(1, int(h * scale))))
-                imgs_this_ref.append(scaled)
-        # Synthetic viewpoint augmentation
-        acc = cfg.accuracy
+        synth_fn = None
         if acc.mode == "max_accuracy" and acc.max_accuracy.synthetic_viewpoint_aug.enabled:
             sva = acc.max_accuracy.synthetic_viewpoint_aug
-            synth = generate_synth_views(
-                masked, mask,
+            synth_fn = lambda base, m, _i=i: generate_synth_views(
+                base, m,
                 method=sva.method,
                 num_views=sva.num_synth_views,
                 pitch_range_deg=sva.pitch_range_deg,
-                seed=cfg.project.seed + i,
+                seed=cfg.project.seed + _i,
             )
-            imgs_this_ref.extend(synth)
-        # Diverse reference-degradation ensemble (opt-in) -- appends
-        # blur+downscale+JPEG-compressed variants at several severities on
-        # top of the clean pyramid/synth views above (never replaces them),
-        # so the fused per-ref feature (step 4's mean) sits closer to this
-        # video's own degraded domain without needing any training. See
-        # RefDegradationEnsembleConfig's own docstring for the rationale.
-        deg_cfg = cfg.stage1.ref_degradation_ensemble
-        if deg_cfg.enabled:
-            for level in deg_cfg.levels:
-                imgs_this_ref.append(
-                    apply_ref_degradation(masked, level.downscale_factor, level.blur_ksize, level.jpeg_quality)
-                )
-        images_per_ref.append(imgs_this_ref)
+        images_per_ref.append(build_ref_views(masked, mask, levels, synth_fn))
 
     # ---- 4. Extract features ----
     per_ref_features: list[np.ndarray] = []
