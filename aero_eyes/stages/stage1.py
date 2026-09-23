@@ -135,6 +135,29 @@ def _apply_aerial_sim(img: np.ndarray, downscale_factor: float, blur_ksize: int)
     return out
 
 
+def apply_ref_degradation(
+    img: np.ndarray, downscale_factor: float, blur_ksize: int, jpeg_quality: int,
+) -> np.ndarray:
+    """stage1.ref_degradation_ensemble's per-level transform -- same
+    downscale+blur as _apply_aerial_sim, PLUS a real JPEG re-encode/decode
+    round-trip (cv2.imencode/imdecode), since the published degradation-
+    augmentation evidence this config is based on (see
+    RefDegradationEnsembleConfig's own docstring) found combining blur +
+    downscale + COMPRESSION beats blur+downscale alone. All 3 are no-ops at
+    their identity values (1.0 / 0 / 100) -- calling this with all-defaults
+    returns a value equal to img (up to the JPEG codec's own lossless-at-
+    quality-100 rounding, which is not exactly bit-identical but visually
+    a no-op).
+    """
+    out = _apply_aerial_sim(img, downscale_factor, blur_ksize)
+    if jpeg_quality < 100:
+        q = max(1, min(100, jpeg_quality))
+        ok, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+        if ok:
+            out = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    return out
+
+
 def run_stage1(cfg, sample_id: str) -> Path:
     """Run Stage 1 for the given sample. Returns path to prototype.npz."""
     from aero_eyes.config import load_config
@@ -284,6 +307,18 @@ def run_stage1(cfg, sample_id: str) -> Path:
                 seed=cfg.project.seed + i,
             )
             imgs_this_ref.extend(synth)
+        # Diverse reference-degradation ensemble (opt-in) -- appends
+        # blur+downscale+JPEG-compressed variants at several severities on
+        # top of the clean pyramid/synth views above (never replaces them),
+        # so the fused per-ref feature (step 4's mean) sits closer to this
+        # video's own degraded domain without needing any training. See
+        # RefDegradationEnsembleConfig's own docstring for the rationale.
+        deg_cfg = cfg.stage1.ref_degradation_ensemble
+        if deg_cfg.enabled:
+            for level in deg_cfg.levels:
+                imgs_this_ref.append(
+                    apply_ref_degradation(masked, level.downscale_factor, level.blur_ksize, level.jpeg_quality)
+                )
         images_per_ref.append(imgs_this_ref)
 
     # ---- 4. Extract features ----

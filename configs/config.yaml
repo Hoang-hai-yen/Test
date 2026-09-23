@@ -283,6 +283,24 @@ stage1:
     enabled: false
     downscale_factor: 1.0   # e.g. 0.5 = shrink to half then upscale back
     blur_ksize: 0            # Gaussian blur kernel size in px, 0 = off
+  # --------------------------------------------------------------------
+  # Deep-research-backed fix (reports/"Mô hình Re-ID nhẹ thay cosine.md")
+  # for the reference-photo-vs-video-crop domain gap: published evidence
+  # found "diverse" degradation (blur+downscale+JPEG-compression combined,
+  # at SEVERAL severities) closes this exact clean-reference-vs-degraded-
+  # query gap much better than aerial_sim's single fixed transform. Unlike
+  # aerial_sim (which REPLACES the clean image), this APPENDS degraded
+  # variants alongside the clean multi-scale pyramid already built per ref
+  # -- averaged together in step 4, no training, no architecture change.
+  # Can be combined with aerial_sim. NOT YET VALIDATED on real footage --
+  # see RefDegradationEnsembleConfig's own docstring (aero_eyes/config.py).
+  # --------------------------------------------------------------------
+  ref_degradation_ensemble:
+    enabled: false
+    levels:
+      - {downscale_factor: 0.5, blur_ksize: 3, jpeg_quality: 60}
+      - {downscale_factor: 0.25, blur_ksize: 5, jpeg_quality: 35}
+      - {downscale_factor: 0.15, blur_ksize: 7, jpeg_quality: 20}
   # DINOv2 analog of stage123_geco2.domain_calibration: shifts the fused
   # prototype (and each per-ref vector, when multi_reference_embedding is
   # active) toward the mean DINOv2 embedding of a few RAW frames sampled
@@ -702,7 +720,7 @@ stage3:
     # consulted here -- this section's `enabled` is the switch).
     cluster_verification:
       enabled: false
-      cluster_method: hdbscan
+      cluster_method: hdbscan   # hdbscan | spectral -- see stage3.cluster_verification's own comment above
       pairwise_metric: cosine   # cosine | l1 | mahalanobis -- see stage3.cluster_verification's own comment above
       min_cluster_size: 2
       min_samples: null

@@ -457,6 +457,45 @@ class AerialSimConfig(BaseModel):
     blur_ksize: int = 0  # Gaussian blur kernel size in px, 0 = off (simulate motion/optical blur)
 
 
+class RefDegradationLevel(BaseModel):
+    downscale_factor: float = 1.0  # 1.0 = no shrink
+    blur_ksize: int = 0            # Gaussian blur kernel size in px, 0 = off
+    jpeg_quality: int = 100        # 1-100, 100 = no compression artifact
+
+
+class RefDegradationEnsembleConfig(BaseModel):
+    """stage1.ref_degradation_ensemble -- deep-research-backed fix for the
+    reference-photo-vs-video-crop domain gap (see reports/"Mô hình Re-ID
+    nhẹ thay cosine.md"): published evidence (DARA, arXiv:2607.16644; a
+    2026 wildlife re-ID degradation study, arXiv:2603.04163) found "diverse"
+    degradation composition (blur + downscale + compression combined, at
+    SEVERAL severities) closes a clean-reference-vs-degraded-query domain
+    gap significantly better than one fixed transform -- the existing
+    `aerial_sim` above only applies ONE (downscale, blur) pair uniformly,
+    REPLACING the clean image outright, no JPEG-compression simulation.
+
+    When enabled, generates one ADDITIONAL degraded view per (ref image,
+    entry in `levels`) -- appended alongside the clean multi-scale pyramid
+    (1.0x/0.75x/0.5x) and any synthetic-viewpoint views already built per
+    ref in run_stage1 -- then averaged into that ref's single feature
+    vector exactly as those other views already are (no architecture
+    change, no training, no downstream code change). The clean image is
+    NEVER replaced, only supplemented -- unlike aerial_sim. Can be combined
+    with aerial_sim (aerial_sim's single transform becomes the "base" image
+    this ensemble's pyramid+levels are then built from).
+
+    Cheapest possible test of the domain-gap hypothesis (no training) --
+    NOT YET VALIDATED on this project's own real footage; the published
+    evidence above is from person/vehicle/animal re-ID, not this domain.
+    """
+    enabled: bool = False
+    levels: list[RefDegradationLevel] = [
+        RefDegradationLevel(downscale_factor=0.5, blur_ksize=3, jpeg_quality=60),
+        RefDegradationLevel(downscale_factor=0.25, blur_ksize=5, jpeg_quality=35),
+        RefDegradationLevel(downscale_factor=0.15, blur_ksize=7, jpeg_quality=20),
+    ]
+
+
 class DinoDomainCalibrationConfig(BaseModel):
     """DINOv2 analog of stage123_geco2.domain_calibration: shifts the fused
     `prototype` (and each per-ref vector, when multi_reference_embedding is
@@ -509,6 +548,7 @@ class Stage1Config(BaseModel):
     feature_extractor: FeatureExtractorConfig = FeatureExtractorConfig()
     prototype: PrototypeConfig = PrototypeConfig()
     aerial_sim: AerialSimConfig = AerialSimConfig()
+    ref_degradation_ensemble: RefDegradationEnsembleConfig = RefDegradationEnsembleConfig()
     domain_calibration: DinoDomainCalibrationConfig = DinoDomainCalibrationConfig()
     # Crop each reference image to its MobileSAM tight mask box (expanded by
     # crop_context_margin) BEFORE resizing to feature_extractor.image_size
@@ -2365,6 +2405,20 @@ class Geco2DynamicPrototypeTopKFusionConfig(BaseModel):
     # keyframe has none, the peakiness term is silently dropped for the
     # rest of the run (one-time warning), falling back to the 2-way
     # formula, rather than erroring.
+    #
+    # REAL-FOOTAGE FINDING (see Geco2PeakContrastFilterConfig's own
+    # docstring, 2 IDCard samples): peak_contrast does NOT separate real
+    # candidates from clutter on this checkpoint/domain -- median CLUTTER
+    # actually scored HIGHER than median REAL, both with a fixed and a
+    # size-adaptive window. A POSITIVE peakiness_weight would therefore
+    # actively bias selection TOWARD clutter over the real target on a
+    # tie, not just fail to help -- keep this at 0.0 (default) until
+    # re-validated on your own footage with scripts/check_peak_contrast_
+    # separation.py. Flipping the sign to exploit the (weak) inverse
+    # correlation is not recommended either -- the overlap measured was
+    # too total (100% of clutter candidates scored at or above the lowest
+    # real one) to trust as a general feature, only as an artifact of the
+    # 2 samples it was measured on.
     peakiness_weight: float = 0.0
     # How many past keyframes' CHOSEN-candidate raw cosine/geco2 values to
     # keep for the running Z-score baseline (a simple deque, oldest evicted
@@ -2685,11 +2739,25 @@ class Geco2PeakContrastFilterConfig(BaseModel):
     result: median REAL contrast was LOWER than median CLUTTER contrast on
     both samples tested (inverted from the original hypothesis, which only
     accounted for repetitive-texture clutter, not point-like clutter).
-    adaptive_radius below is the fix -- scale the window to each
-    candidate's OWN box footprint instead of a fixed constant, removing the
-    size confound. Re-run scripts/check_peak_contrast_separation.py with it
-    enabled before trusting min_contrast_z/peakiness_weight on this
-    checkpoint again -- the fixed-radius numbers above do not carry over.
+    adaptive_radius below is a PARTIAL fix -- scaling the window to each
+    candidate's own box footprint narrows the gap (re-measured on the same
+    2 samples: median REAL/CLUTTER moved from ~2.5/~3.1-3.5 apart to ~5.9/
+    ~6.1-6.7 apart, i.e. closer but still overlapping) but does NOT make
+    REAL and CLUTTER cleanly separable -- 100% of clutter candidates still
+    scored at or above the lowest real candidate on both samples, with or
+    without adaptive_radius. CONCLUSION: peak_contrast (fixed or adaptive)
+    is NOT currently a reliable standalone real-vs-clutter signal on this
+    checkpoint/domain -- same wall as raw cosine similarity's own measured
+    ~0.335-0.38 TP/FP ceiling (docs/GECO2_precision_improvements_plan.md).
+    DO NOT enable hard_reject (or give topk_fusion.peakiness_weight much
+    weight) based on this finding -- it would trade real recall for near-
+    zero precision gain. If picking this back up later: re-run
+    scripts/check_peak_contrast_separation.py on YOUR OWN checkpoint/
+    samples first (this finding may not generalize), and consider that the
+    underlying problem may need a temporal/structural signal (persistence
+    across many frames) rather than any single-frame local-appearance
+    statistic -- appearance-only approaches (cosine, RMD, peak_contrast)
+    have now all hit a similar wall on this project's own footage.
     """
     enabled: bool = False
     # Neighborhood half-size, in centerness-grid cells (not pixels) --
