@@ -540,8 +540,13 @@ def main():
 
     for epoch in range(args.epochs):
         t0 = time.time()
-        train_loss, train_present, train_absent, _ = run_epoch(
+        train_loss, train_present, train_absent, train_stats = run_epoch(
             model, train_loader, criterion, optimizer, args, image_size, device, train=True,
+        )
+        log.info(
+            "  train detection: top1_hit=%.3f margin=%.3f present_empty=%.3f absent_empty=%.3f absent_max=%.3f",
+            train_stats["top1_hit"], train_stats["margin"], train_stats["present_empty"],
+            train_stats["absent_empty"], train_stats["absent_max"],
         )
         val_loss, val_present, val_absent, val_stats = run_epoch(
             model, val_loader, criterion, optimizer, args, image_size, device, train=False,
@@ -576,15 +581,17 @@ def main():
                  "val_stats": val_stats, "args": vars(args)},
                 out_checkpoint,
             )
+            shown = val_loss if args.select_by == "val_loss" else val_stats[args.select_by]
             log.info("Saved new best checkpoint (%s=%.4f, val_loss=%.4f) -> %s",
-                     args.select_by, abs(select_value), val_loss, out_checkpoint)
+                     args.select_by, shown, val_loss, out_checkpoint)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.early_stop_patience:
                 log.info("Early stopping: no val improvement for %d epoch(s)", epochs_without_improvement)
                 break
 
-    log.info("Training done. Best %s=%.4f, checkpoint at %s", args.select_by, abs(best_val_loss), out_checkpoint)
+    best_shown = best_val_loss if args.select_by == "val_loss" else -best_val_loss
+    log.info("Training done. Best %s=%.4f, checkpoint at %s", args.select_by, best_shown, out_checkpoint)
 
 
 if __name__ == "__main__":
