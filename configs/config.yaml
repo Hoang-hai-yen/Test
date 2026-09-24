@@ -814,7 +814,7 @@ stage3:
   # Can only REJECT, never add recall. NOT YET VALIDATED.
   isolated_detection_filter:
     enabled: false
-    max_gap_intervals: 2
+    max_gap_intervals: 1
     keep_conf_threshold: null
     mode: offline              # "online" = causal delayed-decision gate (same result, bounded latency)
   # KeepTrack-style (arXiv:2103.16556, docs/GECO2_precision_improvements_
@@ -1648,6 +1648,19 @@ stage4:
     enabled: false
     required_hits: 2
     iou_threshold: 0.3
+    # Opt-in. While a track is ACTIVE, judge each keyframe detection against
+    # the tracker's own box for that same frame (no keyframe_interval gap, so
+    # robust to fast motion) instead of against the previous detection.
+    # IoU >= tracker_iou_threshold -> accept + re-anchor immediately.
+    # Otherwise on_mismatch: conf_compare = higher stage-3 similarity between
+    # the track's anchoring detection and the new one wins (tie keeps the
+    # track); hits = keep tracking until required_hits consecutive keyframes
+    # disagree, then re-init from the latest. No active track (first lock /
+    # after loss) -> init straight from the keyframe detection, no
+    # confirmation; later keyframes judge it by the rules above.
+    compare_with_tracker: false
+    tracker_iou_threshold: 0.3
+    on_mismatch: conf_compare   # conf_compare | hits
 
   # A keyframe with ZERO surviving detections (GeCo2/Stage3 found nothing
   # there -- e.g. a single false-negative frame sandwiched between two

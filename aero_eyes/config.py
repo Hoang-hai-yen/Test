@@ -1793,6 +1793,25 @@ class DetectionConfirmationConfig(BaseModel):
     enabled: bool = False
     required_hits: int = 2
     iou_threshold: float = 0.3
+    # compare_with_tracker (opt-in): while a track is ACTIVE, judge each
+    # keyframe detection against the tracker's own box for that same frame
+    # (TrackerAgreementGate) instead of against the previous keyframe's
+    # detection -- consecutive keyframes are keyframe_interval frames apart,
+    # so a fast-moving object can fail the detection-vs-detection IoU even
+    # though it is the same object. Agrees (IoU >= tracker_iou_threshold) ->
+    # accept + re-anchor at once, no second hit needed. Disagrees ->
+    # on_mismatch: "conf_compare" (higher stage-3 similarity between the
+    # track's anchoring detection and the new one wins; a tie keeps the
+    # track) or "hits" (keep tracking until required_hits consecutive
+    # keyframes disagree, then re-init from the latest). With no active
+    # track (first lock / after loss) the tracker is initialized straight
+    # from the keyframe detection -- no confirmation at all; the following
+    # keyframes then judge it by the rules above. Also fixes: with this
+    # off, a keyframe detection that is not yet confirmed deactivates the
+    # active track for that keyframe.
+    compare_with_tracker: bool = False
+    tracker_iou_threshold: float = 0.3
+    on_mismatch: Literal["conf_compare", "hits"] = "conf_compare"
 
 
 class AbsenceCheckConfig(BaseModel):

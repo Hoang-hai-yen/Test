@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 # used by GeCo2's own dynamic_prototype online update now. Kept importable
 # under the old private name here for any existing call sites in this file.
 from aero_eyes.utils.detection_confirm import DetectionConfirmer as _DetectionConfirmer
+from aero_eyes.utils.detection_confirm import TrackerAgreementGate as _TrackerAgreementGate
 
 
 def run_stage4(cfg, sample_id: str) -> Path:
@@ -343,6 +344,15 @@ def run_stage4(cfg, sample_id: str) -> Path:
         _DetectionConfirmer(confirm_cfg.required_hits, confirm_cfg.iou_threshold)
         if confirm_cfg.enabled else None
     )
+    # confirm_detections.compare_with_tracker: judges a keyframe detection
+    # against the ACTIVE tracker's own box for that frame (see
+    # TrackerAgreementGate); None = classic detection-vs-detection only.
+    agreement_gate = (
+        _TrackerAgreementGate(
+            confirm_cfg.tracker_iou_threshold, confirm_cfg.on_mismatch, confirm_cfg.required_hits,
+        )
+        if confirm_cfg.enabled and confirm_cfg.compare_with_tracker else None
+    )
 
     # frame_idx of the first frame in an ONGOING keep_tracking_on_missed_keyframe
     # segment still awaiting validation (None = no pending segment). Set the
@@ -625,10 +635,53 @@ def run_stage4(cfg, sample_id: str) -> Path:
             else:
                 is_keyframe = frame_idx in kf_set
                 dets = detections[frame_idx] if is_keyframe else None
-                if is_keyframe and dets:
+                best_det = max(dets, key=lambda d: d.similarity) if dets else None
+                if agreement_gate is not None and is_keyframe and not dets:
+                    agreement_gate.reset_streak()  # a gap breaks "consecutive" mismatches
+                # confirm_detections.compare_with_tracker: with a track already
+                # active, get the tracker's box for THIS frame first and let
+                # TrackerAgreementGate decide (pre_update is then reused by
+                # the tracking branch below so tracker.update runs only once).
+                pre_update = None
+                keep_tracking_this_kf = False
+                agreed_with_tracker = False
+                if agreement_gate is not None and best_det is not None and tracker_active:
+                    t_box, t_conf = tracker.update(frame_bgr)
+                    if t_box is None or t_conf < s4.tracker_conf_threshold:
+                        tracker_active = False  # lost lock: same as no track (init below)
+                    else:
+                        pre_update = (t_box, t_conf)
+                        verdict = agreement_gate.judge(t_box, best_det.box, best_det.similarity)
+                        if verdict == "keep_track":
+                            keep_tracking_this_kf = True
+                            log.info(
+                                "[Stage4] %s: frame %d: detection (sim=%.3f) disagrees with the "
+                                "active track (anchor sim=%s) -- on_mismatch=%s keeps the track",
+                                sample_id, frame_idx, best_det.similarity,
+                                agreement_gate.anchor_sim, confirm_cfg.on_mismatch,
+                            )
+                        else:
+                            agreed_with_tracker = True
+                            if verdict == "replace":
+                                log.info(
+                                    "[Stage4] %s: frame %d: detection (sim=%.3f) replaces the active "
+                                    "track (anchor sim=%s, on_mismatch=%s)",
+                                    sample_id, frame_idx, best_det.similarity,
+                                    agreement_gate.anchor_sim, confirm_cfg.on_mismatch,
+                                )
+                if agreement_gate is not None and best_det is not None and pre_update is None:
+                    # No usable track to compare against (never started, or
+                    # just lost): init straight from the detection, no
+                    # detection-vs-detection confirmation.
+                    agreed_with_tracker = True
+                if is_keyframe and dets and not keep_tracking_this_kf:
                     # Initialize or re-initialize tracker from detection
-                    candidate = max(dets, key=lambda d: d.similarity).box
-                    confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
+                    candidate = best_det.box
+                    if agreed_with_tracker:
+                        confirmed = candidate
+                        confirmer.reset()  # any stale pending detection-vs-detection streak
+                    else:
+                        confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
                     if confirmed is not None:
                         # This IS the independent box a pending
                         # keep_tracking_on_missed_keyframe segment (if any)
@@ -650,6 +703,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             tracker_active = True
                             track_age = 0
                             frames_since_verify = 0
+                            if agreement_gate is not None:
+                                agreement_gate.anchored(best_det.similarity)
                             box_out = confirmed
                             source = "detect"
                             # stage4.backward_tracking: this is a FRESH lock
@@ -673,9 +728,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 # gets to judge on its own terms).
                 elif tracker_active and (
                     not is_keyframe
+                    or keep_tracking_this_kf
                     or (kt_cfg.enabled and consecutive_missed_keyframes < kt_cfg.max_consecutive_missed_keyframes)
                 ):
-                    if is_keyframe:
+                    if is_keyframe and not keep_tracking_this_kf:
                         consecutive_missed_keyframes += 1
                         if kept_segment_start is None:
                             kept_segment_start = frame_idx
@@ -686,7 +742,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             sample_id, frame_idx, consecutive_missed_keyframes,
                             kt_cfg.max_consecutive_missed_keyframes,
                         )
-                    box, conf = tracker.update(frame_bgr)
+                    box, conf = pre_update if pre_update is not None else tracker.update(frame_bgr)
                     # track_age is frozen for the whole time a segment is
                     # open -- max_track_age no longer bounds tolerance for
                     # missed keyframes at all, that's entirely
@@ -923,6 +979,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 tracker_active = True
                                 track_age = 0
                                 frames_since_verify = 0
+                                if agreement_gate is not None:
+                                    agreement_gate.anchored(None)  # re-detect: no stage-3 similarity
                                 # Always a fresh lock here (tracker_active
                                 # was forced False a few lines up before
                                 # this re-detect attempt) -- recover any
