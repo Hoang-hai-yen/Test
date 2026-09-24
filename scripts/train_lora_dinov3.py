@@ -23,6 +23,19 @@ prototype and away from the other objects', and a clutter crop is pushed away
 from ALL prototypes. That is the same "cosine to the ref prototype" decision
 the pipeline makes at Stage 3, trained directly.
 
+Pushing clutter away (all optional, off by default)
+--------------------------------------------------
+  --hard-neg-pool P    hard-negative mining: train on the clutter crops with the
+                       highest cosine to the prototype (P crops drawn per object
+                       per step, the top --neg-per-object kept).
+  --neg-margin m       adds a hinge on clutter: relu(cos(clutter, own prototype) - m),
+                       weight --neg-margin-weight, so clutter keeps being pushed
+                       below m even after cross-entropy is satisfied.
+  --select-by tpr_fpr1pct  picks lora_best.pt by the share of targets kept at
+                       1% clutter leak instead of AUROC (the high-cosine tail is
+                       what leaks false positives; AUROC is dominated by easy clutter).
+TPR@FPR 1% / 0.1% are always computed and logged/saved in metrics.json.
+
 Evaluating honestly (only 7 objects, 2 videos each!)
 ----------------------------------------------------
 No flag = train on everything and report nothing about generalization.
@@ -151,29 +164,51 @@ def jitter_box(box, rng: np.random.Generator, min_iou: float, tries: int = 20):
 def prototype_bg_loss(
     crop_emb: torch.Tensor, labels: torch.Tensor, protos: torch.Tensor,
     bg_logit: torch.Tensor, tau: float,
+    owner: torch.Tensor | None = None, neg_margin: float | None = None, margin_weight: float = 1.0,
 ) -> torch.Tensor:
     """(K+1)-way cross-entropy: cosine(crop, prototype_k)/tau for the K
     object prototypes plus one learnable background logit. labels in [0,K];
     K = clutter. Target crops and clutter crops are averaged separately so
-    a clutter-heavy batch cannot drown out the target term."""
+    a clutter-heavy batch cannot drown out the target term.
+
+    Cross-entropy alone stops caring once a clutter crop merely loses to the
+    (learnable!) background logit, so it never asks for clutter to be FAR
+    from the prototype. neg_margin (with `owner`: the object index each crop
+    belongs to) adds margin_weight * mean(relu(cos(clutter, its own
+    object's prototype) - neg_margin)): a hinge in plain cosine units that
+    keeps pushing every clutter crop below neg_margin. None = off."""
     K = protos.shape[0]
     logits = torch.cat([crop_emb @ protos.t() / tau, bg_logit.reshape(1, 1).expand(len(crop_emb), 1)], dim=1)
     ce = F.cross_entropy(logits, labels, reduction="none")
     is_target = labels < K
     parts = [ce[m].mean() for m in (is_target, ~is_target) if bool(m.any())]
-    return torch.stack(parts).mean()
+    loss = torch.stack(parts).mean()
+    if neg_margin is not None and owner is not None and bool((~is_target).any()):
+        clutter = ~is_target
+        cos_own = (crop_emb[clutter] * protos[owner[clutter]]).sum(-1)
+        loss = loss + margin_weight * F.relu(cos_own - neg_margin).mean()
+    return loss
 
 
 def separation_metrics(pos_cos: np.ndarray, neg_cos: np.ndarray) -> dict:
     from sklearn.metrics import average_precision_score, roc_auc_score
 
+    from sklearn.metrics import roc_curve
+
     if len(pos_cos) == 0 or len(neg_cos) == 0:
-        return {"auroc": float("nan"), "ap": float("nan"), "pos_cos": float("nan"), "neg_cos": float("nan")}
+        nan = float("nan")
+        return {"auroc": nan, "ap": nan, "pos_cos": nan, "neg_cos": nan,
+                "tpr_fpr1pct": nan, "tpr_fpr0p1pct": nan}
     y = np.concatenate([np.ones(len(pos_cos)), np.zeros(len(neg_cos))])
     s = np.concatenate([pos_cos, neg_cos])
+    fpr, tpr, _ = roc_curve(y, s, drop_intermediate=False)
     return {
         "auroc": float(roc_auc_score(y, s)), "ap": float(average_precision_score(y, s)),
         "pos_cos": float(np.mean(pos_cos)), "neg_cos": float(np.mean(neg_cos)),
+        # Fraction of targets kept while letting at most 1% / 0.1% of clutter through --
+        # the high-cosine clutter TAIL, which is what leaks FPs into the pipeline
+        # (AUROC is dominated by the easy bulk of clutter).
+        "tpr_fpr1pct": float(tpr[fpr <= 0.01].max()), "tpr_fpr0p1pct": float(tpr[fpr <= 0.001].max()),
     }
 
 
@@ -345,27 +380,55 @@ def _pick(lst: list, n: int, rng: np.random.Generator) -> list:
     return [lst[i] for i in rng.integers(0, len(lst), size=n)]
 
 
+def mine_hard_negatives(ext, pool: list, proto: torch.Tensor, n: int, mode: str, micro_batch: int, amp: bool) -> list:
+    """The n crops of `pool` with the highest cosine to `proto` under the
+    CURRENT model (scored without gradients) -- the clutter that would leak
+    through. Caveat: mining amplifies label noise (a target crop wrongly
+    listed as clutter, e.g. in an unannotated frame, is exactly what gets
+    picked), so keep the pool moderate."""
+    with torch.no_grad():
+        scores = embed(ext, pool, mode, micro_batch, amp) @ proto.detach()
+    return [pool[i] for i in torch.topk(scores, min(n, len(pool))).indices.tolist()]
+
+
 def train_step(ext, objs: list[str], obj_data: dict, args, rng, bg_logit) -> torch.Tensor:
     K = len(objs)
-    ref_imgs, ref_owner, crops, labels = [], [], [], []
+    ref_imgs, ref_owner = [], []
     for k, o in enumerate(objs):
-        d = obj_data[o]
-        for img in _pick(d.refs, args.refs_per_object, rng):
+        for img in _pick(obj_data[o].refs, args.refs_per_object, rng):
             ref_imgs.append(degrade_ref(img, float(rng.choice(args.ref_factors))))
             ref_owner.append(k)
+    ref_emb = embed(ext, ref_imgs, ext.preprocess_mode, args.micro_batch, args.amp)
+    ref_owner_t = torch.tensor(ref_owner, device=ref_emb.device)
+    protos = torch.stack([F.normalize(ref_emb[ref_owner_t == k].mean(0), dim=0) for k in range(K)])
+
+    pool_n = getattr(args, "hard_neg_pool", 0)
+    crops, labels, owner = [], [], []
+    for k, o in enumerate(objs):
+        d = obj_data[o]
         for img in _pick(d.pos, args.pos_per_object, rng):
             crops.append(augment_crop(img, rng))
             labels.append(k)
+            owner.append(k)
         if d.neg:
-            for img in _pick(d.neg, args.neg_per_object, rng):
+            if pool_n > args.neg_per_object:
+                negs = mine_hard_negatives(
+                    ext, _pick(d.neg, pool_n, rng), protos[k], args.neg_per_object,
+                    ext.candidate_preprocess_mode, args.micro_batch, args.amp,
+                )
+            else:
+                negs = _pick(d.neg, args.neg_per_object, rng)
+            for img in negs:
                 crops.append(augment_crop(img, rng))
                 labels.append(K)
-    ref_emb = embed(ext, ref_imgs, ext.preprocess_mode, args.micro_batch, args.amp)
+                owner.append(k)
     crop_emb = embed(ext, crops, ext.candidate_preprocess_mode, args.micro_batch, args.amp)
-    owner = torch.tensor(ref_owner, device=ref_emb.device)
-    protos = torch.stack([F.normalize(ref_emb[owner == k].mean(0), dim=0) for k in range(K)])
     y = torch.tensor(labels, device=crop_emb.device)
-    return prototype_bg_loss(crop_emb, y, protos, bg_logit, args.tau)
+    return prototype_bg_loss(
+        crop_emb, y, protos, bg_logit, args.tau,
+        owner=torch.tensor(owner, device=crop_emb.device),
+        neg_margin=getattr(args, "neg_margin", None), margin_weight=getattr(args, "neg_margin_weight", 1.0),
+    )
 
 
 @torch.no_grad()
@@ -380,8 +443,14 @@ def eval_video(ext, vd: VideoData, args) -> dict:
 
 def evaluate(ext, val_data: list[VideoData], args) -> dict:
     per_video = {v.video_id: eval_video(ext, v, args) for v in val_data}
-    aur = [m["auroc"] for m in per_video.values() if not np.isnan(m["auroc"])]
-    return {"per_video": per_video, "mean_auroc": float(np.mean(aur)) if aur else float("nan")}
+    def _mean(key):
+        vals = [m[key] for m in per_video.values() if not np.isnan(m[key])]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    return {
+        "per_video": per_video, "mean_auroc": _mean("auroc"), "mean_tpr_fpr1pct": _mean("tpr_fpr1pct"),
+        "mean_tpr_fpr0p1pct": _mean("tpr_fpr0p1pct"),
+    }
 
 
 def run_training(ext, train_data: list[VideoData], val_data: list[VideoData], args) -> dict:
@@ -424,11 +493,13 @@ def run_training(ext, train_data: list[VideoData], val_data: list[VideoData], ar
     out_dir.mkdir(parents=True, exist_ok=True)
     history = []
     best = -1.0
+    select_key = {"auroc": "mean_auroc", "tpr_fpr1pct": "mean_tpr_fpr1pct"}[getattr(args, "select_by", "auroc")]
+    fmt = lambda ev: f"val mean AUROC {ev['mean_auroc']:.4f} | TPR@FPR1% {ev['mean_tpr_fpr1pct']:.4f}"
     if val_data:
         base = evaluate(ext, val_data, args)
-        log.info("epoch 0 (frozen backbone) val mean AUROC %.4f", base["mean_auroc"])
+        log.info("epoch 0 (frozen backbone) %s", fmt(base))
         history.append({"epoch": 0, "train_loss": None, **base})
-        best = base["mean_auroc"]
+        best = base[select_key]
 
     for epoch in range(1, args.epochs + 1):
         losses = []
@@ -444,16 +515,16 @@ def run_training(ext, train_data: list[VideoData], val_data: list[VideoData], ar
         if val_data:
             ev = evaluate(ext, val_data, args)
             rec.update(ev)
-            msg += f" | val mean AUROC {ev['mean_auroc']:.4f}"
-            if ev["mean_auroc"] > best:
-                best = ev["mean_auroc"]
+            msg += " | " + fmt(ev)
+            if ev[select_key] > best:
+                best = ev[select_key]
                 save_lora(ext.model, out_dir / "lora_best.pt", train_config)
                 msg += "  (best, saved)"
         log.info(msg)
         history.append(rec)
         save_lora(ext.model, out_dir / "lora_last.pt", train_config)
     (out_dir / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    return {"history": history, "best_val_auroc": best}
+    return {"history": history, "best_val_score": best}
 
 
 def main():
@@ -482,6 +553,14 @@ def main():
     p.add_argument("--max-neg", type=int, default=600, help="negative crops kept per video")
     p.add_argument("--jitter-copies", type=int, default=0,
                    help="extra loosened/shifted copies of each sampled GT box added as positives (imperfect crops)")
+    p.add_argument("--hard-neg-pool", type=int, default=0,
+                   help="per object per step, draw this many clutter crops and train on the --neg-per-object "
+                        "with the highest cosine to the prototype (hard-negative mining); 0 = off")
+    p.add_argument("--neg-margin", type=float, default=None,
+                   help="hinge on clutter: penalize cosine(clutter, own prototype) above this (e.g. 0.15); off if unset")
+    p.add_argument("--neg-margin-weight", type=float, default=1.0)
+    p.add_argument("--select-by", choices=["auroc", "tpr_fpr1pct"], default="auroc",
+                   help="validation metric that picks lora_best.pt; tpr_fpr1pct = share of targets kept at 1 percent clutter leak")
     p.add_argument("--neg-iou-max", type=float, default=0.1)
     p.add_argument("--pos-iou-min", type=float, default=0.6)
     p.add_argument("--ref-factors", default="1.0", help="extra ref downscale factors sampled in training, e.g. 1.0,0.3")
@@ -495,6 +574,9 @@ def main():
     args.targets = [t for t in args.targets.split(",") if t]
     args.last_n_blocks = args.last_n_blocks or None
     args.ref_factors = [float(x) for x in args.ref_factors.split(",") if x]
+    if 0 < args.hard_neg_pool <= args.neg_per_object:
+        log.warning("--hard-neg-pool %d <= --neg-per-object %d: nothing to mine, ignoring.",
+                    args.hard_neg_pool, args.neg_per_object)
 
     from aero_eyes.config import load_config
     from aero_eyes.models.features import DINOv3FeatureExtractor, build_feature_extractor
@@ -545,7 +627,7 @@ def main():
     log.info("data built in %.0fs", time.time() - t0)
 
     result = run_training(ext, train_data, val_data, args)
-    log.info("done. best val mean AUROC: %.4f. Checkpoints in %s", result["best_val_auroc"], args.out_dir)
+    log.info("done. best val %s: %.4f. Checkpoints in %s", args.select_by, result["best_val_score"], args.out_dir)
 
 
 if __name__ == "__main__":
