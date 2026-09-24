@@ -33,6 +33,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from aero_eyes.models.geco2_loss_extras import LossOptions, custom_main_loss, frame_detection_stats
 from aero_eyes.models.geco2_finetune_data import (
     DEFAULT_HOLDOUT_CATEGORIES,
     Geco2FinetuneDataset,
@@ -63,7 +64,7 @@ def build_targets(gt_box_canvas: tuple[float, float, float, float] | None, image
 
 def compute_step_loss(
     criterion, out, target_boxes: torch.Tensor, aux_weight: float, image_size: float,
-    aux_size_threshold_px: float = 25.0,
+    aux_size_threshold_px: float = 25.0, opts: LossOptions | None = None, stats: dict | None = None,
 ):
     """Loss recipe adapted from GECO2/train.py, with two deliberate,
     documented deviations from the reference implementation (see
@@ -89,9 +90,8 @@ def compute_step_loss(
     to 100-150) to actually exercise the aux head on this dataset, an
     identified low-risk lever from the first finetune attempt's post-mortem.
     """
+    opts = opts or LossOptions()
     targets = [{"boxes": target_boxes, "labels": torch.zeros(len(target_boxes), dtype=torch.long)}]
-    l = criterion(out.main, targets, out.centerness, out.ref_points)
-    l1 = criterion(out.aux, targets, out.centerness_aux, out.ref_points_aux)
 
     if target_boxes.numel() == 0:
         alpha = 0.0
@@ -100,9 +100,65 @@ def compute_step_loss(
         mean_w = (target_boxes[:, 2] - target_boxes[:, 0]).mean().item() * image_size
         alpha = aux_weight if min(mean_h, mean_w) < aux_size_threshold_px else 0.0
 
-    main_loss = l["loss_giou"] + l["loss_ce"] + l["loss_bbox"]
-    aux_loss = alpha * (l1["loss_giou"] + l1["loss_ce"] + l1["loss_bbox"])
+    if opts.custom_main():
+        main_out = out.main
+        if target_boxes.shape[0] > 0:
+            with torch.no_grad():
+                indices, fn_idx, _fp = criterion.matcher(main_out, targets)
+            tp_pred, tp_gt = indices[0]
+            fn_gt = torch.as_tensor(np.asarray(fn_idx[0]), dtype=torch.long)
+        else:
+            tp_pred = tp_gt = fn_gt = torch.zeros(0, dtype=torch.long)
+        scores, boxes = main_out["box_v"][0], main_out["pred_boxes"][0]
+        main_loss, _ = custom_main_loss(
+            scores, boxes, out.centerness, out.ref_points, target_boxes, tp_pred, tp_gt, fn_gt, opts,
+        )
+        if stats is not None:
+            stats.update(frame_detection_stats(
+                scores, boxes, out.ref_points, tuple(out.centerness.shape[-2:]), target_boxes,
+            ))
+    else:
+        l = criterion(out.main, targets, out.centerness, out.ref_points)
+        main_loss = opts.giou_weight * l["loss_giou"] + l["loss_ce"] + l["loss_bbox"]
+        if stats is not None:
+            stats.update(frame_detection_stats(
+                out.main["box_v"][0], out.main["pred_boxes"][0], out.ref_points,
+                tuple(out.centerness.shape[-2:]), target_boxes,
+            ))
+
+    aux_loss = 0.0
+    if alpha > 0.0:
+        l1 = criterion(out.aux, targets, out.centerness_aux, out.ref_points_aux)
+        aux_loss = alpha * (opts.giou_weight * l1["loss_giou"] + l1["loss_ce"] + l1["loss_bbox"])
     return main_loss + aux_loss
+
+
+def loss_opts_from_args(args) -> LossOptions:
+    return LossOptions(
+        giou_weight=args.giou_weight, group_norm_ce=args.group_norm_ce, mask_gt_peaks=args.mask_gt_peaks,
+        tp_target_iou_floor=args.tp_target_iou_floor, multi_peak_box=args.multi_peak_box,
+        rank_weight=args.rank_weight, rank_margin=args.rank_margin, rank_topk=args.rank_topk,
+        pos_weight=args.pos_weight, pos_margin=args.pos_margin,
+        absent_topk=args.absent_topk, absent_ceiling=args.absent_ceiling, absent_weight=args.absent_weight,
+    )
+
+
+def summarize_frame_stats(rows: list[dict]) -> dict:
+    """Detection-oriented validation numbers (peaks from the training-mode
+    median-threshold head): top1_hit = share of present frames whose
+    highest-scoring peak has IoU>=0.5; margin = mean(best good peak - highest
+    clutter peak); absent_max = mean over absent frames of the highest peak
+    score (empty frames count as 0, i.e. nothing emitted)."""
+    pres = [r for r in rows if r.get("present")]
+    absn = [r for r in rows if not r.get("present", True)]
+    out = {
+        "top1_hit": float(np.mean([r["top1_hit"] for r in pres])) if pres else float("nan"),
+        "margin": float(np.mean([r["margin"] for r in pres])) if pres else float("nan"),
+        "present_empty": float(np.mean([r["empty"] for r in pres])) if pres else float("nan"),
+        "absent_empty": float(np.mean([r["empty"] for r in absn])) if absn else float("nan"),
+        "absent_max": float(np.mean([max(r["max_score"], 0.0) for r in absn])) if absn else float("nan"),
+    }
+    return out
 
 
 def run_epoch(model, loader, criterion, optimizer, args, image_size, device, train: bool):
@@ -116,6 +172,7 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
 
     set_train_mode(model, train)
     total_loss, n_present, n_absent, n_samples = 0.0, 0, 0, 0
+    frame_stats: list[dict] = []
     # Track B (docs/GECO2_scale_domain_gap_plan.md): model.scale_fusion_gates
     # only exists when build_training_model was called with
     # num_ref_scale_variants > 1 (see main() below) -- gated on the SAME
@@ -163,10 +220,17 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
                 _, gt_box_canvas, _ = convert_gt_box_to_canvas(sample.frame_bgr, sample.gt_box, image_size)
                 target_boxes = build_targets(gt_box_canvas, image_size).to(device)
 
+                step_stats: dict = {}
                 loss = compute_step_loss(
                     criterion, out, target_boxes, args.aux_weight, image_size,
                     aux_size_threshold_px=args.aux_size_threshold_px,
+                    opts=loss_opts_from_args(args), stats=step_stats,
                 )
+                frame_stats.append(step_stats)
+                if train and hasattr(loader.dataset, "record_hardness"):
+                    hardness = step_stats.get("hardness") if step_stats.get("present") else step_stats.get("max_score")
+                    if hardness is not None and np.isfinite(hardness):
+                        loader.dataset.record_hardness(sample.video_id, sample.frame_idx, sample.is_present, float(hardness))
                 # Opt-in (default weight 0.0 = no effect): pulls scale-
                 # variant appearance tokens of the SAME reference image
                 # toward each other BEFORE the gate -- see
@@ -191,7 +255,7 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
             total_loss += float(batch_loss.item())
 
     mean_loss = total_loss / max(1, n_samples)
-    return mean_loss, n_present, n_absent
+    return mean_loss, n_present, n_absent, summarize_frame_stats(frame_stats)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -216,6 +280,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "signal on most AERO EYES objects (typically 20-150px) -- try e.g. 100-150 "
                          "if the aux head appears under-trained.")
     p.add_argument("--p-present", type=float, default=0.5)
+    # ---- opt-in loss variants (aero_eyes/models/geco2_loss_extras.py); all default to the stock loss ----
+    p.add_argument("--giou-weight", type=float, default=1.0,
+                    help="Weight on the GIoU box term (main+aux). SetCriterion's weight_dict says 2.0 but "
+                         "compute_step_loss never applied it; 1.0 = stock behaviour, 2.0 = original intent.")
+    p.add_argument("--group-norm-ce", action="store_true",
+                    help="Centerness MSE = mean over positives + mean over negatives (stock: SUM over "
+                         "all peaks / #GT, so dozens of 0-targets swamp the single 1-target and a lower "
+                         "--p-present collapses the whole score map to <=0).")
+    p.add_argument("--mask-gt-peaks", action="store_true",
+                    help="Unmatched peaks whose centre lies inside the GT box are ignored instead of "
+                         "being pushed to 0 (NMS merges duplicates at inference anyway).")
+    p.add_argument("--tp-target-iou-floor", type=float, default=None,
+                    help="If set, the matched peak's centerness target is max(IoU(pred,gt).detach(), floor) "
+                         "instead of 1, so a high score means a TIGHT box (e.g. 0.3).")
+    p.add_argument("--multi-peak-box", type=float, default=0.0,
+                    help="If >0, also train the box head on every unmatched peak whose centre lies in the "
+                         "central this-fraction of the GT box (e.g. 0.5), not just the 1 matched peak.")
+    p.add_argument("--rank-weight", type=float, default=0.0,
+                    help="In-frame ranking loss weight: relu(margin + s_FP - s_TP) over the hardest FP peaks. "
+                         "Enforces TP > FP without dragging absolute scores to 0; independent of p_present.")
+    p.add_argument("--rank-margin", type=float, default=0.2)
+    p.add_argument("--rank-topk", type=int, default=3, help="Number of hardest FP peaks in the ranking loss.")
+    p.add_argument("--pos-weight", type=float, default=0.0,
+                    help="Weight of relu(pos_margin - s_TP): keeps TP scores high no matter how many "
+                         "absent frames are sampled (prevents the empty-map collapse).")
+    p.add_argument("--pos-margin", type=float, default=0.5)
+    p.add_argument("--absent-topk", type=int, default=0,
+                    help="If >0, absent frames penalise only their k highest peaks (squared hinge above "
+                         "--absent-ceiling) instead of squashing every peak to 0.")
+    p.add_argument("--absent-ceiling", type=float, default=0.0)
+    p.add_argument("--absent-weight", type=float, default=1.0)
+    p.add_argument("--hard-frame-frac", type=float, default=0.0,
+                    help="Hard-frame mining: with this probability a train frame is drawn from the "
+                         "--hard-frame-top frames (of the wanted present/absent kind, per video) that "
+                         "scored worst in earlier epochs (absent: highest peak score; present: smallest "
+                         "TP-vs-clutter margin). Keeps --p-present unchanged. 0 = uniform (stock).")
+    p.add_argument("--hard-frame-top", type=int, default=50)
+    p.add_argument("--select-by", choices=["val_loss", "top1_hit", "margin"], default="val_loss",
+                    help="Validation metric that picks the saved checkpoint. top1_hit = share of present "
+                         "val frames whose highest-scoring peak has IoU>=0.5; margin = mean(best good peak "
+                         "- highest clutter peak). Both are logged every epoch regardless.")
     p.add_argument("--ref-downscale-lo", type=float, default=0.03)
     p.add_argument("--ref-downscale-hi", type=float, default=1.0)
     p.add_argument("--brightness-lo", type=float, default=0.0)
@@ -379,6 +484,7 @@ def main():
         max_dynamic_exemplars=args.max_dynamic_exemplars,
         dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
         num_ref_scale_variants=args.num_ref_scale_variants,
+        hard_frame_frac=args.hard_frame_frac, hard_frame_top=args.hard_frame_top,
         seed=args.seed,
     )
     val_ds = Geco2FinetuneDataset(
@@ -420,7 +526,7 @@ def main():
     if args.dry_run:
         log.info("--- DRY RUN: %d step(s), no checkpoint will be saved ---", args.dry_run_steps)
         t0 = time.time()
-        mean_loss, n_present, n_absent = run_epoch(
+        mean_loss, n_present, n_absent, _ = run_epoch(
             model, train_loader, criterion, optimizer, args, image_size, device, train=True,
         )
         assert np.isfinite(mean_loss), f"dry run produced a non-finite loss: {mean_loss}"
@@ -434,12 +540,20 @@ def main():
 
     for epoch in range(args.epochs):
         t0 = time.time()
-        train_loss, train_present, train_absent = run_epoch(
+        train_loss, train_present, train_absent, _ = run_epoch(
             model, train_loader, criterion, optimizer, args, image_size, device, train=True,
         )
-        val_loss, val_present, val_absent = run_epoch(
+        val_loss, val_present, val_absent, val_stats = run_epoch(
             model, val_loader, criterion, optimizer, args, image_size, device, train=False,
         )
+        log.info(
+            "  val detection: top1_hit=%.3f margin=%.3f present_empty=%.3f absent_empty=%.3f absent_max=%.3f",
+            val_stats["top1_hit"], val_stats["margin"], val_stats["present_empty"],
+            val_stats["absent_empty"], val_stats["absent_max"],
+        )
+        select_value = val_loss if args.select_by == "val_loss" else -val_stats[args.select_by]
+        if not np.isfinite(select_value):
+            select_value = float("inf")
         lr_before = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
         lr_after = optimizer.param_groups[0]["lr"]
@@ -453,22 +567,24 @@ def main():
             log.info("LR decayed: %.2e -> %.2e (val_loss plateaued for %d epochs)",
                       lr_before, lr_after, args.lr_patience)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if select_value < best_val_loss:
+            best_val_loss = select_value
             epochs_without_improvement = 0
             out_checkpoint.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
-                {"epoch": epoch, "model": model.state_dict(), "val_loss": val_loss, "args": vars(args)},
+                {"epoch": epoch, "model": model.state_dict(), "val_loss": val_loss,
+                 "val_stats": val_stats, "args": vars(args)},
                 out_checkpoint,
             )
-            log.info("Saved new best checkpoint (val_loss=%.4f) -> %s", val_loss, out_checkpoint)
+            log.info("Saved new best checkpoint (%s=%.4f, val_loss=%.4f) -> %s",
+                     args.select_by, abs(select_value), val_loss, out_checkpoint)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.early_stop_patience:
                 log.info("Early stopping: no val improvement for %d epoch(s)", epochs_without_improvement)
                 break
 
-    log.info("Training done. Best val_loss=%.4f, checkpoint at %s", best_val_loss, out_checkpoint)
+    log.info("Training done. Best %s=%.4f, checkpoint at %s", args.select_by, abs(best_val_loss), out_checkpoint)
 
 
 if __name__ == "__main__":

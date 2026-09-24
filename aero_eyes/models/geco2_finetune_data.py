@@ -387,6 +387,8 @@ class Geco2FinetuneDataset(Dataset):
         dynamic_exemplar_box_jitter: float = 0.0,
         num_ref_scale_variants: int = 1,
         seed: int | None = None,
+        hard_frame_frac: float = 0.0,
+        hard_frame_top: int = 50,
     ):
         if not video_ids:
             raise ValueError("video_ids must be non-empty")
@@ -466,6 +468,14 @@ class Geco2FinetuneDataset(Dataset):
         # concatenation left open (see that config field's own docstring in
         # aero_eyes/config.py).
         self.num_ref_scale_variants = num_ref_scale_variants
+        # Opt-in hard-frame mining (0 = uniform, unchanged): the training loop
+        # reports a per-frame hardness via record_hardness(); with probability
+        # hard_frame_frac the frame is drawn from the hard_frame_top hardest
+        # frames recorded so far for that video and present/absent kind.
+        self.hard_frame_frac = hard_frame_frac
+        self.hard_frame_top = hard_frame_top
+        self._hardness: dict[tuple[str, bool], dict[int, float]] = {}
+        self.hard_count = 0
         self.rng = np.random.default_rng(seed)
 
         self._gt: dict[str, dict[int, Box]] = {}
@@ -488,9 +498,25 @@ class Geco2FinetuneDataset(Dataset):
     def __len__(self) -> int:
         return self.steps_per_epoch
 
+    def record_hardness(self, video_id: str, frame_idx: int, is_present: bool, value: float) -> None:
+        """Latest hardness of a frame (higher = harder); only used when hard_frame_frac > 0."""
+        self._hardness.setdefault((video_id, is_present), {})[int(frame_idx)] = float(value)
+
+    def _pick_hard(self, video_id: str, is_present: bool) -> int | None:
+        seen = self._hardness.get((video_id, is_present))
+        if not seen or self.rng.random() >= self.hard_frame_frac:
+            return None
+        top = sorted(seen, key=seen.get, reverse=True)[: max(1, self.hard_frame_top)]
+        self.hard_count += 1
+        return int(self.rng.choice(top))
+
     def _sample_frame(self, video_id: str) -> tuple[int, bool]:
         present, absent, _total = self._pools[video_id]
         want_present = self.rng.random() < self.p_present
+        if self.hard_frame_frac > 0 and (present if want_present else absent):
+            hard = self._pick_hard(video_id, want_present)
+            if hard is not None:
+                return hard, want_present
         if want_present and present:
             return int(self.rng.choice(present)), True
         if not want_present and absent:
