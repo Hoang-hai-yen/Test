@@ -201,3 +201,15 @@ def test_run_training_needs_two_objects(tmp_path):
     rng = np.random.default_rng(0)
     with pytest.raises(ValueError, match="at least 2 objects"):
         run_training(_FakeExt(), [_video("A_0", "A", (220, 30, 30), rng)], [], _args(tmp_path))
+
+
+def test_jitter_box_stays_a_correct_but_imperfect_detection():
+    from aero_eyes.utils.geometry import box_iou
+    from scripts.train_lora_dinov3 import jitter_box
+
+    rng = np.random.default_rng(0)
+    gt = Box(100, 100, 200, 180)
+    jittered = [jitter_box(gt, rng, min_iou=0.5) for _ in range(50)]
+    assert all(b is not None and box_iou(b, gt) >= 0.5 for b in jittered)
+    assert any(b.x1 != gt.x1 or b.y2 != gt.y2 for b in jittered)      # actually perturbed
+    assert jitter_box(gt, rng, min_iou=1.01) is None                   # impossible constraint

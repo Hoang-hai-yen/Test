@@ -626,9 +626,21 @@ class DINOv3FeatureExtractor:
                     "target transformers' DINOv3ViT module names (layer.<i>.attention.q_proj...), "
                     "which the raw kaggle/torch.hub model does not have."
                 )
-            from aero_eyes.models.lora import load_lora
+            from aero_eyes.models.lora import config_mismatches, load_lora
             meta = load_lora(self.model, lora_weights_path)
             log.info("DINOv3: loaded LoRA weights %s (%s)", lora_weights_path, meta)
+            running = {
+                "preprocess_mode": self.preprocess_mode,
+                "candidate_preprocess_mode": self.candidate_preprocess_mode,
+                "image_size": self.image_size, "variant": self.variant,
+                "pretrain_dataset": self.pretrain_dataset,
+            }
+            for diff in config_mismatches(meta.get("train_config", {}), running):
+                log.warning(
+                    "LoRA %s was trained under different settings -- %s. The adapters were fit to "
+                    "that preprocessing, so results may degrade; retrain or match the setting.",
+                    lora_weights_path, diff,
+                )
         if pooling == "multiscale_attn":
             self._scale_layers = _select_multiscale_layers(self.model.config.num_hidden_layers)
         log.info(

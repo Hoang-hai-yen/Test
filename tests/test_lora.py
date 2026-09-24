@@ -117,3 +117,25 @@ def test_loralinear_keeps_base_frozen():
     base = nn.Linear(4, 4)
     l = LoRALinear(base, rank=2, alpha=4)
     assert not base.weight.requires_grad and l.lora_A.requires_grad and l.lora_B.requires_grad
+
+
+def test_train_config_roundtrips_and_mismatches_are_reported(tmp_path):
+    from aero_eyes.models.lora import config_mismatches
+
+    m = _model()
+    apply_lora(m, rank=2)
+    save_lora(m, tmp_path / "l.pt", {"preprocess_mode": "stretch", "image_size": 224})
+    meta = load_lora(_model(), tmp_path / "l.pt")
+    assert meta["train_config"] == {"preprocess_mode": "stretch", "image_size": 224}
+
+    running = {"preprocess_mode": "pad_to_square", "image_size": 224, "unrelated": 1}
+    diffs = config_mismatches(meta["train_config"], running)
+    assert len(diffs) == 1 and "preprocess_mode" in diffs[0]
+    assert config_mismatches({}, running) == []          # old checkpoint without a config: no warnings
+
+
+def test_checkpoint_without_train_config_still_loads(tmp_path):
+    m = _model()
+    apply_lora(m, rank=2)
+    save_lora(m, tmp_path / "l.pt")
+    assert load_lora(_model(), tmp_path / "l.pt")["train_config"] == {}

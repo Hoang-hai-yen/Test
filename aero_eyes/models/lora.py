@@ -87,15 +87,29 @@ def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [p for n, p in model.named_parameters() if n.endswith(("lora_A", "lora_B"))]
 
 
-def save_lora(model: nn.Module, path: str | Path) -> None:
+def save_lora(model: nn.Module, path: str | Path, train_config: dict | None = None) -> None:
+    """train_config: plain-primitive settings the adapters were trained under
+    (preprocess modes, image size, ...), stored so a later run can warn when
+    it is not running with the same preprocessing (see config_mismatches)."""
     state = {n: p.detach().cpu() for n, p in model.named_parameters() if n.endswith(("lora_A", "lora_B"))}
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"meta": model._lora_meta, "state": state}, str(path))
+    torch.save(
+        {"meta": model._lora_meta, "state": state, "train_config": dict(train_config or {})}, str(path),
+    )
+
+
+def config_mismatches(saved: dict, current: dict) -> list[str]:
+    """Human-readable differences for every key present in BOTH dicts."""
+    return [
+        f"{k}: trained with {saved[k]!r}, running with {current[k]!r}"
+        for k in saved if k in current and saved[k] != current[k]
+    ]
 
 
 def load_lora(model: nn.Module, path: str | Path) -> dict:
     """Wrap `model` per the checkpoint's own metadata (if it isn't wrapped
-    yet), then load the saved A/B matrices. Returns the metadata."""
+    yet), then load the saved A/B matrices. Returns the metadata plus the
+    checkpoint's "train_config" (empty for checkpoints saved without one)."""
     ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     meta = ckpt["meta"]
     if not hasattr(model, "_lora_meta"):
@@ -112,4 +126,4 @@ def load_lora(model: nn.Module, path: str | Path) -> dict:
     with torch.no_grad():
         for n, p in params.items():
             p.copy_(ckpt["state"][n].to(p.device, p.dtype))
-    return meta
+    return {**meta, "train_config": ckpt.get("train_config", {})}

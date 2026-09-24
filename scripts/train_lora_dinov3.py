@@ -129,6 +129,25 @@ def random_subsample(items: list, n: int, rng: np.random.Generator) -> list:
     return [items[i] for i in sorted(rng.choice(len(items), size=n, replace=False).tolist())]
 
 
+def jitter_box(box, rng: np.random.Generator, min_iou: float, tries: int = 20):
+    """A loosened/shifted copy of a GT box (each side scaled 0.8-1.3x, center
+    moved up to 15% of the box size), kept only if it still overlaps the GT
+    with IoU >= min_iou -- i.e. an imperfect-but-still-correct detection.
+    None if no draw qualifies."""
+    from aero_eyes.types import Box
+    from aero_eyes.utils.geometry import box_iou
+
+    w, h = box.x2 - box.x1, box.y2 - box.y1
+    cx, cy = (box.x1 + box.x2) / 2, (box.y1 + box.y2) / 2
+    for _ in range(tries):
+        nw, nh = w * rng.uniform(0.8, 1.3), h * rng.uniform(0.8, 1.3)
+        ncx, ncy = cx + rng.uniform(-0.15, 0.15) * w, cy + rng.uniform(-0.15, 0.15) * h
+        cand = Box(ncx - nw / 2, ncy - nh / 2, ncx + nw / 2, ncy + nh / 2)
+        if box_iou(cand, box) >= min_iou:
+            return cand
+    return None
+
+
 def prototype_bg_loss(
     crop_emb: torch.Tensor, labels: torch.Tensor, protos: torch.Tensor,
     bg_logit: torch.Tensor, tau: float,
@@ -258,6 +277,11 @@ def build_video_data(cfg, vid: str, args, rng: np.random.Generator) -> VideoData
     gt = load_gt(args.annotations, vid)
     gt_frames = sorted(gt)
     pos_items = [(f, gt[f]) for f in even_subsample(gt_frames, args.max_pos)]
+    for f, b in list(pos_items):
+        for _ in range(getattr(args, "jitter_copies", 0)):
+            jb = jitter_box(b, rng, args.pos_iou_min)
+            if jb is not None:
+                pos_items.append((f, jb))
     neg_items: list = []
     cand_path = Path(cfg.project.work_dir) / vid / "candidates.json"
     if cand_path.exists():
@@ -387,6 +411,15 @@ def run_training(ext, train_data: list[VideoData], val_data: list[VideoData], ar
     opt = torch.optim.AdamW(params + [bg_logit], lr=args.lr, weight_decay=args.weight_decay)
     log.info("Trainable: %d LoRA params tensors, %d values.", len(params), sum(p.numel() for p in params))
 
+    # Stored in the checkpoint; DINOv3FeatureExtractor warns at load when the
+    # running preprocessing differs from what the adapters were trained under.
+    train_config = {
+        k: getattr(ext, k, None)
+        for k in ("preprocess_mode", "candidate_preprocess_mode", "image_size", "variant", "pretrain_dataset")
+    }
+    train_config.update(getattr(args, "extra_meta", None) or {})
+    log.info("Training under: %s", train_config)
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     history = []
@@ -414,11 +447,11 @@ def run_training(ext, train_data: list[VideoData], val_data: list[VideoData], ar
             msg += f" | val mean AUROC {ev['mean_auroc']:.4f}"
             if ev["mean_auroc"] > best:
                 best = ev["mean_auroc"]
-                save_lora(ext.model, out_dir / "lora_best.pt")
+                save_lora(ext.model, out_dir / "lora_best.pt", train_config)
                 msg += "  (best, saved)"
         log.info(msg)
         history.append(rec)
-        save_lora(ext.model, out_dir / "lora_last.pt")
+        save_lora(ext.model, out_dir / "lora_last.pt", train_config)
     (out_dir / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     return {"history": history, "best_val_auroc": best}
 
@@ -447,6 +480,8 @@ def main():
     p.add_argument("--neg-per-object", type=int, default=8)
     p.add_argument("--max-pos", type=int, default=300, help="GT crops kept per video")
     p.add_argument("--max-neg", type=int, default=600, help="negative crops kept per video")
+    p.add_argument("--jitter-copies", type=int, default=0,
+                   help="extra loosened/shifted copies of each sampled GT box added as positives (imperfect crops)")
     p.add_argument("--neg-iou-max", type=float, default=0.1)
     p.add_argument("--pos-iou-min", type=float, default=0.6)
     p.add_argument("--ref-factors", default="1.0", help="extra ref downscale factors sampled in training, e.g. 1.0,0.3")
@@ -494,6 +529,14 @@ def main():
         log.warning("--val-suffix shares objects between train and val: measures same-object/new-video "
                     "generalization only, not new objects.")
     log.info("train videos: %s | val videos: %s", train_ids, val_ids)
+    sim = cfg.stage1.aerial_sim
+    args.extra_meta = {  # informational (the extractor only compares the keys it knows)
+        "segmentation_enabled": cfg.stage1.segmentation.enabled,
+        "crop_to_object": cfg.stage1.crop_to_object,
+        "aerial_sim_downscale": sim.downscale_factor if sim.enabled else None,
+        "feature_crop_pad": cfg.stage2.candidate.feature_crop_pad,
+        "raw_refs": args.raw_refs,
+    }
 
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
