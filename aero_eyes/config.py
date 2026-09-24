@@ -997,6 +997,42 @@ class MarginVerificationConfig(BaseModel):
     tau_margin: float = 0.05
 
 
+class IsolatedDetectionFilterConfig(BaseModel):
+    """Drops keyframes whose detection is temporally ISOLATED -- no other
+    detection-bearing keyframe within max_gap_intervals * keyframe_interval
+    frames on either side. A real object usually shows up on several
+    neighbouring keyframes; a lone hit far from every other one is far more
+    likely a spurious match.
+
+    Example, keyframe_interval=8: with max_gap_intervals=2 the tolerated gap
+    is 16 frames, so detections at frames 0 and 15 support each other (kept),
+    while detections at 0 and 40 do not (both dropped, unless another
+    keyframe sits within 16 frames of them).
+
+    keep_conf_threshold: an isolated keyframe whose best detection score
+    (similarity) is >= this is still kept -- a very confident lone hit is
+    trusted. None = no exemption. The score scale depends on the detector
+    (cosine similarity for stage3, GeCo2's own score for stage123_geco2), so
+    calibrate it per stage.
+
+    Only ever REJECTS detections an earlier stage already accepted (never
+    adds recall back); a genuinely brief appearance (< 2 keyframes) will be
+    lost unless it clears keep_conf_threshold. NOT YET VALIDATED.
+    """
+    enabled: bool = False
+    max_gap_intervals: int = 2
+    keep_conf_threshold: float | None = None
+    # "offline": looks at the whole video's detections at once. "online":
+    # causal delayed decision (IsolatedKeyframeGate) -- a keyframe is only
+    # decided once the next detection arrives or max_gap frames pass with
+    # none, so it never uses information from beyond that delay. Produces the
+    # SAME final result as offline; it exists so a streaming consumer can use
+    # the gate directly (push()/advance()/flush()) with bounded latency of
+    # max_gap_intervals * keyframe_interval frames. In this batch pipeline
+    # the two modes are interchangeable.
+    mode: Literal["offline", "online"] = "offline"
+
+
 class OnlineFDRConfig(BaseModel):
     """SAFFRON (Ramdas, Zrnic, Wainwright, Jordan, PMLR v80 / ICML 2018,
     arXiv:1802.09098 -- docs/1802.09098v2.pdf, read directly), as an
@@ -1428,6 +1464,8 @@ class Stage3Config(BaseModel):
     cluster_secondary_filter: ClusterSecondaryFilterConfig = ClusterSecondaryFilterConfig()
     # Margin-over-runner-up (WildFusion-style) -- see MarginVerificationConfig.
     margin_verification: MarginVerificationConfig = MarginVerificationConfig()
+    # Drops temporally isolated keyframe detections -- see IsolatedDetectionFilterConfig.
+    isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
     # KeepTrack-style multi-candidate identity tracking -- see IdentityChainFilterConfig.
     identity_chain_filter: IdentityChainFilterConfig = IdentityChainFilterConfig()
     # Hard-negative "negative prototype" filter -- see NegativePrototypeFilterConfig.
@@ -2882,6 +2920,11 @@ class Stage123Geco2Config(BaseModel):
     kernel_dim: int = 3
     reduction: int = 16
     keyframe_interval: int = 8
+    # Drops temporally isolated keyframe detections (score = GeCo2's own
+    # score) -- see IsolatedDetectionFilterConfig. Applied to the final
+    # detections of the default (non cosine_rescore) path; with
+    # cosine_rescore the equivalent filter is stage3.isolated_detection_filter.
+    isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
     # Per-frame relative threshold: keep detections with score >
     # box_v.max() * score_threshold_ratio (GeCo2's own score scale is not
     # comparable across frames, so this can't be a fixed absolute cutoff

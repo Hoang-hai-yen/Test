@@ -950,6 +950,23 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
     # stage123_geco2.score_threshold_ratio directly instead of this field
     # either way, so recording effective_threshold here is informational
     # only (for inspecting detections.json), not consumed downstream.
+    idf_cfg = cfg.stage123_geco2.isolated_detection_filter
+    if idf_cfg.enabled:
+        from aero_eyes.stages.stage3 import find_isolated_keyframes
+        isolated = find_isolated_keyframes(
+            {fi: max(d.similarity for d in dets) for fi, dets in detections.items() if dets},
+            cfg.stage123_geco2.keyframe_interval, idf_cfg,
+        )
+        for fi in isolated:
+            detections[fi] = []
+        if isolated:
+            log.info(
+                "[Stage123-GeCo2] %s: isolated_detection_filter (max_gap=%d x %d frames, "
+                "keep_conf_threshold=%s) dropped %d isolated keyframe(s): %s",
+                sample_id, idf_cfg.max_gap_intervals, cfg.stage123_geco2.keyframe_interval,
+                idf_cfg.keep_conf_threshold, len(isolated), sorted(isolated),
+            )
+
     write_detections(detections, det_path, threshold=effective_threshold)
     detector.log_peak_contrast_summary(sample_id)
 

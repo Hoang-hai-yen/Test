@@ -748,6 +748,83 @@ def apply_identity_chain_filter(
     return new_keep_mask, len(finished_chains), n_chains_kept
 
 
+class IsolatedKeyframeGate:
+    """Causal (streaming) form of IsolatedDetectionFilterConfig: delayed
+    decision. Feed detection-bearing keyframes in increasing frame order via
+    push(); each call returns the (frame, keep) decisions that just became
+    final. A keyframe f is decided when the NEXT detection g arrives
+    (near_next = g - f <= max_gap) or when advance(t) reports t - f > max_gap
+    with no detection since (call it for every processed keyframe, detection
+    or not, so a lone keyframe is released after max_gap frames instead of
+    waiting for the next hit), or at flush() (end of stream). Decisions come
+    out in frame order; latency is at most max_gap frames.
+    """
+
+    def __init__(self, keyframe_interval: int, cfg):
+        self.max_gap = cfg.max_gap_intervals * keyframe_interval
+        self.keep_conf = cfg.keep_conf_threshold
+        self._last: int | None = None          # last pushed detection frame
+        self._pending: tuple[int, float, bool] | None = None  # (frame, score, near_prev)
+
+    def _decide(self, near_next: bool) -> tuple[int, bool]:
+        fi, score, near_prev = self._pending
+        self._pending = None
+        keep = near_prev or near_next or (self.keep_conf is not None and score >= self.keep_conf)
+        return fi, keep
+
+    def push(self, frame: int, score: float) -> list[tuple[int, bool]]:
+        out = []
+        near_prev = self._last is not None and frame - self._last <= self.max_gap
+        if self._pending is not None:
+            out.append(self._decide(near_next=near_prev))
+        self._pending = (frame, score, near_prev)
+        self._last = frame
+        return out
+
+    def advance(self, current_frame: int) -> list[tuple[int, bool]]:
+        if self._pending is not None and current_frame - self._pending[0] > self.max_gap:
+            return [self._decide(near_next=False)]
+        return []
+
+    def flush(self) -> list[tuple[int, bool]]:
+        return [self._decide(near_next=False)] if self._pending is not None else []
+
+
+def find_isolated_keyframes(
+    frame_scores: dict[int, float],
+    keyframe_interval: int,
+    cfg,
+) -> set[int]:
+    """Frames (keys of frame_scores) to drop under IsolatedDetectionFilterConfig.
+
+    frame_scores maps each detection-bearing keyframe to its best score. A
+    keyframe is supported iff another one lies within
+    cfg.max_gap_intervals * keyframe_interval frames; an unsupported
+    keyframe is still kept if its score >= cfg.keep_conf_threshold. Support
+    is judged against the ORIGINAL set (not iteratively), so two mutually
+    supporting keyframes never knock each other out.
+    """
+    max_gap = cfg.max_gap_intervals * keyframe_interval
+    frames = sorted(frame_scores)
+    if getattr(cfg, "mode", "offline") == "online":
+        gate = IsolatedKeyframeGate(keyframe_interval, cfg)
+        decisions = []
+        for fi in frames:
+            decisions.extend(gate.push(fi, frame_scores[fi]))
+        decisions.extend(gate.flush())
+        return {fi for fi, keep in decisions if not keep}
+    isolated: set[int] = set()
+    for k, fi in enumerate(frames):
+        near_prev = k > 0 and fi - frames[k - 1] <= max_gap
+        near_next = k + 1 < len(frames) and frames[k + 1] - fi <= max_gap
+        if near_prev or near_next:
+            continue
+        if cfg.keep_conf_threshold is not None and frame_scores[fi] >= cfg.keep_conf_threshold:
+            continue
+        isolated.add(fi)
+    return isolated
+
+
 def run_stage3(cfg, sample_id: str) -> Path:
     """Run Stage 3 for the given sample. Returns path to detections.json."""
     from aero_eyes.stages.stage2 import read_candidates_with_features
@@ -1625,6 +1702,30 @@ def run_stage3(cfg, sample_id: str) -> Path:
         # Keep `selected` consistent with the pruned frame_groups -- used
         # below for sample_reference_size.
         selected = [(fi, d, s) for fi, pairs in frame_groups.items() for d, s in pairs]
+
+    # ---- Isolated-detection filter (opt-in) ----
+    # Drops keyframes with no other detection-bearing keyframe within
+    # max_gap_intervals * keyframe_interval frames (unless confident enough).
+    idf_cfg = s3.isolated_detection_filter
+    if idf_cfg.enabled and frame_groups:
+        kf_interval = (
+            cfg.stage123_geco2.keyframe_interval
+            if cfg.pipeline.detector == "geco2" else cfg.stage2.keyframe_interval
+        )
+        isolated = find_isolated_keyframes(
+            {fi: max(s for _, s in pairs) for fi, pairs in frame_groups.items()},
+            kf_interval, idf_cfg,
+        )
+        for fi in isolated:
+            del frame_groups[fi]
+        if isolated:
+            log.info(
+                "[Stage3] %s: isolated_detection_filter (max_gap=%d x %d frames, "
+                "keep_conf_threshold=%s) dropped %d isolated keyframe(s): %s",
+                sample_id, idf_cfg.max_gap_intervals, kf_interval,
+                idf_cfg.keep_conf_threshold, len(isolated), sorted(isolated),
+            )
+            selected = [(fi, d, s) for fi, pairs in frame_groups.items() for d, s in pairs]
 
     # box_refine.adaptive_context_margin.relative_to_sample_median: this
     # SAME object's own typical box size across every OTHER threshold-

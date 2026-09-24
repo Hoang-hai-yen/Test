@@ -805,6 +805,18 @@ stage3:
   margin_verification:
     enabled: false
     tau_margin: 0.05
+  # Drops temporally ISOLATED keyframe detections: a keyframe is kept only
+  # if another detection-bearing keyframe lies within max_gap_intervals *
+  # keyframe_interval frames of it. E.g. keyframe_interval=8,
+  # max_gap_intervals=2 -> tolerated gap 16 frames: frames 0 & 15 keep each
+  # other, frames 0 & 40 are both dropped. An isolated keyframe whose best
+  # similarity >= keep_conf_threshold is still kept (null = no exemption).
+  # Can only REJECT, never add recall. NOT YET VALIDATED.
+  isolated_detection_filter:
+    enabled: false
+    max_gap_intervals: 2
+    keep_conf_threshold: null
+    mode: offline              # "online" = causal delayed-decision gate (same result, bounded latency)
   # KeepTrack-style (arXiv:2103.16556, docs/GECO2_precision_improvements_
   # plan.md Phase 3 item 6) multi-candidate identity tracking across
   # keyframes -- an alternative/additional precision filter to
@@ -950,6 +962,14 @@ stage123_geco2:
   kernel_dim: 3
   reduction: 16
   keyframe_interval: 8       # same meaning as stage2.keyframe_interval
+  # Same filter as stage3.isolated_detection_filter, applied to this stage's
+  # final detections (default, non-cosine_rescore path). keep_conf_threshold
+  # is on GeCo2's OWN score scale here, not cosine similarity.
+  isolated_detection_filter:
+    enabled: false
+    max_gap_intervals: 2
+    keep_conf_threshold: null
+    mode: offline              # "online" = causal delayed-decision gate (same result, bounded latency)
   # Per-frame relative threshold: keep detections with score >
   # box_v.max() * score_threshold_ratio. GeCo2's raw score is not
   # comparable across frames/videos, so (unlike stage3.match_threshold)
