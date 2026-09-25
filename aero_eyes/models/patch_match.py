@@ -87,12 +87,27 @@ class PatchMatcher:
         self.cfg = pm_cfg
         self.n_layers = self.model.config.num_hidden_layers
         self._refs: list[torch.Tensor] = []
+        # MaskedCropFeatureExtractor to background-mask candidate crops with
+        # (set by from_cfg when candidate_background_masking is enabled).
+        self.candidate_masker = None
 
     @classmethod
     def from_cfg(cls, cfg) -> "PatchMatcher":
-        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.models.features import MaskedCropFeatureExtractor, build_feature_extractor
 
-        return cls(_unwrap_dinov3(build_feature_extractor(cfg)), cfg.stage3.patch_matching)
+        extractor = build_feature_extractor(cfg)
+        matcher = cls(_unwrap_dinov3(extractor), cfg.stage3.patch_matching)
+        # stage1.feature_extractor.candidate_background_masking wraps the
+        # extractor; unwrapping it for the DINOv3 backbone above would
+        # silently drop that masking, so carry the wrapper over and apply it
+        # to the candidate crops we encode ourselves.
+        seen = extractor
+        while seen is not None and not isinstance(seen, MaskedCropFeatureExtractor):
+            seen = getattr(seen, "base", None)
+        matcher.candidate_masker = seen
+        if seen is not None:
+            log.info("patch_matching: candidate crops are background-masked (candidate_background_masking)")
+        return matcher
 
     # -- encoding -----------------------------------------------------------
 
@@ -150,6 +165,8 @@ class PatchMatcher:
         set_references()."""
         out = np.zeros((len(crops_bgr), len(self._refs)), dtype=np.float32)
         for i, crop in enumerate(crops_bgr):
+            if self.candidate_masker is not None:
+                crop = self.candidate_masker.mask_crop(crop)
             cand = self.encode(crop)
             for r, ref in enumerate(self._refs):
                 out[i, r] = self.score_pair(ref, cand)
@@ -172,7 +189,20 @@ def score_candidates(cfg, sample_id: str, video_path: Path, frame_idxs: list[int
     )[: cfg.data.num_references]
     if not ref_paths:
         raise FileNotFoundError(f"stage3.patch_matching: no reference images found in {refs_dir}")
-    matcher.set_references([cv2.imread(str(p)) for p in ref_paths])
+    ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
+    if cfg.stage3.patch_matching.reuse_stage1_ref_processing:
+        from aero_eyes.models.segmentation import build_segmenter
+        from aero_eyes.stages.stage1 import prepare_reference_images
+
+        seg_cfg = cfg.stage1.segmentation
+        segmenter = build_segmenter(seg_cfg, cfg) if seg_cfg.enabled else None
+        ref_imgs, _, _ = prepare_reference_images(cfg, sample_id, ref_imgs, segmenter)
+        log.info(
+            "[Stage3] %s: patch_matching applied stage1 ref processing (segmentation=%s, "
+            "background_mode=%s, crop_to_object=%s)", sample_id, seg_cfg.enabled,
+            seg_cfg.background_mode, cfg.stage1.crop_to_object,
+        )
+    matcher.set_references(ref_imgs)
 
     by_frame: dict[int, list[int]] = defaultdict(list)
     for i, fi in enumerate(frame_idxs):

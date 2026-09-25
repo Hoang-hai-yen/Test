@@ -1258,6 +1258,16 @@ class PatchMatchingConfig(BaseModel):
     # cosine (and the same view a LoRA was trained under). long_side and
     # keep_aspect are IGNORED when true.
     reuse_cls_preprocess: bool = False
+    # true: run each reference image through Stage 1's own reference
+    # preprocessing before patch encoding -- stage1.segmentation (foreground
+    # mask), background_mode (mean_fill/keep_real/blur) and crop_to_object /
+    # crop_context_margin -- so background clutter in the reference photo
+    # doesn't leak into its patch set. (stage1.aerial_sim, degradation and
+    # synthetic views are NOT applied.) Refs only: candidate crops are
+    # background-masked iff stage1.feature_extractor.candidate_background_
+    # masking.enabled (followed automatically), otherwise encoded as-is.
+    # false (default): raw reference images.
+    reuse_stage1_ref_processing: bool = False
 
 
 class Stage3Config(BaseModel):

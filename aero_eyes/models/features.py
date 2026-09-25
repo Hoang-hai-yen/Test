@@ -1569,18 +1569,22 @@ class MaskedCropFeatureExtractor:
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
             return np.zeros((0, self._dim()), dtype=np.float32)
+        masked_crops = [self.mask_crop(crop_with_pad(frame_bgr, b, pad_ratio)) for b in boxes]
+        return self.base.extract(masked_crops, batch_size)
+
+    def mask_crop(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Background-mask one already-cropped candidate; falls back to the
+        unmasked crop on any segmentation failure (see class docstring).
+        Public so patch matching (aero_eyes.models.patch_match) can apply the
+        identical masking to the crops it encodes itself."""
         from aero_eyes.utils.geometry import apply_background_mode
 
-        masked_crops = []
-        for b in boxes:
-            crop = crop_with_pad(frame_bgr, b, pad_ratio)
-            try:
-                mask = self.segmenter.segment(crop)
-                masked_crops.append(apply_background_mode(crop, mask, self.background_mode, self.blur_sigma))
-            except Exception:
-                log.debug("MaskedCropFeatureExtractor: segmentation failed on a candidate crop, using it unmasked", exc_info=True)
-                masked_crops.append(crop)
-        return self.base.extract(masked_crops, batch_size)
+        try:
+            mask = self.segmenter.segment(crop_bgr)
+            return apply_background_mode(crop_bgr, mask, self.background_mode, self.blur_sigma)
+        except Exception:
+            log.debug("MaskedCropFeatureExtractor: segmentation failed on a candidate crop, using it unmasked", exc_info=True)
+            return crop_bgr
 
     def _dim(self) -> int:
         return self.base._dim()

@@ -203,6 +203,82 @@ def build_ref_views(
     return views
 
 
+def prepare_reference_images(
+    cfg, sample_id: str, ref_imgs: list[np.ndarray], segmenter,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Stage 1's reference-image preprocessing (foreground masking,
+    background_mode, opt-in crop_to_object), factored out of run_stage1 so
+    stage3.patch_matching can apply the exact same processing to its own
+    reference images. segmenter is None when stage1.segmentation is
+    disabled (all-ones masks). Returns (masked_imgs, masks, synth_masks):
+    masked_imgs are the (possibly cropped) processed images; masks are the
+    ORIGINAL full-frame masks (what mask-area-weighted fusion should see);
+    synth_masks are pixel-aligned with masked_imgs (== masks unless
+    cropping ran).
+    """
+    from aero_eyes.utils.geometry import apply_background_mode, crop_to_object, mask_bbox
+
+    seg_cfg = cfg.stage1.segmentation
+    masked_imgs: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    for img in ref_imgs:
+        if segmenter is not None:
+            mask = segmenter.segment(img)
+            if seg_cfg.center_crop_fallback:
+                mask_ratio = float(mask.sum()) / float(mask.size)
+                if mask_ratio < seg_cfg.min_valid_mask_ratio or mask_ratio > seg_cfg.max_valid_mask_ratio:
+                    from aero_eyes.utils.geometry import center_box_mask
+                    log.warning(
+                        "[Stage1] %s: MobileSAM mask area implausible (%.1f%% of frame), "
+                        "using center-crop fallback (ratio=%.2f) instead of passthrough.",
+                        sample_id, mask_ratio * 100.0, seg_cfg.center_fallback_ratio,
+                    )
+                    mask = center_box_mask(img.shape, seg_cfg.center_fallback_ratio)
+        else:
+            mask = np.ones(img.shape[:2], dtype=bool)
+        masks.append(mask)
+        # background_mode: mean_fill (flat mean-color fill, old hardcoded
+        # default) | keep_real (leave the photo's real background
+        # untouched) | blur (Gaussian-blur it). See
+        # aero_eyes/utils/geometry.py::apply_background_mode.
+        masked_imgs.append(apply_background_mode(img, mask, seg_cfg.background_mode, seg_cfg.blur_sigma))
+
+    # Crop to object (opt-in): whole-photo resize to feature_extractor.image_size
+    # means the object occupies only whatever fraction of the photo it
+    # originally did -- less detail/resolution for the object than if it
+    # filled more of the canvas. Cropping tight to the MobileSAM mask's
+    # bbox (+ crop_context_margin) BEFORE that resize makes the object
+    # occupy a larger fraction of the (now smaller) cropped image, so it
+    # also occupies a larger fraction after resizing. Mirrors
+    # stage123_geco2.crop_to_object -- see
+    # aero_eyes/utils/geometry.py::crop_to_object for the full rationale.
+    # synth_masks tracks whichever mask is pixel-aligned with masked_imgs --
+    # stays == masks (the ORIGINAL, uncropped masks) unless cropping below
+    # actually runs. Kept separate from `masks` itself because the mask-
+    # area-weighted fusion (run_stage1 step 5) should still reflect each
+    # ref's ORIGINAL segmentation confidence/framing, not the post-crop
+    # ratio (which would trend toward a similar value for every ref
+    # regardless of how tightly the photo was originally framed, once
+    # cropped to roughly the same box+margin proportions).
+    synth_masks = masks
+    if seg_cfg.enabled and cfg.stage1.crop_to_object:
+        cropped_imgs = []
+        cropped_masks = []
+        for masked, mask in zip(masked_imgs, masks):
+            tight_box = mask_bbox(mask)
+            if tight_box is None:
+                cropped_imgs.append(masked)
+                cropped_masks.append(mask)
+                continue
+            cimg, _ = crop_to_object(masked, tight_box, cfg.stage1.crop_context_margin)
+            cmask, _ = crop_to_object(mask, tight_box, cfg.stage1.crop_context_margin)
+            cropped_imgs.append(cimg)
+            cropped_masks.append(cmask)
+        masked_imgs = cropped_imgs
+        synth_masks = cropped_masks
+    return masked_imgs, masks, synth_masks
+
+
 def run_stage1(cfg, sample_id: str) -> Path:
     """Run Stage 1 for the given sample. Returns path to prototype.npz."""
     from aero_eyes.config import load_config
@@ -240,73 +316,15 @@ def run_stage1(cfg, sample_id: str) -> Path:
     ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
 
     # ---- 2. Reference-image foreground masking (mobilesam | fastsam | sam2) ----
+    # ---- 2a. Crop to object (opt-in) ----
     seg_cfg = cfg.stage1.segmentation
     segmenter = build_segmenter(seg_cfg, cfg) if seg_cfg.enabled else None
-
-    masked_imgs: list[np.ndarray] = []
-    masks: list[np.ndarray] = []
-    for img in ref_imgs:
-        if segmenter is not None:
-            mask = segmenter.segment(img)
-            if seg_cfg.center_crop_fallback:
-                mask_ratio = float(mask.sum()) / float(mask.size)
-                if mask_ratio < seg_cfg.min_valid_mask_ratio or mask_ratio > seg_cfg.max_valid_mask_ratio:
-                    from aero_eyes.utils.geometry import center_box_mask
-                    log.warning(
-                        "[Stage1] %s: MobileSAM mask area implausible (%.1f%% of frame), "
-                        "using center-crop fallback (ratio=%.2f) instead of passthrough.",
-                        sample_id, mask_ratio * 100.0, seg_cfg.center_fallback_ratio,
-                    )
-                    mask = center_box_mask(img.shape, seg_cfg.center_fallback_ratio)
-        else:
-            mask = np.ones(img.shape[:2], dtype=bool)
-        masks.append(mask)
-        # background_mode: mean_fill (flat mean-color fill, old hardcoded
-        # default) | keep_real (leave the photo's real background
-        # untouched) | blur (Gaussian-blur it). See
-        # aero_eyes/utils/geometry.py::apply_background_mode.
-        masked = apply_background_mode(img, mask, seg_cfg.background_mode, seg_cfg.blur_sigma)
-        masked_imgs.append(masked)
+    masked_imgs, masks, synth_masks = prepare_reference_images(cfg, sample_id, ref_imgs, segmenter)
 
     if cfg.runtime.save_visualizations:
         viz_dir = work_dir / "viz" / "stage1"
         vizmod.save_stage1_refs(ref_imgs, masks, viz_dir)
-
-    # ---- 2a. Crop to object (opt-in) ----
-    # Whole-photo resize to feature_extractor.image_size (224 by default)
-    # means the object occupies only whatever fraction of the photo it
-    # originally did -- less detail/resolution for the object than if it
-    # filled more of the canvas. Cropping tight to the MobileSAM mask's
-    # bbox (+ crop_context_margin) BEFORE that resize makes the object
-    # occupy a larger fraction of the (now smaller) cropped image, so it
-    # also occupies a larger fraction after resizing. Mirrors
-    # stage123_geco2.crop_to_object -- see
-    # aero_eyes/utils/geometry.py::crop_to_object for the full rationale.
-    # synth_masks tracks whichever mask is pixel-aligned with masked_imgs --
-    # stays == masks (the ORIGINAL, uncropped masks) unless cropping below
-    # actually runs. Kept separate from `masks` itself because the mask-
-    # area-weighted fusion further down (step 5) should still reflect each
-    # ref's ORIGINAL segmentation confidence/framing, not the post-crop
-    # ratio (which would trend toward a similar value for every ref
-    # regardless of how tightly the photo was originally framed, once
-    # cropped to roughly the same box+margin proportions).
-    synth_masks = masks
-    if seg_cfg.enabled and cfg.stage1.crop_to_object:
-        cropped_imgs = []
-        cropped_masks = []
-        for masked, mask in zip(masked_imgs, masks):
-            tight_box = mask_bbox(mask)
-            if tight_box is None:
-                cropped_imgs.append(masked)
-                cropped_masks.append(mask)
-                continue
-            cimg, _ = crop_to_object(masked, tight_box, cfg.stage1.crop_context_margin)
-            cmask, _ = crop_to_object(mask, tight_box, cfg.stage1.crop_context_margin)
-            cropped_imgs.append(cimg)
-            cropped_masks.append(cmask)
-        masked_imgs = cropped_imgs
-        synth_masks = cropped_masks
-        if cfg.runtime.save_visualizations:
+        if seg_cfg.enabled and cfg.stage1.crop_to_object:
             out_dir = work_dir / "viz" / "stage1" / "refs_cropped"
             out_dir.mkdir(parents=True, exist_ok=True)
             for i, c in enumerate(masked_imgs):
