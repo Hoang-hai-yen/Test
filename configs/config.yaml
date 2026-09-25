@@ -817,6 +817,21 @@ stage3:
     max_gap_intervals: 1
     keep_conf_threshold: null
     mode: offline              # "online" = causal delayed-decision gate (same result, bounded latency)
+  # Patch-token re-scoring (opt-in): compare sets of DINOv3 patch tokens
+  # (Chamfer/MaxSim or Sinkhorn OT) instead of only the global CLS vector, so
+  # fine detail (text, portrait) counts. See PatchMatchingConfig. NOT YET VALIDATED.
+  patch_matching:
+    enabled: false
+    method: chamfer            # chamfer | ot
+    layers: [-1]               # e.g. [6, 9, -1] for mid+last layers (ViT-B, 12 blocks)
+    long_side: 224             # e.g. 448 for finer patches
+    keep_aspect: true
+    symmetric: true
+    ot_epsilon: 0.05
+    ot_iters: 50
+    cls_weight: 0.0            # 0 = patch score only; >0 blends with CLS cosine
+    reuse_cls_preprocess: false  # true = use feature_extractor.preprocess_mode / candidate_preprocess_mode / image_size
+                                 # (long_side and keep_aspect are then ignored)
   # KeepTrack-style (arXiv:2103.16556, docs/GECO2_precision_improvements_
   # plan.md Phase 3 item 6) multi-candidate identity tracking across
   # keyframes -- an alternative/additional precision filter to

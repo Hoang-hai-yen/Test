@@ -1198,6 +1198,68 @@ class NegativePrototypeFilterConfig(BaseModel):
     tau_negative_margin: float = 0.0
 
 
+class PatchMatchingConfig(BaseModel):
+    """Patch-token re-scoring for Stage 3 (opt-in). A single CLS vector is a
+    global summary: a blank sheet of paper with the same outline as an ID card
+    scores close to it, because the small details (text, portrait, emblem)
+    barely move CLS. Here every candidate crop and every reference image is
+    instead encoded as a SET of DINOv3 patch tokens and the two sets are
+    compared, so a card's detail patches cannot be matched by blank-paper
+    patches.
+
+    method:
+      "chamfer" -- MaxSim: each patch takes its best match in the other set
+        (mean over patches; symmetric=true averages both directions, so
+        unmatched detail on either side is penalised). Cheap.
+      "ot" -- entropic optimal transport (Sinkhorn, cost = 1 - cosine,
+        uniform patch weights); score = mean cosine under the transport plan.
+        Every patch must be transported somewhere, so many-to-one matching
+        (which lets blank paper absorb card patches under chamfer) is
+        impossible. Approximates EMD as ot_epsilon -> 0.
+
+    layers: transformer depths to take patch tokens from (indices into
+      hidden_states; -1 = last block, with the model's final norm). Each
+      layer's tokens are L2-normalised and concatenated, so the score is the
+      mean of the per-layer scores. Mid layers keep more local texture/detail
+      than the last one, e.g. for a 12-layer ViT-B: [6, 9, -1].
+
+    long_side / keep_aspect: input resolution. keep_aspect=true resizes the
+      LONG side to long_side (rounded to a multiple of the 16px patch size)
+      and scales the short side proportionally instead of squashing to a
+      square; larger long_side = finer patches = small text survives.
+
+    cls_weight: final = cls_weight * cls_cosine + (1 - cls_weight) * patch_score.
+      0.0 = patch score only. Score scale is cosine-like either way, but the
+      distribution shifts, so re-tune match_threshold/adaptive settings.
+
+    Needs stage1.feature_extractor.model="dinov3" with dinov3_source=
+    "huggingface" (raises otherwise). Only the threshold path of Stage 3 is
+    affected: dynamic_prototype re-scores from CLS features and would discard
+    these scores (a warning is logged), and verification_method="cluster"
+    keeps clustering on CLS features. References are the raw images in the
+    refs dir -- Stage 1's masking/cropping/augmentation is not replicated.
+    NOT YET VALIDATED -- compare with scripts/compare_patch_matching.py.
+    """
+    enabled: bool = False
+    method: Literal["chamfer", "ot"] = "chamfer"
+    layers: list[int] = [-1]
+    long_side: int = 224
+    keep_aspect: bool = True
+    symmetric: bool = True
+    ot_epsilon: float = 0.05
+    ot_iters: int = 50
+    cls_weight: float = 0.0
+    # false (default): patch tokens use their OWN preprocessing (long_side/
+    # keep_aspect above; refs and candidates both resized as-is, no crop/pad).
+    # true: reuse the CLS path's preprocessing instead -- refs go through
+    # stage1.feature_extractor.preprocess_mode, candidate crops through
+    # candidate_preprocess_mode, at feature_extractor.image_size -- so the
+    # patch score sees exactly the same view of each image as the CLS
+    # cosine (and the same view a LoRA was trained under). long_side and
+    # keep_aspect are IGNORED when true.
+    reuse_cls_preprocess: bool = False
+
+
 class Stage3Config(BaseModel):
     # Dev/debug convenience: candidates.json's companion candidates.feats.npz
     # is written by Stage 2 (see aero_eyes/stages/stage2.py::
@@ -1466,6 +1528,8 @@ class Stage3Config(BaseModel):
     margin_verification: MarginVerificationConfig = MarginVerificationConfig()
     # Drops temporally isolated keyframe detections -- see IsolatedDetectionFilterConfig.
     isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
+    # Patch-token (Chamfer/OT) re-scoring instead of/alongside CLS cosine -- see PatchMatchingConfig.
+    patch_matching: PatchMatchingConfig = PatchMatchingConfig()
     # KeepTrack-style multi-candidate identity tracking -- see IdentityChainFilterConfig.
     identity_chain_filter: IdentityChainFilterConfig = IdentityChainFilterConfig()
     # Hard-negative "negative prototype" filter -- see NegativePrototypeFilterConfig.

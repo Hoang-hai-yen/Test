@@ -618,6 +618,7 @@ def main():
         "aerial_sim_downscale": sim.downscale_factor if sim.enabled else None,
         "feature_crop_pad": cfg.stage2.candidate.feature_crop_pad,
         "raw_refs": args.raw_refs,
+        "ref_factors": args.ref_factors,
     }
 
     rng = np.random.default_rng(args.seed)

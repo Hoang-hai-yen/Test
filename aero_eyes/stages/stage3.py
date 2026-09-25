@@ -1107,6 +1107,33 @@ def run_stage3(cfg, sample_id: str) -> Path:
     else:
         all_sims = _score_against_ref(all_feats, prototype, s3.similarity, background=background)  # [N]
 
+    # ---- Patch-token re-scoring (stage3.patch_matching, opt-in) ----
+    pm = s3.patch_matching
+    if pm.enabled:
+        if s3.similarity != "cosine":
+            raise ValueError("stage3.patch_matching is only implemented for stage3.similarity='cosine'.")
+        if video_path is None:
+            raise FileNotFoundError(
+                f"stage3.patch_matching needs the sample's video to crop candidates but none was "
+                f"found for {sample_id!r} matching {cfg.data.video_glob!r}."
+            )
+        if s3.dynamic_prototype.enabled:
+            log.warning(
+                "[Stage3] %s: stage3.dynamic_prototype re-scores from CLS features and will "
+                "discard patch_matching scores once a round fires.", sample_id,
+            )
+        from aero_eyes.models.patch_match import score_candidates
+
+        patch_matrix = score_candidates(cfg, sample_id, video_path, all_frame_idxs, all_dets)
+        n_refs = patch_matrix.shape[1]
+        patch_pooling = multi_ref_pooling if use_multi_ref else "mean"
+        if patch_pooling == "agreement_weighted" and n_refs != len(per_ref_features):
+            patch_pooling = "mean"
+        patch_sims = _pool_sims(
+            [patch_matrix[:, r] for r in range(n_refs)], patch_pooling, per_ref_features, agreement_epsilon,
+        )
+        all_sims = pm.cls_weight * all_sims + (1.0 - pm.cls_weight) * patch_sims
+
     # Snapshot BEFORE dynamic_prototype runs -- the similarity distribution
     # against only the original reference photo(s), untouched by whatever
     # dynamic_prototype appends/blends later. Used by
