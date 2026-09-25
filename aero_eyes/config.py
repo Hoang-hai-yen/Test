@@ -1270,6 +1270,33 @@ class PatchMatchingConfig(BaseModel):
     reuse_stage1_ref_processing: bool = False
 
 
+class WhiteningConfig(BaseModel):
+    """PCA whitening of the CLS embeddings Stage 3 scores with (opt-in). The
+    map is fitted OFFLINE by scripts/fit_pca_whitening.py (evaluate first --
+    it reports whether whitening beats raw cosine out of sample) and applied
+    here as a fixed linear transform (subtract mean, project, rescale,
+    L2-normalise), so it is causal / streaming-safe: no other candidate or
+    frame is needed. Applied to candidate features, the fused prototype and
+    every per-reference vector, so all Stage 3 consumers (cosine scoring,
+    rmd, dynamic_prototype, cluster verification) see the same space, whose
+    dimension becomes weights_path's k.
+
+    The weights must have been fitted on embeddings from the SAME extractor
+    settings (model/variant, LoRA, preprocess modes, crop padding) that
+    produced candidates.feats.npz / prototype.npz; a dimension mismatch
+    raises, but other mismatches (e.g. different LoRA) do not.
+
+    Only Stage 3's own scoring is affected: Stage 4 and GeCo2's own cosine
+    checks still embed/compare in the plain CLS space, and
+    prototype_adapted.npz is NOT written while this is on (its whitened
+    vectors would not match Stage 4's CLS-space candidates). Whitened cosine
+    has a different distribution than raw cosine -- re-tune match_threshold /
+    adaptive_min_floor. NOT YET VALIDATED on this project's footage.
+    """
+    enabled: bool = False
+    weights_path: Optional[str] = None
+
+
 class Stage3Config(BaseModel):
     # Dev/debug convenience: candidates.json's companion candidates.feats.npz
     # is written by Stage 2 (see aero_eyes/stages/stage2.py::
@@ -1540,6 +1567,8 @@ class Stage3Config(BaseModel):
     isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
     # Patch-token (Chamfer/OT) re-scoring instead of/alongside CLS cosine -- see PatchMatchingConfig.
     patch_matching: PatchMatchingConfig = PatchMatchingConfig()
+    # PCA whitening of the CLS embeddings before scoring -- see WhiteningConfig.
+    whitening: WhiteningConfig = WhiteningConfig()
     # KeepTrack-style multi-candidate identity tracking -- see IdentityChainFilterConfig.
     identity_chain_filter: IdentityChainFilterConfig = IdentityChainFilterConfig()
     # Hard-negative "negative prototype" filter -- see NegativePrototypeFilterConfig.

@@ -10,6 +10,7 @@ All scores are cosine-like (higher = more similar, roughly in [-1, 1]).
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import cv2
@@ -53,6 +54,40 @@ def sinkhorn_score(ref: torch.Tensor, cand: torch.Tensor, epsilon: float = 0.05,
     return float((plan * sim).sum())
 
 
+def patch_pair_scores(
+    cand: torch.Tensor, ref: torch.Tensor, method: str = "chamfer", symmetric: bool = True,
+    epsilon: float = 0.05, iters: int = 50, chunk: int = 8,
+) -> torch.Tensor:
+    """Batched, differentiable form of chamfer_score / sinkhorn_score:
+    cand [C,N,D] x ref [R,M,D] (L2-normalised patch tokens) -> [C,R] scores.
+    Gradients flow to the tokens. For "ot" the transport plan is computed
+    without gradient and only the similarity it weights is differentiated
+    (the plan is the OT cost's gradient, so this is the exact first-order
+    gradient and keeps memory flat). chunk = crops processed at a time."""
+    if method not in ("chamfer", "ot"):
+        raise ValueError(f"Unknown patch method {method!r}. Must be 'chamfer' or 'ot'.")
+    outs = []
+    for i in range(0, cand.shape[0], chunk):
+        sim = torch.einsum("cnd,rmd->crnm", cand[i:i + chunk], ref)      # [c,R,N,M]
+        if method == "chamfer":
+            score = sim.max(dim=2).values.mean(dim=-1)                   # ref patch -> best cand patch
+            if symmetric:
+                score = 0.5 * (score + sim.max(dim=3).values.mean(dim=-1))
+        else:
+            with torch.no_grad():
+                cost = 1.0 - sim.detach()
+                n, m = cost.shape[-2:]
+                f = torch.zeros(cost.shape[:3], device=cost.device, dtype=cost.dtype)
+                g = torch.zeros(cost.shape[:2] + (m,), device=cost.device, dtype=cost.dtype)
+                for _ in range(iters):
+                    f = epsilon * (-math.log(n) - torch.logsumexp((g[:, :, None, :] - cost) / epsilon, dim=3))
+                    g = epsilon * (-math.log(m) - torch.logsumexp((f[:, :, :, None] - cost) / epsilon, dim=2))
+                plan = torch.exp((f[..., None] + g[:, :, None, :] - cost) / epsilon)
+            score = (plan * sim).sum(dim=(2, 3))
+        outs.append(score)
+    return torch.cat(outs, dim=0)
+
+
 def _unwrap_dinov3(extractor) -> DINOv3FeatureExtractor:
     """Find the DINOv3FeatureExtractor inside the wrappers
     build_feature_extractor may add (background masking, projection head) or
@@ -90,6 +125,33 @@ class PatchMatcher:
         # MaskedCropFeatureExtractor to background-mask candidate crops with
         # (set by from_cfg when candidate_background_masking is enabled).
         self.candidate_masker = None
+        self._warn_lora_mismatch(extractor)
+
+    def _warn_lora_mismatch(self, extractor) -> None:
+        """A LoRA trained with scripts/train_lora_dinov3.py --score patch|both
+        was fit to a specific patch scoring setup; warn when this run's
+        stage3.patch_matching differs from it."""
+        tc = getattr(extractor, "lora_train_config", {}) or {}
+        if tc.get("score") not in ("patch", "both"):
+            return
+        c = self.cfg
+        running = {
+            "patch_method": c.method, "patch_layers": list(c.layers),
+            "patch_symmetric": c.symmetric, "reuse_cls_preprocess": c.reuse_cls_preprocess,
+        }
+        if tc["score"] == "both":
+            running["cls_weight"] = c.cls_weight
+        if c.method == "ot":
+            running["patch_ot_epsilon"], running["patch_ot_iters"] = c.ot_epsilon, c.ot_iters
+        # the LoRA saw ext.preprocess_mode-style inputs, never long_side/keep_aspect ones
+        want = {**tc, "reuse_cls_preprocess": True}
+        for k, v in running.items():
+            if k in want and want[k] != v:
+                log.warning(
+                    "LoRA was trained with score=%s but stage3.patch_matching differs -- %s: trained with %r, "
+                    "running with %r. The adapters were fit to that patch setup, so results may degrade.",
+                    tc["score"], k, want[k], v,
+                )
 
     @classmethod
     def from_cfg(cls, cfg) -> "PatchMatcher":
@@ -138,17 +200,7 @@ class PatchMatcher:
         is_candidate only matters under reuse_cls_preprocess (picks
         candidate_preprocess_mode vs preprocess_mode)."""
         pv = self._to_tensor(img_bgr, is_candidate).to(self.device)
-        out = self.model(pixel_values=pv, output_hidden_states=True)
-        n_patches = (pv.shape[-2] // self.patch) * (pv.shape[-1] // self.patch)
-        per_layer = []
-        for idx in self.cfg.layers:
-            if idx == -1 or idx == self.n_layers:
-                h = out.last_hidden_state  # after the model's final norm
-            else:
-                h = out.hidden_states[idx]
-            tokens = h[0, h.shape[1] - n_patches:, :]  # drop CLS (+ register tokens)
-            per_layer.append(F.normalize(tokens, dim=-1))
-        return F.normalize(torch.cat(per_layer, dim=-1), dim=-1)
+        return self.extractor.forward_tokens(pv, self.cfg.layers)[1][0]
 
     def set_references(self, ref_imgs_bgr: list[np.ndarray]) -> None:
         self._refs = [self.encode(im, is_candidate=False) for im in ref_imgs_bgr]

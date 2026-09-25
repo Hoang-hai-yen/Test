@@ -285,3 +285,103 @@ def test_run_training_with_mining_margin_and_tpr_selection(tmp_path):
     assert "mean_tpr_fpr1pct" in res["history"][0] and "mean_tpr_fpr1pct" in res["history"][-1]
     assert 0.0 <= res["best_val_score"] <= 1.0
     assert (tmp_path / "lora_last.pt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Triplet loss and patch-token (Chamfer/OT) scoring
+# ---------------------------------------------------------------------------
+
+def test_score_bg_loss_matches_prototype_bg_loss():
+    from scripts.train_lora_dinov3 import score_bg_loss
+
+    protos = torch.nn.functional.normalize(torch.randn(3, 8), dim=1)
+    crops = torch.nn.functional.normalize(torch.randn(5, 8), dim=1)
+    labels, owner, bg = torch.tensor([0, 1, 2, 3, 3]), torch.tensor([0, 1, 2, 0, 1]), torch.tensor(0.2)
+    a = prototype_bg_loss(crops, labels, protos, bg, 0.1, owner=owner, neg_margin=0.1)
+    b = score_bg_loss(crops @ protos.t(), labels, bg, 0.1, owner=owner, neg_margin=0.1)
+    assert a.item() == pytest.approx(b.item(), rel=1e-6)
+
+
+def test_triplet_zero_when_margin_satisfied_and_no_gradient():
+    from scripts.train_lora_dinov3 import triplet_loss
+
+    scores = torch.tensor([[0.9, 0.1], [0.1, 0.9], [0.2, 0.2]], requires_grad=True)   # 2 targets + 1 clutter (owner 0)
+    labels, owner = torch.tensor([0, 1, 2]), torch.tensor([0, 1, 0])
+    loss = triplet_loss(scores, labels, owner, margin=0.1)
+    loss.backward()
+    assert loss.item() == 0.0 and float(scores.grad.abs().sum()) == 0.0
+
+
+def test_triplet_penalizes_clutter_scoring_near_the_target_and_hard_mining_picks_the_worst():
+    from scripts.train_lora_dinov3 import triplet_loss
+
+    # object 0: target 0.6; clutter at 0.55 (violates margin 0.1 by 0.05), 0.62 (by 0.12) and 0.1 (fine)
+    scores = torch.tensor([[0.6, 0.0], [0.55, 0.0], [0.62, 0.0], [0.1, 0.0], [0.0, 0.9]])
+    labels, owner = torch.tensor([0, 2, 2, 2, 1]), torch.tensor([0, 0, 0, 0, 1])
+    allp = triplet_loss(scores, labels, owner, margin=0.1, mining="all")
+    hard = triplet_loss(scores, labels, owner, margin=0.1, mining="hard")
+    assert allp.item() == pytest.approx((0.05 + 0.12) / 2, abs=1e-6)     # mean over the 2 violating pairs
+    assert hard.item() == pytest.approx(0.12, abs=1e-6)                 # only the hardest negative counts
+    with pytest.raises(ValueError):
+        triplet_loss(scores, labels, owner, mining="nope")
+
+
+def test_triplet_without_negatives_is_a_zero_loss_that_can_backprop():
+    from scripts.train_lora_dinov3 import triplet_loss
+
+    scores = torch.tensor([[0.5, 0.5]], requires_grad=True)
+    loss = triplet_loss(scores, torch.tensor([0]), torch.tensor([0]))
+    loss.backward()
+    assert loss.item() == 0.0
+
+
+def test_patch_pair_scores_match_single_pair_functions_and_are_differentiable():
+    from aero_eyes.models.patch_match import chamfer_score, patch_pair_scores, sinkhorn_score
+
+    g = torch.Generator().manual_seed(0)
+    cand = torch.nn.functional.normalize(torch.randn(3, 10, 16, generator=g), dim=-1).requires_grad_(True)
+    ref = torch.nn.functional.normalize(torch.randn(2, 12, 16, generator=g), dim=-1)
+    ch = patch_pair_scores(cand, ref, "chamfer", chunk=2)
+    ot = patch_pair_scores(cand, ref, "ot", epsilon=0.05, iters=50, chunk=2)
+    assert ch.shape == ot.shape == (3, 2)
+    for c in range(3):
+        for r in range(2):
+            assert ch[c, r].item() == pytest.approx(chamfer_score(ref[r], cand[c].detach()), abs=1e-5)
+            assert ot[c, r].item() == pytest.approx(sinkhorn_score(ref[r], cand[c].detach(), 0.05, 50), abs=1e-4)
+    one_way = patch_pair_scores(cand, ref, "chamfer", symmetric=False)
+    assert one_way[0, 0].item() == pytest.approx(chamfer_score(ref[0], cand[0].detach(), symmetric=False), abs=1e-5)
+    (ch.sum() + ot.sum()).backward()
+    assert cand.grad is not None and float(cand.grad.abs().sum()) > 0
+    with pytest.raises(ValueError):
+        patch_pair_scores(cand, ref, "nope")
+
+
+class _FakePatchExt(_FakeExt):
+    """_FakeExt plus forward_tokens: 4 'patches' = the four quadrants of the 8x8 input."""
+
+    def forward_tokens(self, pv, layers=(-1,)):
+        toks = []
+        for rows in (slice(0, 4), slice(4, 8)):
+            for cols in (slice(0, 4), slice(4, 8)):
+                m = torch.zeros_like(pv)
+                m[:, :, rows, cols] = 1.0
+                toks.append(self.model(pv * m))
+        tokens = torch.nn.functional.normalize(torch.stack(toks, dim=1), dim=-1)
+        return self.model(pv), tokens
+
+
+@pytest.mark.parametrize("score,method,loss", [
+    ("patch", "chamfer", "ce"), ("patch", "ot", "triplet"), ("both", "chamfer", "triplet"),
+])
+def test_run_training_with_patch_scores(tmp_path, score, method, loss):
+    rng = np.random.default_rng(0)
+    train = [_video("A_0", "A", (220, 30, 30), rng), _video("B_0", "B", (30, 200, 40), rng)]
+    val = [_video("A_1", "A", (220, 30, 30), rng)]
+    args = _args(tmp_path)
+    args.score, args.patch_method, args.loss = score, method, loss
+    args.patch_layers, args.patch_ot_iters, args.cls_weight, args.triplet_margin = [-1], 10, 0.5, 0.05
+    args.epochs, args.steps_per_epoch = 2, 6
+    res = run_training(_FakePatchExt(), train, val, args)
+    assert np.isfinite([h["train_loss"] for h in res["history"] if h["train_loss"] is not None]).all()
+    assert 0.0 <= res["history"][0]["mean_auroc"] <= 1.0
+    assert (tmp_path / "lora_last.pt").exists()

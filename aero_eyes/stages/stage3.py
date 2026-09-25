@@ -29,6 +29,34 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def apply_whitening(cfg_w, all_feats: np.ndarray, prototype: np.ndarray, per_ref_features: list):
+    """stage3.whitening: map candidate features [N,D], the fused prototype [D]
+    and per-ref vectors (list of [D]) through the offline-fitted PCA whitening
+    at cfg_w.weights_path (see aero_eyes.models.whitening). Returns the
+    transformed (all_feats, prototype, per_ref_features), all L2-normalised in
+    the whitened space."""
+    from aero_eyes.models.whitening import Whitener
+
+    if not cfg_w.weights_path:
+        raise ValueError("stage3.whitening.enabled=true needs stage3.whitening.weights_path "
+                         "(fit one with scripts/fit_pca_whitening.py).")
+    path = Path(cfg_w.weights_path)
+    if not path.exists():
+        raise FileNotFoundError(f"stage3.whitening.weights_path {path} not found.")
+    w = Whitener.load(path)
+    if all_feats.shape[1] != w.in_dim:
+        raise ValueError(
+            f"stage3.whitening: weights expect {w.in_dim}-d embeddings but candidates have "
+            f"{all_feats.shape[1]}-d -- they were fitted with a different extractor "
+            "(model/variant/pooling); refit with scripts/fit_pca_whitening.py under the same settings."
+        )
+    return (
+        w.transform(all_feats),
+        w.transform(prototype),
+        [w.transform(f) for f in per_ref_features],
+    )
+
+
 def _fit_rmd_background(all_feats: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fits a shared, regularized covariance (Ledoit-Wolf shrinkage --
     candidate count can be less than embedding dimensionality, where a
@@ -1073,6 +1101,19 @@ def run_stage3(cfg, sample_id: str) -> Path:
     all_dets = [e[1] for e in all_entries]
     all_feats = np.stack([e[2] for e in all_entries], axis=0)  # [N, D]
 
+    # ---- PCA whitening (stage3.whitening, opt-in) ----
+    # Transforms candidates, the fused prototype and every per-ref vector into
+    # the same whitened space, so everything below (scoring, rmd,
+    # dynamic_prototype, cluster verification) is unchanged apart from dim.
+    if s3.whitening.enabled:
+        all_feats, prototype, per_ref_features = apply_whitening(
+            s3.whitening, all_feats, prototype, per_ref_features,
+        )
+        log.info(
+            "[Stage3] %s: whitening applied (%s) -> feature dim %d",
+            sample_id, s3.whitening.weights_path, all_feats.shape[1],
+        )
+
     # RMD (Relative Mahalanobis Distance, opt-in via s3.similarity="rmd")
     # background stats -- fit ONCE from this video's own full candidate
     # pool (mostly background/FP by construction) before any per-ref
@@ -1181,7 +1222,14 @@ def run_stage3(cfg, sample_id: str) -> Path:
     # Written whenever dynamic_prototype is enabled (harmless no-op
     # duplicate of prototype.npz on the rare run where 0 rounds actually
     # fired -- e.g. min_support never met).
-    if s3.dynamic_prototype.enabled:
+    if s3.dynamic_prototype.enabled and s3.whitening.enabled:
+        log.warning(
+            "[Stage3] %s: stage3.whitening is on -- prototype_adapted.npz NOT written (its whitened "
+            "vectors would not match Stage 4's CLS-space candidates); "
+            "cosine_arbitration.use_adaptive_prototype will not see this run's adapted prototype.",
+            sample_id,
+        )
+    elif s3.dynamic_prototype.enabled:
         write_prototype(prototype, meta, per_ref_features if use_multi_ref else None, work_dir / "prototype_adapted.npz")
 
     # CD-ViTO domain prompter (max_accuracy) -- only implemented for cosine;

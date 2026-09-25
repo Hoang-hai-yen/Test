@@ -36,6 +36,25 @@ Pushing clutter away (all optional, off by default)
                        what leaks false positives; AUROC is dominated by easy clutter).
 TPR@FPR 1% / 0.1% are always computed and logged/saved in metrics.json.
 
+Other loss / score options (all default to the behaviour above)
+---------------------------------------------------------------
+  --loss triplet       replaces the cross-entropy with a triplet loss on the same
+                       object-vs-crop scores: relu(--triplet-margin - s(target crop)
+                       + s(clutter crop or other object's crop)), averaged over the
+                       violating pairs; a satisfied pair gives no gradient, so it
+                       moves the backbone less than cross-entropy (--triplet-mining hard
+                       keeps only the hardest negative).
+  --score patch|both   train (and validate) on the Chamfer/OT PATCH-token score that
+                       stage3.patch_matching computes, instead of the CLS cosine.
+                       both = --cls-weight * CLS + (1 - that) * patch. Then run the
+                       pipeline with the SAME setup: stage3.patch_matching.enabled=true,
+                       reuse_cls_preprocess=true, method/layers/symmetric matching
+                       --patch-method/--patch-layers/--patch-one-way (and cls_weight
+                       for both); a mismatch logs a warning at load time.
+                       Costs more per step than CLS (crops x refs patch matrices);
+                       lower --patch-chunk / --micro-batch if the GPU runs out of memory.
+                       --hard-neg-pool still mines on CLS cosine.
+
 Evaluating honestly (only 7 objects, 2 videos each!)
 ----------------------------------------------------
 No flag = train on everything and report nothing about generalization.
@@ -161,33 +180,84 @@ def jitter_box(box, rng: np.random.Generator, min_iou: float, tries: int = 20):
     return None
 
 
-def prototype_bg_loss(
-    crop_emb: torch.Tensor, labels: torch.Tensor, protos: torch.Tensor,
-    bg_logit: torch.Tensor, tau: float,
+def score_bg_loss(
+    scores: torch.Tensor, labels: torch.Tensor, bg_logit: torch.Tensor, tau: float,
     owner: torch.Tensor | None = None, neg_margin: float | None = None, margin_weight: float = 1.0,
 ) -> torch.Tensor:
-    """(K+1)-way cross-entropy: cosine(crop, prototype_k)/tau for the K
-    object prototypes plus one learnable background logit. labels in [0,K];
-    K = clutter. Target crops and clutter crops are averaged separately so
-    a clutter-heavy batch cannot drown out the target term.
+    """(K+1)-way cross-entropy on `scores` [C, K] (cosine-like similarity of
+    every crop to every object) / tau plus one learnable background logit.
+    labels in [0,K]; K = clutter. Target crops and clutter crops are averaged
+    separately so a clutter-heavy batch cannot drown out the target term.
 
     Cross-entropy alone stops caring once a clutter crop merely loses to the
     (learnable!) background logit, so it never asks for clutter to be FAR
     from the prototype. neg_margin (with `owner`: the object index each crop
-    belongs to) adds margin_weight * mean(relu(cos(clutter, its own
-    object's prototype) - neg_margin)): a hinge in plain cosine units that
-    keeps pushing every clutter crop below neg_margin. None = off."""
-    K = protos.shape[0]
-    logits = torch.cat([crop_emb @ protos.t() / tau, bg_logit.reshape(1, 1).expand(len(crop_emb), 1)], dim=1)
+    belongs to) adds margin_weight * mean(relu(score(clutter, its own
+    object) - neg_margin)): a hinge in plain cosine units that keeps pushing
+    every clutter crop below neg_margin. None = off."""
+    K = scores.shape[1]
+    logits = torch.cat([scores / tau, bg_logit.reshape(1, 1).expand(len(scores), 1)], dim=1)
     ce = F.cross_entropy(logits, labels, reduction="none")
     is_target = labels < K
     parts = [ce[m].mean() for m in (is_target, ~is_target) if bool(m.any())]
     loss = torch.stack(parts).mean()
     if neg_margin is not None and owner is not None and bool((~is_target).any()):
         clutter = ~is_target
-        cos_own = (crop_emb[clutter] * protos[owner[clutter]]).sum(-1)
+        cos_own = scores[clutter].gather(1, owner[clutter].unsqueeze(1)).squeeze(1)
         loss = loss + margin_weight * F.relu(cos_own - neg_margin).mean()
     return loss
+
+
+def prototype_bg_loss(
+    crop_emb: torch.Tensor, labels: torch.Tensor, protos: torch.Tensor,
+    bg_logit: torch.Tensor, tau: float,
+    owner: torch.Tensor | None = None, neg_margin: float | None = None, margin_weight: float = 1.0,
+) -> torch.Tensor:
+    """score_bg_loss on CLS cosines: scores = crop_emb @ protos.T."""
+    return score_bg_loss(crop_emb @ protos.t(), labels, bg_logit, tau, owner, neg_margin, margin_weight)
+
+
+def triplet_loss(
+    scores: torch.Tensor, labels: torch.Tensor, owner: torch.Tensor, margin: float = 0.1, mining: str = "all",
+) -> torch.Tensor:
+    """Triplet loss on the same [C, K] scores: for every object k the anchor is
+    its reference set, the positives are k's target crops and the negatives
+    are k's clutter crops (owner == k) plus the OTHER objects' target crops.
+    Each (positive, negative) pair costs relu(margin - s_pos + s_neg): once a
+    pair satisfies the margin it contributes nothing (no gradient) -- softer
+    than cross-entropy, which never stops pushing. Averaged over the
+    violating pairs only (so easy pairs don't dilute the gradient).
+    mining="hard" keeps only each object's hardest negative."""
+    if mining not in ("all", "hard"):
+        raise ValueError(f"Unknown triplet mining {mining!r}. Must be 'all' or 'hard'.")
+    K = scores.shape[1]
+    hinges = []
+    for k in range(K):
+        pos = scores[labels == k, k]
+        neg = scores[((labels == K) & (owner == k)) | ((labels < K) & (labels != k)), k]
+        if pos.numel() == 0 or neg.numel() == 0:
+            continue
+        if mining == "hard":
+            hinges.append(F.relu(margin - pos + neg.max()))
+        else:
+            hinges.append(F.relu(margin - pos[:, None] + neg[None, :]).reshape(-1))
+    if not hinges:
+        return scores.sum() * 0.0
+    h = torch.cat(hinges)
+    return h.sum() / (h > 0).sum().clamp(min=1)
+
+
+def combine_scores_loss(scores: torch.Tensor, labels, owner, bg_logit, args) -> torch.Tensor:
+    """args.loss dispatch: "ce" (default, score_bg_loss + optional neg-margin
+    hinge) or "triplet"."""
+    if getattr(args, "loss", "ce") == "triplet":
+        return triplet_loss(
+            scores, labels, owner, getattr(args, "triplet_margin", 0.1), getattr(args, "triplet_mining", "all"),
+        )
+    return score_bg_loss(
+        scores, labels, bg_logit, args.tau, owner=owner,
+        neg_margin=getattr(args, "neg_margin", None), margin_weight=getattr(args, "neg_margin_weight", 1.0),
+    )
 
 
 def separation_metrics(pos_cos: np.ndarray, neg_cos: np.ndarray) -> dict:
@@ -376,6 +446,42 @@ def embed(ext, images: list, mode: str, micro_batch: int, amp: bool) -> torch.Te
     return torch.cat(outs)
 
 
+def embed_both(ext, images: list, mode: str, micro_batch: int, amp: bool, layers, need_patch: bool):
+    """(L2-normalised CLS [B,D], L2-normalised patch tokens [B,N,D'] or None)
+    from ONE forward pass per micro-batch, differentiable, through the
+    CURRENT (LoRA-wrapped) model with the extractor's own preprocessing."""
+    dev = torch.device(ext.device)
+    cls_out, patch_out = [], []
+    for i in range(0, len(images), micro_batch):
+        pv = ext.pixel_values(images[i:i + micro_batch], mode).to(dev)
+        with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=amp and dev.type == "cuda"):
+            if need_patch:
+                c, p = ext.forward_tokens(pv, layers)
+            else:
+                c, p = ext.forward_cls(pv), None
+        cls_out.append(F.normalize(c.float(), dim=-1))
+        if need_patch:
+            patch_out.append(F.normalize(p.float(), dim=-1))
+    return torch.cat(cls_out), (torch.cat(patch_out) if need_patch else None)
+
+
+def _patch_pair_scores(crop_patch: torch.Tensor, ref_patch: torch.Tensor, args) -> torch.Tensor:
+    from aero_eyes.models.patch_match import patch_pair_scores
+
+    return patch_pair_scores(
+        crop_patch, ref_patch, getattr(args, "patch_method", "chamfer"), not getattr(args, "patch_one_way", False),
+        getattr(args, "patch_ot_epsilon", 0.05), getattr(args, "patch_ot_iters", 20), getattr(args, "patch_chunk", 8),
+    )
+
+
+def patch_scores_by_object(crop_patch: torch.Tensor, ref_patch: torch.Tensor, ref_owner: torch.Tensor, K: int, args):
+    """[C, K] patch score of every crop against every object: the mean over
+    that object's reference images of the Chamfer/OT patch score (the same
+    'mean' multi-ref pooling stage3.patch_matching uses by default)."""
+    pair = _patch_pair_scores(crop_patch, ref_patch, args)
+    return torch.stack([pair[:, ref_owner == k].mean(dim=1) for k in range(K)], dim=1)
+
+
 def _pick(lst: list, n: int, rng: np.random.Generator) -> list:
     return [lst[i] for i in rng.integers(0, len(lst), size=n)]
 
@@ -393,12 +499,15 @@ def mine_hard_negatives(ext, pool: list, proto: torch.Tensor, n: int, mode: str,
 
 def train_step(ext, objs: list[str], obj_data: dict, args, rng, bg_logit) -> torch.Tensor:
     K = len(objs)
+    score_mode = getattr(args, "score", "cls")        # cls | patch | both
+    need_patch = score_mode != "cls"
+    layers = getattr(args, "patch_layers", [-1])
     ref_imgs, ref_owner = [], []
     for k, o in enumerate(objs):
         for img in _pick(obj_data[o].refs, args.refs_per_object, rng):
             ref_imgs.append(degrade_ref(img, float(rng.choice(args.ref_factors))))
             ref_owner.append(k)
-    ref_emb = embed(ext, ref_imgs, ext.preprocess_mode, args.micro_batch, args.amp)
+    ref_emb, ref_patch = embed_both(ext, ref_imgs, ext.preprocess_mode, args.micro_batch, args.amp, layers, need_patch)
     ref_owner_t = torch.tensor(ref_owner, device=ref_emb.device)
     protos = torch.stack([F.normalize(ref_emb[ref_owner_t == k].mean(0), dim=0) for k in range(K)])
 
@@ -412,6 +521,7 @@ def train_step(ext, objs: list[str], obj_data: dict, args, rng, bg_logit) -> tor
             owner.append(k)
         if d.neg:
             if pool_n > args.neg_per_object:
+                # mined on CLS cosine even for patch/both training (a proxy for the patch score)
                 negs = mine_hard_negatives(
                     ext, _pick(d.neg, pool_n, rng), protos[k], args.neg_per_object,
                     ext.candidate_preprocess_mode, args.micro_batch, args.amp,
@@ -422,23 +532,52 @@ def train_step(ext, objs: list[str], obj_data: dict, args, rng, bg_logit) -> tor
                 crops.append(augment_crop(img, rng))
                 labels.append(K)
                 owner.append(k)
-    crop_emb = embed(ext, crops, ext.candidate_preprocess_mode, args.micro_batch, args.amp)
-    y = torch.tensor(labels, device=crop_emb.device)
-    return prototype_bg_loss(
-        crop_emb, y, protos, bg_logit, args.tau,
-        owner=torch.tensor(owner, device=crop_emb.device),
-        neg_margin=getattr(args, "neg_margin", None), margin_weight=getattr(args, "neg_margin_weight", 1.0),
+    crop_emb, crop_patch = embed_both(
+        ext, crops, ext.candidate_preprocess_mode, args.micro_batch, args.amp, layers, need_patch,
     )
+    y = torch.tensor(labels, device=crop_emb.device)
+    own = torch.tensor(owner, device=crop_emb.device)
+    if score_mode == "cls":
+        return combine_scores_loss(crop_emb @ protos.t(), y, own, bg_logit, args)
+    patch_scores = patch_scores_by_object(crop_patch, ref_patch, ref_owner_t, K, args)
+    patch_loss = combine_scores_loss(patch_scores, y, own, bg_logit, args)
+    if score_mode == "patch":
+        return patch_loss
+    w = getattr(args, "cls_weight", 0.3)
+    return w * combine_scores_loss(crop_emb @ protos.t(), y, own, bg_logit, args) + (1.0 - w) * patch_loss
 
 
 @torch.no_grad()
 def eval_video(ext, vd: VideoData, args) -> dict:
+    """Separation of GT crops vs clutter for one video, with the SAME score the
+    model is trained on: CLS cosine (score=cls), mean-over-refs patch score
+    (patch), or their cls_weight blend (both)."""
+    score_mode = getattr(args, "score", "cls")
+    layers = getattr(args, "patch_layers", [-1])
     refs = [degrade_ref(r, args.eval_ref_factor) for r in vd.refs]
-    proto = F.normalize(embed(ext, refs, ext.preprocess_mode, args.micro_batch, False).mean(0), dim=0)
-    pos = embed(ext, vd.pos, ext.candidate_preprocess_mode, args.micro_batch, False) @ proto if vd.pos else None
-    neg = embed(ext, vd.neg, ext.candidate_preprocess_mode, args.micro_batch, False) @ proto if vd.neg else None
-    to_np = lambda t: t.cpu().numpy() if t is not None else np.zeros(0)
-    return separation_metrics(to_np(pos), to_np(neg))
+    need_patch = score_mode != "cls"
+    ref_emb, ref_patch = embed_both(ext, refs, ext.preprocess_mode, args.micro_batch, False, layers, need_patch)
+    proto = F.normalize(ref_emb.mean(0), dim=0)
+    w = getattr(args, "cls_weight", 0.3)
+
+    def score(images: list):
+        if not images:
+            return np.zeros(0)
+        out = []
+        for i in range(0, len(images), args.micro_batch):
+            c, p = embed_both(
+                ext, images[i:i + args.micro_batch], ext.candidate_preprocess_mode, args.micro_batch, False,
+                layers, need_patch,
+            )
+            if score_mode == "cls":
+                s = c @ proto
+            else:
+                sp = _patch_pair_scores(p, ref_patch, args).mean(dim=1)
+                s = sp if score_mode == "patch" else w * (c @ proto) + (1.0 - w) * sp
+            out.append(s.cpu())
+        return torch.cat(out).numpy()
+
+    return separation_metrics(score(vd.pos), score(vd.neg))
 
 
 def evaluate(ext, val_data: list[VideoData], args) -> dict:
@@ -559,6 +698,26 @@ def main():
     p.add_argument("--neg-margin", type=float, default=None,
                    help="hinge on clutter: penalize cosine(clutter, own prototype) above this (e.g. 0.15); off if unset")
     p.add_argument("--neg-margin-weight", type=float, default=1.0)
+    p.add_argument("--loss", choices=["ce", "triplet"], default="ce",
+                   help="ce = (K+1)-way cross-entropy on score/tau with a learnable background logit (default); "
+                        "triplet = relu(margin - s(pos) + s(neg)) on the same scores, no gradient once satisfied")
+    p.add_argument("--triplet-margin", type=float, default=0.1, help="margin in score (cosine) units, --loss triplet")
+    p.add_argument("--triplet-mining", choices=["all", "hard"], default="all",
+                   help="all = every (positive, negative) pair, averaged over violating pairs; hard = hardest negative only")
+    p.add_argument("--score", choices=["cls", "patch", "both"], default="cls",
+                   help="what similarity the loss/validation use: cls = CLS cosine (default); patch = Chamfer/OT "
+                        "patch-token score, i.e. what stage3.patch_matching computes; both = --cls-weight blend")
+    p.add_argument("--cls-weight", type=float, default=0.3,
+                   help="--score both: weight of the CLS cosine in the loss and in validation (patch gets 1 - this). "
+                        "Use the same value for stage3.patch_matching.cls_weight")
+    p.add_argument("--patch-method", choices=["chamfer", "ot"], default="chamfer",
+                   help="patch score for --score patch|both (ot = Sinkhorn, much slower per step)")
+    p.add_argument("--patch-layers", default="-1",
+                   help='comma-separated hidden_states indices the patch tokens come from, e.g. "6,9,-1" (ViT-B has 12 blocks)')
+    p.add_argument("--patch-one-way", action="store_true", help="ref->crop Chamfer only (default: symmetric)")
+    p.add_argument("--patch-ot-epsilon", type=float, default=0.05)
+    p.add_argument("--patch-ot-iters", type=int, default=20, help="Sinkhorn iterations (training default lower than inference's 50)")
+    p.add_argument("--patch-chunk", type=int, default=8, help="crops per patch-score block (lower = less GPU memory)")
     p.add_argument("--select-by", choices=["auroc", "tpr_fpr1pct"], default="auroc",
                    help="validation metric that picks lora_best.pt; tpr_fpr1pct = share of targets kept at 1 percent clutter leak")
     p.add_argument("--neg-iou-max", type=float, default=0.1)
@@ -574,6 +733,7 @@ def main():
     args.targets = [t for t in args.targets.split(",") if t]
     args.last_n_blocks = args.last_n_blocks or None
     args.ref_factors = [float(x) for x in args.ref_factors.split(",") if x]
+    args.patch_layers = [int(x) for x in args.patch_layers.split(",") if x.strip()]
     if 0 < args.hard_neg_pool <= args.neg_per_object:
         log.warning("--hard-neg-pool %d <= --neg-per-object %d: nothing to mine, ignoring.",
                     args.hard_neg_pool, args.neg_per_object)
@@ -619,6 +779,10 @@ def main():
         "feature_crop_pad": cfg.stage2.candidate.feature_crop_pad,
         "raw_refs": args.raw_refs,
         "ref_factors": args.ref_factors,
+        "loss": args.loss, "triplet_margin": args.triplet_margin, "triplet_mining": args.triplet_mining,
+        "score": args.score, "cls_weight": args.cls_weight, "patch_method": args.patch_method,
+        "patch_layers": args.patch_layers, "patch_symmetric": not args.patch_one_way,
+        "patch_ot_epsilon": args.patch_ot_epsilon, "patch_ot_iters": args.patch_ot_iters,
     }
 
     rng = np.random.default_rng(args.seed)

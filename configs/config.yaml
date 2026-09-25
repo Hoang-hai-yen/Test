@@ -833,6 +833,12 @@ stage3:
     reuse_cls_preprocess: false  # true = use feature_extractor.preprocess_mode / candidate_preprocess_mode / image_size
                                  # (long_side and keep_aspect are then ignored)
     reuse_stage1_ref_processing: false  # true = refs go through stage1 segmentation + background_mode + crop_to_object first
+  # PCA whitening of the CLS embeddings before scoring (opt-in, causal: a fixed
+  # linear map fitted offline by scripts/fit_pca_whitening.py). See
+  # WhiteningConfig -- re-tune match_threshold/adaptive_min_floor when enabled.
+  whitening:
+    enabled: false
+    weights_path: null         # e.g. runs/pca_whitening/whitening.npz
   # KeepTrack-style (arXiv:2103.16556, docs/GECO2_precision_improvements_
   # plan.md Phase 3 item 6) multi-candidate identity tracking across
   # keyframes -- an alternative/additional precision filter to

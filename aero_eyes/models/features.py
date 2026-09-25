@@ -525,6 +525,21 @@ class DINOv2FeatureExtractor:
         return self._dim()
 
 
+def patch_tokens_from_output(out, layers, n_layers: int, n_patches: int) -> torch.Tensor:
+    """Patch tokens [B, n_patches, D*len(layers)] from a HuggingFace ViT output
+    produced with output_hidden_states=True: each requested layer's tokens
+    (index into hidden_states; -1 or n_layers = last block with the model's
+    final norm) are L2-normalised, concatenated, and re-normalised, so a dot
+    product between two such tokens is the mean of the per-layer cosines.
+    CLS/register tokens are dropped by keeping only the last n_patches tokens.
+    Differentiable."""
+    per_layer = []
+    for idx in layers:
+        h = out.last_hidden_state if idx in (-1, n_layers) else out.hidden_states[idx]
+        per_layer.append(F.normalize(h[:, h.shape[1] - n_patches:, :], dim=-1))
+    return F.normalize(torch.cat(per_layer, dim=-1), dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # DINOv3
 # ---------------------------------------------------------------------------
@@ -611,6 +626,7 @@ class DINOv3FeatureExtractor:
         )
         self.device           = _resolve_device(device)
         self.processor        = None
+        self.lora_train_config: dict = {}   # settings the loaded LoRA was trained under ({} = none/unknown)
         self._scale_layers: list[int] = []
         if source == "huggingface":
             self.model, self.processor = self._load_huggingface(
@@ -628,6 +644,7 @@ class DINOv3FeatureExtractor:
                 )
             from aero_eyes.models.lora import config_mismatches, load_lora
             meta = load_lora(self.model, lora_weights_path)
+            self.lora_train_config = dict(meta.get("train_config", {}))
             log.info("DINOv3: loaded LoRA weights %s (%s)", lora_weights_path, meta)
             running = {
                 "preprocess_mode": self.preprocess_mode,
@@ -725,6 +742,20 @@ class DINOv3FeatureExtractor:
         if self.source == "kaggle":
             return self.model(pixel_values)
         return self.model(pixel_values=pixel_values).pooler_output
+
+    def forward_tokens(self, pixel_values: torch.Tensor, layers=(-1,)) -> tuple[torch.Tensor, torch.Tensor]:
+        """(CLS/pooler embedding [B,D] unnormalised, patch tokens
+        [B,N,D*len(layers)] L2-normalised -- see patch_tokens_from_output)
+        for a preprocessed batch, in ONE forward pass. Differentiable (used
+        by scripts/train_lora_dinov3.py for patch-based training and by
+        aero_eyes.models.patch_match). Needs source="huggingface"."""
+        if self.source == "kaggle":
+            raise ValueError("forward_tokens needs dinov3_source='huggingface' (no hidden_states on the kaggle model).")
+        out = self.model(pixel_values=pixel_values, output_hidden_states=True)
+        n_patches = (pixel_values.shape[-2] // self._PATCH_SIZE) * (pixel_values.shape[-1] // self._PATCH_SIZE)
+        return out.pooler_output, patch_tokens_from_output(
+            out, layers, self.model.config.num_hidden_layers, n_patches,
+        )
 
     def _processor_kwargs(self, mode: str) -> dict:
         """preprocess_mode="resize_then_crop" override for the HuggingFace
