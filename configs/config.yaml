@@ -1106,6 +1106,10 @@ stage123_geco2:
     # stage only needs to not throw away the true positive; stage3's
     # cosine matching does the real cut.
     candidate_score_threshold_ratio: 0.15
+    # Per-box absolute floor on GeCo2's score, applied before the ratio above
+    # (0.0 = off; both 0.0 = no score filtering, NMS/top-K still apply).
+    # Replaces the generic score_threshold_abs in cosine_rescore mode.
+    candidate_score_threshold_abs: 0.0
     candidate_topk_per_keyframe: 15
   # Shrink each ref image before encoding as an exemplar, to narrow the
   # ground-to-aerial domain gap (close-up ref photos are otherwise much

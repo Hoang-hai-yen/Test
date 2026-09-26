@@ -159,6 +159,10 @@ class GeCo2Detector:
         self.image_size = float(g.image_size)
         self.score_threshold_ratio = g.score_threshold_ratio
         self.score_threshold_abs = g.score_threshold_abs
+        # None = legacy behaviour (ratio only, score_threshold_abs is a floor
+        # on the frame's best score). Set by run_stage12_geco2_candidates from
+        # cosine_rescore.candidate_score_threshold_abs -- see detect_frame.
+        self.score_threshold_box_abs: float | None = None
         self.nms_iou = g.nms_iou
         self.topk_per_keyframe = g.topk_per_keyframe
         self.min_box_area_enabled = g.min_box_area_enabled
@@ -726,7 +730,15 @@ class GeCo2Detector:
         if max_score < self.score_threshold_abs:
             return []
 
-        threshold = max_score * self.score_threshold_ratio
+        box_abs = getattr(self, "score_threshold_box_abs", None)
+        if box_abs is None:
+            threshold = max_score * self.score_threshold_ratio
+        elif box_abs <= 0.0 and self.score_threshold_ratio <= 0.0:
+            threshold = float("-inf")   # both off: no score filtering (NMS/top-K still apply)
+        else:
+            # cosine_rescore candidate mode: per-box absolute floor first, then the
+            # frame-relative ratio -- one combined cut, since a box must clear both.
+            threshold = max(float(box_abs), float(max_score) * self.score_threshold_ratio)
         return self.filter_boxes_by_threshold(
             pred_boxes, box_v, scale, frame_bgr, threshold,
             ref_points=ref_points, centerness=centerness,

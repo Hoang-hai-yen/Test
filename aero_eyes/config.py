@@ -2535,6 +2535,17 @@ class Geco2CosineRescoreConfig(BaseModel):
     # this stage only needs to not throw away the true positive; Stage 3's
     # cosine matching (+ dynamic_prototype, if enabled) does the real cut.
     candidate_score_threshold_ratio: float = 0.15
+    # Absolute floor on EACH candidate box's own GeCo2 score, applied BEFORE
+    # the frame-relative candidate_score_threshold_ratio above. > 0: a box
+    # must score above this to be a candidate at all (so a frame whose best
+    # box is below it yields no candidates), and it must then also clear
+    # max_score * candidate_score_threshold_ratio. 0.0 = this floor is off.
+    # Both this and candidate_score_threshold_ratio at 0.0 = no score
+    # filtering whatsoever (NMS and candidate_topk_per_keyframe still apply).
+    # In cosine_rescore mode this REPLACES the generic
+    # stage123_geco2.score_threshold_abs, which is a different thing (a floor
+    # on the frame's BEST score only) and is ignored here.
+    candidate_score_threshold_abs: float = 0.0
     candidate_topk_per_keyframe: int = 15
 
 

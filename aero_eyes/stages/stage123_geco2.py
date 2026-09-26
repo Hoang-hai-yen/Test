@@ -1080,6 +1080,17 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     cr = cfg.stage123_geco2.cosine_rescore
     detector.score_threshold_ratio = cr.candidate_score_threshold_ratio
     detector.topk_per_keyframe = cr.candidate_topk_per_keyframe
+    # Per-box absolute floor (applied before the ratio); 0 + ratio 0 = no score
+    # filtering. The generic stage123_geco2.score_threshold_abs (a floor on the
+    # frame's best score only) is superseded here.
+    if detector.score_threshold_abs > 0:
+        log.warning(
+            "[Stage12-GeCo2] %s: stage123_geco2.score_threshold_abs=%.3f is ignored in cosine_rescore "
+            "candidate mode -- use stage123_geco2.cosine_rescore.candidate_score_threshold_abs instead.",
+            sample_id, detector.score_threshold_abs,
+        )
+    detector.score_threshold_abs = 0.0
+    detector.score_threshold_box_abs = cr.candidate_score_threshold_abs
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
     color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
