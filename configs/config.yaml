@@ -833,6 +833,8 @@ stage3:
     reuse_cls_preprocess: false  # true = use feature_extractor.preprocess_mode / candidate_preprocess_mode / image_size
                                  # (long_side and keep_aspect are then ignored)
     reuse_stage1_ref_processing: false  # true = refs go through stage1 segmentation + background_mode + crop_to_object first
+    mask_padding: true         # with reuse_cls_preprocess + pad_to_square: don't compare padded patches (either side)
+    pad_min_content_frac: 0.5  # a patch counts as content when >= this fraction of it is real image
   # PCA whitening of the CLS embeddings before scoring (opt-in, causal: a fixed
   # linear map fitted offline by scripts/fit_pca_whitening.py). See
   # WhiteningConfig -- re-tune match_threshold/adaptive_min_floor when enabled.
@@ -1111,6 +1113,18 @@ stage123_geco2:
     # Replaces the generic score_threshold_abs in cosine_rescore mode.
     candidate_score_threshold_abs: 0.0
     candidate_topk_per_keyframe: 15
+    # Fuse overlapping candidate boxes of a keyframe (opt-in). union = parts of
+    # one object -> enclosing box (linked by containment, not IoU); wbf =
+    # Weighted Boxes Fusion of near-duplicates (iou_thresh must be < nms_iou).
+    # keep_originals=true appends the fused box so Stage 3's cosine can choose.
+    candidate_fusion:
+      enabled: false
+      mode: union              # union | wbf
+      containment_thresh: 0.5  # union: intersection / smaller-box area
+      iou_thresh: 0.3          # wbf
+      min_boxes: 2
+      max_union_area_ratio: 4.0
+      keep_originals: true
   # Shrink each ref image before encoding as an exemplar, to narrow the
   # ground-to-aerial domain gap (close-up ref photos are otherwise much
   # crisper/larger-looking than the object as it actually appears in the

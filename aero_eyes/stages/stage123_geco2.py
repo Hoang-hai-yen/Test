@@ -978,7 +978,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
 def _run_geco2_candidate_pass(
     detector, extractor, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg, cfg,
-    on_result=None, viz_dir: Path | None = None,
+    on_result=None, viz_dir: Path | None = None, fusion_cfg=None,
 ) -> dict[int, list[Detection]]:
     """One full sweep over the video's keyframes building candidates.json
     entries -- shared by run_stage12_geco2_candidates's pass 1 (online
@@ -988,12 +988,17 @@ def _run_geco2_candidate_pass(
     when given, runs after each keyframe's candidates are built -- pass 1
     uses it to feed dyn_proto_tracker.offer(); pass 2 passes None.
 
+    fusion_cfg (a CandidateFusionConfig, from cosine_rescore.candidate_fusion),
+    when given and enabled, fuses each keyframe's overlapping boxes before
+    their features are extracted (see aero_eyes.utils.box_fusion).
+
     viz_dir, when given, saves every keyframe that has at least one candidate
     (after the color postfilter) as viz_dir/frame_XXXXXX.jpg with each box
     labelled by GeCo2's own score -- the RAW candidates, before Stage 3's
     cosine threshold/NMS/top-K (Stage 3 draws its own, filtered frames).
     """
     from aero_eyes.utils import viz as vizmod
+    from aero_eyes.utils.box_fusion import fuse_overlapping_boxes
     from aero_eyes.utils.video import frame_iterator
 
     candidates: dict[int, list[Detection]] = {}
@@ -1004,6 +1009,8 @@ def _run_geco2_candidate_pass(
         boxes = detector.detect_frame(frame_bgr, get_prototype())
         if color_sig is not None:
             boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
+        if fusion_cfg is not None and fusion_cfg.enabled:
+            boxes = fuse_overlapping_boxes(boxes, fusion_cfg)
 
         if boxes:
             feats = extractor.extract_crops(
@@ -1091,6 +1098,13 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
         )
     detector.score_threshold_abs = 0.0
     detector.score_threshold_box_abs = cr.candidate_score_threshold_abs
+    if cr.candidate_fusion.enabled and cr.candidate_fusion.mode == "wbf"             and cr.candidate_fusion.iou_thresh >= detector.nms_iou:
+        log.warning(
+            "[Stage12-GeCo2] %s: candidate_fusion mode=wbf with iou_thresh=%.2f >= nms_iou=%.2f -- "
+            "candidates have already been NMS'd at nms_iou, so no pair can exceed iou_thresh and "
+            "nothing will be fused. Lower iou_thresh (or raise stage123_geco2.nms_iou).",
+            sample_id, cr.candidate_fusion.iou_thresh, detector.nms_iou,
+        )
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
     color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
@@ -1152,7 +1166,7 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     )
     candidates = _run_geco2_candidate_pass(
         detector, extractor, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, cfg,
-        on_result=_offer_best, viz_dir=cand_viz_dir,
+        on_result=_offer_best, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion,
     )
     if dyn_proto_tracker is not None:
         dyn_proto_tracker.log_summary()
@@ -1184,7 +1198,7 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
                     old.unlink()
             candidates = _run_geco2_candidate_pass(
                 detector, extractor, video_path, kf_indices, lambda: frozen_prototype,
-                color_sig, cpf_cfg, cfg, viz_dir=cand_viz_dir,
+                color_sig, cpf_cfg, cfg, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion,
             )
 
     _write_candidates_with_features(candidates, cand_path)

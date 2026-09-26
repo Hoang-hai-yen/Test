@@ -385,3 +385,83 @@ def test_run_training_with_patch_scores(tmp_path, score, method, loss):
     assert np.isfinite([h["train_loss"] for h in res["history"] if h["train_loss"] is not None]).all()
     assert 0.0 <= res["history"][0]["mean_auroc"] <= 1.0
     assert (tmp_path / "lora_last.pt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Not comparing pad_to_square padding in patch mode
+# ---------------------------------------------------------------------------
+
+def test_pad_patch_mask_matches_the_actual_padding():
+    from PIL import Image
+
+    from aero_eyes.models.features import _resize_and_pad_to_square, pad_patch_mask
+
+    rng = np.random.default_rng(0)
+    img = Image.fromarray(rng.integers(0, 255, (200, 300, 3), dtype=np.uint8))       # 300x200 (3:2)
+    mask = pad_patch_mask(300, 200, 224, 16).reshape(14, 14)
+    assert mask.sum() == 10 * 14                                    # rows 2..11 are content (34-186 px)
+    assert not mask[:2].any() and not mask[12:].any() and mask[2:12].all()
+    canvas = np.array(_resize_and_pad_to_square(img, 224))
+    fill = canvas[0, 0]
+    for row in (0, 1, 12, 13):                                      # fully-padded patch rows really are flat fill
+        assert (canvas[row * 16:(row + 1) * 16] == fill).all()
+    assert pad_patch_mask(300, 200, 224, 16, min_content_frac=0.7).sum() == 8 * 14   # edge patches (69% / 63%) drop out
+    assert pad_patch_mask(224, 224, 224, 16).all()                  # a square image has no padding
+    assert (pad_patch_mask(200, 300, 224, 16).reshape(14, 14).sum(1) == 10).all()             # portrait: pad on the sides
+
+
+def test_masked_patch_scores_equal_scores_on_the_valid_patches_only_and_have_no_gradient_on_masked_ones():
+    from aero_eyes.models.patch_match import chamfer_score, patch_pair_scores, sinkhorn_score
+
+    g = torch.Generator().manual_seed(0)
+    norm = lambda t: torch.nn.functional.normalize(t, dim=-1)
+    cand = norm(torch.randn(2, 10, 16, generator=g)).requires_grad_(True)
+    ref = norm(torch.randn(2, 12, 16, generator=g))
+    cmask = torch.ones(2, 10, dtype=torch.bool); cmask[:, 6:] = False
+    rmask = torch.ones(2, 12, dtype=torch.bool); rmask[0, 8:] = False
+    for method, sym in (("chamfer", True), ("chamfer", False), ("ot", True)):
+        got = patch_pair_scores(cand, ref, method, sym, 0.05, 50, chunk=1, cand_mask=cmask, ref_mask=rmask)
+        for c in range(2):
+            for r in range(2):
+                cv, rv = cand[c][cmask[c]].detach(), ref[r][rmask[r]]
+                want = sinkhorn_score(rv, cv, 0.05, 50) if method == "ot" else chamfer_score(rv, cv, sym)
+                assert got[c, r].item() == pytest.approx(want, abs=1e-4), (method, sym, c, r)
+    patch_pair_scores(cand, ref, "chamfer", cand_mask=cmask, ref_mask=rmask).sum().backward()
+    assert float(cand.grad[:, 6:].abs().sum()) == 0.0 and float(cand.grad[:, :6].abs().sum()) > 0
+
+
+class _FakeMaskExt(_FakePatchExt):
+    """Adds pixel_values_and_mask: the 4th 'patch' (bottom-right quadrant) is padding."""
+
+    def pixel_values_and_mask(self, images, mode=None, min_content_frac=0.5):
+        mask = torch.ones(len(images), 4, dtype=torch.bool)
+        mask[:, 3] = False
+        return self.pixel_values(images, mode), mask
+
+
+@pytest.mark.parametrize("method", ["chamfer", "ot"])
+def test_run_training_masks_padding_when_asked(tmp_path, method):
+    rng = np.random.default_rng(0)
+    train = [_video("A_0", "A", (220, 30, 30), rng), _video("B_0", "B", (30, 200, 40), rng)]
+    val = [_video("A_1", "A", (220, 30, 30), rng)]
+    args = _args(tmp_path)
+    args.score, args.patch_method, args.patch_ot_iters, args.epochs, args.steps_per_epoch = "patch", method, 8, 1, 4
+    seen = []
+    ext = _FakeMaskExt()
+    orig = ext.pixel_values_and_mask
+    ext.pixel_values_and_mask = lambda *a, **k: (seen.append(a[1]), orig(*a, **k))[1]
+    args.patch_mask_padding = True
+    res = run_training(ext, train, val, args)
+    assert seen, "pixel_values_and_mask must be used when patch_mask_padding is on"
+    assert np.isfinite(res["history"][-1]["train_loss"])
+    seen.clear()
+    args.patch_mask_padding = False
+    run_training(_FakeMaskExt(), train, val, args)
+    assert not seen
+
+
+def test_patch_matching_config_masks_padding_by_default():
+    from aero_eyes.config import PatchMatchingConfig
+
+    c = PatchMatchingConfig()
+    assert c.mask_padding is True and c.pad_min_content_frac == 0.5

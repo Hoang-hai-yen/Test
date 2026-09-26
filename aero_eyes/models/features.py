@@ -98,6 +98,33 @@ def _resize_shorter_side_then_center_crop(img_pil: "Image.Image", size: int) -> 
     return resized.crop((left, top, left + size, top + size))
 
 
+def _pad_layout(w: int, h: int, size: int) -> tuple[int, int, int, int]:
+    """(new_w, new_h, left, top) of pad_to_square's resized content inside the
+    size x size canvas -- shared by _resize_and_pad_to_square and
+    pad_patch_mask so the mask can never drift from the actual padding."""
+    scale = size / max(w, h)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    return new_w, new_h, (size - new_w) // 2, (size - new_h) // 2
+
+
+def pad_patch_mask(w: int, h: int, size: int, patch: int = 16, min_content_frac: float = 0.5) -> np.ndarray:
+    """[(size//patch)**2] bool, row-major like the ViT's patch tokens: True for
+    a patch that holds real image content under pad_to_square, False for one
+    that is (mostly) padding. A patch is content when the fraction of its area
+    covered by the pasted image is > 0 and >= min_content_frac -- so a patch
+    straddling the image edge counts as content once at least that fraction of
+    it is real. w/h = the ORIGINAL (pre-resize) image size."""
+    new_w, new_h, left, top = _pad_layout(w, h, size)
+    g = size // patch
+    starts = np.arange(g) * patch
+
+    def overlap(lo: int, length: int) -> np.ndarray:
+        return np.clip(np.minimum(starts + patch, lo + length) - np.maximum(starts, lo), 0, patch)
+
+    frac = (overlap(top, new_h)[:, None] * overlap(left, new_w)[None, :]) / float(patch * patch)
+    return ((frac > 0) & (frac >= min_content_frac)).reshape(-1)
+
+
 def _resize_and_pad_to_square(img_pil: "Image.Image", size: int) -> "Image.Image":
     """stage1.feature_extractor.preprocess_mode="pad_to_square"'s core
     transform: resize preserving aspect ratio so the LARGER side fits
@@ -113,14 +140,11 @@ def _resize_and_pad_to_square(img_pil: "Image.Image", size: int) -> "Image.Image
     means despite being WORDED as "center crop" there.
     """
     w, h = img_pil.size
-    scale = size / max(w, h)
-    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    new_w, new_h, left, top = _pad_layout(w, h, size)
     resized = img_pil.resize((new_w, new_h), Image.BICUBIC)
     arr = np.array(resized)
     mean_color = tuple(int(c) for c in arr.reshape(-1, arr.shape[-1]).mean(axis=0))
     canvas = Image.new("RGB", (size, size), mean_color)
-    left = (size - new_w) // 2
-    top = (size - new_h) // 2
     canvas.paste(resized, (left, top))
     return canvas
 
@@ -735,6 +759,23 @@ class DINOv3FeatureExtractor:
         pil_imgs = [_bgr_to_pil(im) for im in images]
         inputs = self.processor(images=pil_imgs, return_tensors="pt", **self._processor_kwargs(mode))
         return inputs["pixel_values"].float()
+
+    def pixel_values_and_mask(
+        self, images: list[np.ndarray], mode: str | None = None, min_content_frac: float = 0.5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """pixel_values() plus a [B, N] bool mask over the patch tokens: True =
+        the patch holds real image content, False = it is (mostly) pad_to_square
+        padding (see pad_patch_mask). All True for modes that never pad."""
+        mode = mode if mode is not None else self.preprocess_mode
+        pv = self.pixel_values(images, mode)
+        gh, gw = pv.shape[-2] // self._PATCH_SIZE, pv.shape[-1] // self._PATCH_SIZE
+        if mode != "pad_to_square":
+            return pv, torch.ones(len(images), gh * gw, dtype=torch.bool)
+        masks = [
+            torch.from_numpy(pad_patch_mask(im.shape[1], im.shape[0], pv.shape[-1], self._PATCH_SIZE, min_content_frac))
+            for im in images
+        ]
+        return pv, torch.stack(masks)
 
     def forward_cls(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Global embedding (unnormalized) for a preprocessed batch. Not

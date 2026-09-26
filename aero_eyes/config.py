@@ -1268,6 +1268,14 @@ class PatchMatchingConfig(BaseModel):
     # masking.enabled (followed automatically), otherwise encoded as-is.
     # false (default): raw reference images.
     reuse_stage1_ref_processing: bool = False
+    # Only matters under reuse_cls_preprocess with pad_to_square (patch_matching's
+    # own preprocessing never pads): true = patches that are (mostly) padding are
+    # left out of the comparison on BOTH sides (they neither look for a match nor
+    # serve as one), so flat padding can't match flat padding and inflate the
+    # score by aspect ratio alone. A patch counts as content when at least
+    # pad_min_content_frac of its area is real image. false = compare every patch.
+    mask_padding: bool = True
+    pad_min_content_frac: float = 0.5
 
 
 class WhiteningConfig(BaseModel):
@@ -2512,6 +2520,39 @@ class ColorPostfilterConfig(BaseModel):
     candidate_inset_ratio: float = 0.15
 
 
+class CandidateFusionConfig(BaseModel):
+    """cosine_rescore.candidate_fusion -- fuse overlapping GeCo2 candidate boxes
+    of one keyframe (opt-in, off by default). See aero_eyes.utils.box_fusion.
+
+    mode "union": for an object detected as several PART boxes (a motorbike as
+      wheel + handlebar + body boxes). Boxes are linked when the intersection
+      over the SMALLER box's area is >= containment_thresh (nested boxes have a
+      low IoU, so IoU/NMS never merge them), and each linked group becomes its
+      enclosing box, provided that box is at most max_union_area_ratio x the
+      area of the group's largest member (so a chain of overlaps cannot swallow
+      separate objects). Score = highest member score.
+    mode "wbf": Weighted Boxes Fusion -- boxes with IoU > iou_thresh (greedy, by
+      descending score) become their score-weighted mean. It refines the extent
+      of near-duplicate boxes; it does NOT turn parts into a whole. Candidates
+      have already passed NMS at stage123_geco2.nms_iou, so iou_thresh has to be
+      below it or nothing can be linked (a warning is logged).
+
+    min_boxes: clusters smaller than this are left alone.
+    keep_originals: true (recommended) keeps the member boxes and APPENDS the
+      fused box (Stage 3's cosine against the reference then picks the best --
+      a whole-object crop should out-score a part crop); false replaces them.
+    Fused boxes are added AFTER candidate_topk_per_keyframe has been applied, so
+    they can push a keyframe above that count. NOT YET VALIDATED.
+    """
+    enabled: bool = False
+    mode: Literal["union", "wbf"] = "union"
+    containment_thresh: float = 0.5
+    iou_thresh: float = 0.3
+    min_boxes: int = 2
+    max_union_area_ratio: float = 4.0
+    keep_originals: bool = True
+
+
 class Geco2CosineRescoreConfig(BaseModel):
     """Optional extra matching pass inserted between GeCo2 detection and
     Stage 4 tracking: instead of GeCo2's own score alone deciding
@@ -2547,6 +2588,8 @@ class Geco2CosineRescoreConfig(BaseModel):
     # on the frame's BEST score only) and is ignored here.
     candidate_score_threshold_abs: float = 0.0
     candidate_topk_per_keyframe: int = 15
+    # Fuse overlapping candidate boxes (parts of one object -> a whole-object box) -- see CandidateFusionConfig.
+    candidate_fusion: CandidateFusionConfig = CandidateFusionConfig()
 
 
 class GlobalAdaptiveThresholdConfig(BaseModel):

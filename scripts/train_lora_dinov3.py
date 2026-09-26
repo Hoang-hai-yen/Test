@@ -446,14 +446,27 @@ def embed(ext, images: list, mode: str, micro_batch: int, amp: bool) -> torch.Te
     return torch.cat(outs)
 
 
-def embed_both(ext, images: list, mode: str, micro_batch: int, amp: bool, layers, need_patch: bool):
-    """(L2-normalised CLS [B,D], L2-normalised patch tokens [B,N,D'] or None)
-    from ONE forward pass per micro-batch, differentiable, through the
-    CURRENT (LoRA-wrapped) model with the extractor's own preprocessing."""
+def embed_both(
+    ext, images: list, mode: str, micro_batch: int, amp: bool, layers, need_patch: bool,
+    mask_padding: bool = False, pad_min_frac: float = 0.5,
+):
+    """(L2-normalised CLS [B,D], L2-normalised patch tokens [B,N,D'] or None,
+    patch-validity mask [B,N] bool or None) from ONE forward pass per
+    micro-batch, differentiable, through the CURRENT (LoRA-wrapped) model with
+    the extractor's own preprocessing. The mask (only with need_patch and
+    mask_padding, and only if the extractor can produce one) is False for
+    patches that are pad_to_square padding."""
     dev = torch.device(ext.device)
-    cls_out, patch_out = [], []
+    cls_out, patch_out, mask_out = [], [], []
+    use_mask = need_patch and mask_padding and hasattr(ext, "pixel_values_and_mask")
     for i in range(0, len(images), micro_batch):
-        pv = ext.pixel_values(images[i:i + micro_batch], mode).to(dev)
+        batch = images[i:i + micro_batch]
+        if use_mask:
+            pv, m = ext.pixel_values_and_mask(batch, mode, pad_min_frac)
+            mask_out.append(m)
+        else:
+            pv = ext.pixel_values(batch, mode)
+        pv = pv.to(dev)
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=amp and dev.type == "cuda"):
             if need_patch:
                 c, p = ext.forward_tokens(pv, layers)
@@ -462,23 +475,32 @@ def embed_both(ext, images: list, mode: str, micro_batch: int, amp: bool, layers
         cls_out.append(F.normalize(c.float(), dim=-1))
         if need_patch:
             patch_out.append(F.normalize(p.float(), dim=-1))
-    return torch.cat(cls_out), (torch.cat(patch_out) if need_patch else None)
+    return (
+        torch.cat(cls_out),
+        torch.cat(patch_out) if need_patch else None,
+        torch.cat(mask_out).to(dev) if mask_out else None,
+    )
 
 
-def _patch_pair_scores(crop_patch: torch.Tensor, ref_patch: torch.Tensor, args) -> torch.Tensor:
+def _patch_pair_scores(crop_patch, ref_patch, args, crop_mask=None, ref_mask=None) -> torch.Tensor:
     from aero_eyes.models.patch_match import patch_pair_scores
 
     return patch_pair_scores(
         crop_patch, ref_patch, getattr(args, "patch_method", "chamfer"), not getattr(args, "patch_one_way", False),
         getattr(args, "patch_ot_epsilon", 0.05), getattr(args, "patch_ot_iters", 20), getattr(args, "patch_chunk", 8),
+        cand_mask=crop_mask, ref_mask=ref_mask,
     )
 
 
-def patch_scores_by_object(crop_patch: torch.Tensor, ref_patch: torch.Tensor, ref_owner: torch.Tensor, K: int, args):
+def patch_scores_by_object(
+    crop_patch: torch.Tensor, ref_patch: torch.Tensor, ref_owner: torch.Tensor, K: int, args,
+    crop_mask=None, ref_mask=None,
+):
     """[C, K] patch score of every crop against every object: the mean over
     that object's reference images of the Chamfer/OT patch score (the same
-    'mean' multi-ref pooling stage3.patch_matching uses by default)."""
-    pair = _patch_pair_scores(crop_patch, ref_patch, args)
+    'mean' multi-ref pooling stage3.patch_matching uses by default). The
+    optional masks exclude padded patches (see embed_both)."""
+    pair = _patch_pair_scores(crop_patch, ref_patch, args, crop_mask, ref_mask)
     return torch.stack([pair[:, ref_owner == k].mean(dim=1) for k in range(K)], dim=1)
 
 
@@ -502,12 +524,16 @@ def train_step(ext, objs: list[str], obj_data: dict, args, rng, bg_logit) -> tor
     score_mode = getattr(args, "score", "cls")        # cls | patch | both
     need_patch = score_mode != "cls"
     layers = getattr(args, "patch_layers", [-1])
+    mask_pad = getattr(args, "patch_mask_padding", True)
+    pad_frac = getattr(args, "patch_pad_min_frac", 0.5)
     ref_imgs, ref_owner = [], []
     for k, o in enumerate(objs):
         for img in _pick(obj_data[o].refs, args.refs_per_object, rng):
             ref_imgs.append(degrade_ref(img, float(rng.choice(args.ref_factors))))
             ref_owner.append(k)
-    ref_emb, ref_patch = embed_both(ext, ref_imgs, ext.preprocess_mode, args.micro_batch, args.amp, layers, need_patch)
+    ref_emb, ref_patch, ref_mask = embed_both(
+        ext, ref_imgs, ext.preprocess_mode, args.micro_batch, args.amp, layers, need_patch, mask_pad, pad_frac,
+    )
     ref_owner_t = torch.tensor(ref_owner, device=ref_emb.device)
     protos = torch.stack([F.normalize(ref_emb[ref_owner_t == k].mean(0), dim=0) for k in range(K)])
 
@@ -532,14 +558,15 @@ def train_step(ext, objs: list[str], obj_data: dict, args, rng, bg_logit) -> tor
                 crops.append(augment_crop(img, rng))
                 labels.append(K)
                 owner.append(k)
-    crop_emb, crop_patch = embed_both(
-        ext, crops, ext.candidate_preprocess_mode, args.micro_batch, args.amp, layers, need_patch,
+    crop_emb, crop_patch, crop_mask = embed_both(
+        ext, crops, ext.candidate_preprocess_mode, args.micro_batch, args.amp, layers, need_patch, mask_pad, pad_frac,
     )
     y = torch.tensor(labels, device=crop_emb.device)
     own = torch.tensor(owner, device=crop_emb.device)
     if score_mode == "cls":
         return combine_scores_loss(crop_emb @ protos.t(), y, own, bg_logit, args)
-    patch_scores = patch_scores_by_object(crop_patch, ref_patch, ref_owner_t, K, args)
+    # ref_mask is per reference image [R,N]; the per-object mean happens inside patch_scores_by_object
+    patch_scores = patch_scores_by_object(crop_patch, ref_patch, ref_owner_t, K, args, crop_mask, ref_mask)
     patch_loss = combine_scores_loss(patch_scores, y, own, bg_logit, args)
     if score_mode == "patch":
         return patch_loss
@@ -556,7 +583,11 @@ def eval_video(ext, vd: VideoData, args) -> dict:
     layers = getattr(args, "patch_layers", [-1])
     refs = [degrade_ref(r, args.eval_ref_factor) for r in vd.refs]
     need_patch = score_mode != "cls"
-    ref_emb, ref_patch = embed_both(ext, refs, ext.preprocess_mode, args.micro_batch, False, layers, need_patch)
+    mask_pad = getattr(args, "patch_mask_padding", True)
+    pad_frac = getattr(args, "patch_pad_min_frac", 0.5)
+    ref_emb, ref_patch, ref_mask = embed_both(
+        ext, refs, ext.preprocess_mode, args.micro_batch, False, layers, need_patch, mask_pad, pad_frac,
+    )
     proto = F.normalize(ref_emb.mean(0), dim=0)
     w = getattr(args, "cls_weight", 0.3)
 
@@ -565,14 +596,14 @@ def eval_video(ext, vd: VideoData, args) -> dict:
             return np.zeros(0)
         out = []
         for i in range(0, len(images), args.micro_batch):
-            c, p = embed_both(
+            c, p, cm = embed_both(
                 ext, images[i:i + args.micro_batch], ext.candidate_preprocess_mode, args.micro_batch, False,
-                layers, need_patch,
+                layers, need_patch, mask_pad, pad_frac,
             )
             if score_mode == "cls":
                 s = c @ proto
             else:
-                sp = _patch_pair_scores(p, ref_patch, args).mean(dim=1)
+                sp = _patch_pair_scores(p, ref_patch, args, cm, ref_mask).mean(dim=1)
                 s = sp if score_mode == "patch" else w * (c @ proto) + (1.0 - w) * sp
             out.append(s.cpu())
         return torch.cat(out).numpy()
@@ -717,6 +748,12 @@ def main():
     p.add_argument("--patch-one-way", action="store_true", help="ref->crop Chamfer only (default: symmetric)")
     p.add_argument("--patch-ot-epsilon", type=float, default=0.05)
     p.add_argument("--patch-ot-iters", type=int, default=20, help="Sinkhorn iterations (training default lower than inference's 50)")
+    p.add_argument("--patch-mask-padding", action=argparse.BooleanOptionalAction, default=True,
+                   help="with pad_to_square, leave padded patches out of the patch comparison on both sides "
+                        "(default on; --no-patch-mask-padding compares every patch). Use the same setting as "
+                        "stage3.patch_matching.mask_padding")
+    p.add_argument("--patch-pad-min-frac", type=float, default=0.5,
+                   help="a patch counts as content when at least this fraction of it is real image")
     p.add_argument("--patch-chunk", type=int, default=8, help="crops per patch-score block (lower = less GPU memory)")
     p.add_argument("--select-by", choices=["auroc", "tpr_fpr1pct"], default="auroc",
                    help="validation metric that picks lora_best.pt; tpr_fpr1pct = share of targets kept at 1 percent clutter leak")
@@ -786,6 +823,7 @@ def main():
         "score": args.score, "cls_weight": args.cls_weight, "patch_method": args.patch_method,
         "patch_layers": args.patch_layers, "patch_symmetric": not args.patch_one_way,
         "patch_ot_epsilon": args.patch_ot_epsilon, "patch_ot_iters": args.patch_ot_iters,
+        "patch_mask_padding": args.patch_mask_padding, "patch_pad_min_frac": args.patch_pad_min_frac,
     }
 
     rng = np.random.default_rng(args.seed)
