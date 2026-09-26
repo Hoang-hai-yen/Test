@@ -244,6 +244,7 @@ class CheapBoostersConfig(BaseModel):
     scales: list[float] = [0.75, 1.0, 1.5]
     tuned_nms: bool = True
     multi_reference_embedding: bool = True
+    multi_ref_pooling: Literal["mean", "max"] = "mean"
 
 
 class MaxAccuracyConfig(BaseModel):
