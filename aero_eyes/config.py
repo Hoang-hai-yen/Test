@@ -72,12 +72,13 @@ class SegmentationConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
+    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble", "vdt"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
     clip_variant: str = "vit-b/32"
     siglip_variant: Literal["base", "large", "so400m"] = "base"
     weights: Optional[str] = None
+    vdt_weights: Optional[str] = None
     image_size: int = 224
 
 
@@ -173,7 +174,8 @@ class BuiltinTrackerConfig(BaseModel):
 
 
 class LiteTrackConfig(BaseModel):
-    onnx_path: Optional[str] = None
+    onnx_path_z: Optional[str] = None
+    onnx_path_x: Optional[str] = None
     input_size: int = 256
 
 
@@ -233,6 +235,7 @@ class CheapBoostersConfig(BaseModel):
     scales: list[float] = [0.75, 1.0, 1.5]
     tuned_nms: bool = True
     multi_reference_embedding: bool = True
+    multi_ref_pooling: Literal["mean", "max", "concat_then_pca"] = "mean"
 
 
 class MaxAccuracyConfig(BaseModel):
@@ -330,13 +333,21 @@ class AeroEyesConfig(BaseModel):
     eval: EvalConfig = EvalConfig()
 
     @model_validator(mode="after")
-    def check_litetrack_path(self) -> "AeroEyesConfig":
+    def check_requirements(self) -> "AeroEyesConfig":
+        # Tracker check
         if self.stage4.tracker == "litetrack":
-            if not self.stage4.litetrack.onnx_path:
+            if not self.stage4.litetrack.onnx_path_z or not self.stage4.litetrack.onnx_path_x:
                 raise ValueError(
-                    "stage4.tracker is 'litetrack' but stage4.litetrack.onnx_path is not set. "
-                    "Download the LiteTrack-B4 ONNX weights and set "
-                    "stage4.litetrack.onnx_path=/path/to/litetrack.onnx in your config."
+                    "stage4.tracker is 'litetrack' but stage4.litetrack.onnx_path_z or "
+                    "stage4.litetrack.onnx_path_x is not set."
+                )
+        
+        # Feature Extractor (VDT) check
+        if self.stage1.feature_extractor.model == "vdt":
+            if not self.stage1.feature_extractor.vdt_weights:
+                raise ValueError(
+                    "stage1.feature_extractor.model is 'vdt' but stage1.feature_extractor.vdt_weights is not set. "
+                    "Please set the path to your VDT .pth weights file."
                 )
         return self
 
