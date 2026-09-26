@@ -9,6 +9,8 @@ Supported models:
   siglip   — SigLIP vision encoder (base/large/so400m), pooled output
              (768/1024/1152-d). Open access, no gating.
   ensemble — DINOv2 + CLIP concatenated then L2-normalized (1280 or 896-d)
+  vdt      — View-Decoupled Transformer (VDT) based on ViT-Base (768-d).
+             Custom loaded from weights file. 
 
 All extractors return L2-normalized float32 feature vectors.
 """
@@ -16,11 +18,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import os
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.transforms as T
 from PIL import Image
 
 from aero_eyes.types import Box
@@ -28,7 +32,7 @@ from aero_eyes.utils.geometry import crop_with_pad
 
 log = logging.getLogger(__name__)
 
-# ImageNet normalization (DINOv2)
+# ImageNet normalization (DINOv2 & VDT)
 _DINO_MEAN = (0.485, 0.456, 0.406)
 _DINO_STD  = (0.229, 0.224, 0.225)
 
@@ -50,6 +54,86 @@ def _preprocess_dino(img_bgr: np.ndarray, image_size: int = 224) -> torch.Tensor
 def _bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
+
+# ---------------------------------------------------------------------------
+# VDT (View-Decoupled Transformer)
+# ---------------------------------------------------------------------------
+
+class VDTFeatureExtractor:
+    """View-Decoupled Transformer (VDT) based on ViT-Base.
+    
+    Loads a custom .pth file. The input image size is strictly 256x128 
+    as per the paper. Only the meta_token (identity) is returned.
+    """
+    def __init__(self, weights_path: str, device: str = "auto"):
+        self.device = _resolve_device(device)
+        self.weights_path = weights_path
+        self.model = self._load_model()
+        self.model.eval().to(self.device)
+        
+        # VDT requires 256x128 resolution
+        self.transform = T.Compose([
+            T.Resize((256, 128)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        log.info(f"VDT loaded on {self.device} from {self.weights_path} (dim=768)")
+
+    def _load_model(self):
+        if not self.weights_path or not os.path.exists(self.weights_path):
+            raise FileNotFoundError(f"VDT weights not found at {self.weights_path}")
+        
+        # Import your actual VDT model class here
+        # For example, assuming it's in aero_eyes.models.vdt_model:
+        try:
+            from aero_eyes.models.vdt_model import build_vdt_model
+            model = build_vdt_model()
+        except ImportError:
+            log.warning("Could not import build_vdt_model from aero_eyes.models.vdt_model. Falling back to timm vit_base_patch16_224 as a placeholder.")
+            import timm
+            model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=0)
+
+        state_dict = torch.load(self.weights_path, map_location=self.device)
+        if "module." in list(state_dict.keys())[0]:
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        
+        model.load_state_dict(state_dict, strict=False)
+        return model
+
+    @torch.no_grad()
+    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        if not images:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        
+        pil_imgs = [_bgr_to_pil(im) for im in images]
+        tensors = [self.transform(img) for img in pil_imgs]
+        
+        out = []
+        for i in range(0, len(tensors), batch_size):
+            batch = torch.stack(tensors[i:i+batch_size]).to(self.device)
+            outputs = self.model(batch)
+            
+            # Extract meta token (t_m). Assume output is tuple (t_m, t_v) or just t_m
+            if isinstance(outputs, tuple):
+                meta_token = outputs[0]
+            else:
+                meta_token = outputs
+                
+            out.append(F.normalize(meta_token, p=2, dim=1).cpu().numpy())
+            
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
+                      pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
+        if not boxes:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+
+    def _dim(self) -> int:
+        return 768
+
+    def _feature_dim(self) -> int:
+        return self._dim()
 
 # ---------------------------------------------------------------------------
 # DINOv2
@@ -344,7 +428,7 @@ class EnsembleFeatureExtractor:
 # Factory
 # ---------------------------------------------------------------------------
 
-def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtractor | CLIPFeatureExtractor | SiglipFeatureExtractor | EnsembleFeatureExtractor:
+def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtractor | CLIPFeatureExtractor | SiglipFeatureExtractor | EnsembleFeatureExtractor | VDTFeatureExtractor:
     """Build the feature extractor specified by cfg.stage1.feature_extractor."""
     fe  = cfg.stage1.feature_extractor
     dev = cfg.device()
@@ -377,9 +461,14 @@ def build_feature_extractor(cfg) -> DINOv2FeatureExtractor | DINOv3FeatureExtrac
             device         = dev,
             image_size     = fe.image_size,
         )
+    if fe.model == "vdt":
+        return VDTFeatureExtractor(
+            weights_path = fe.vdt_weights,
+            device = dev
+        )
     raise ValueError(
         f"Unknown feature extractor model '{fe.model}'. "
-        "Must be 'dinov2', 'dinov3', 'clip', 'siglip', or 'ensemble'."
+        "Must be 'dinov2', 'dinov3', 'clip', 'siglip', 'ensemble', or 'vdt'."
     )
 
 
