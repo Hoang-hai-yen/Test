@@ -164,3 +164,26 @@ def test_candidate_pass_reads_get_prototype_fresh_each_frame(monkeypatch):
     )
 
     assert [c[1] for c in detector.calls] == ["v1", "v2"]
+
+
+def test_candidate_pass_saves_raw_candidate_frames_only_when_viz_dir_given(monkeypatch, tmp_path):
+    frames = {10: _frame(10), 20: _frame(20)}
+    _patch_frame_iterator(monkeypatch, frames)
+    boxes_by_frame = {10: [Box(0, 0, 5, 5, score=0.9)], 20: []}
+    cfg = SimpleNamespace(
+        stage2=SimpleNamespace(candidate=SimpleNamespace(feature_crop_pad=0.1)),
+        runtime=SimpleNamespace(batch_size=8),
+    )
+
+    def run(viz_dir):
+        return stage123_geco2._run_geco2_candidate_pass(
+            _FakeDetector(boxes_by_frame), _FakeExtractor(dim=3), Path("/nonexistent.mp4"), {10, 20},
+            lambda: "PROTO", color_sig=None, cpf_cfg=None, cfg=cfg, viz_dir=viz_dir,
+        )
+
+    run(None)
+    assert not list(tmp_path.glob("**/*.jpg"))                       # off by default: nothing written
+
+    out = tmp_path / "candidates"
+    run(out)
+    assert sorted(p.name for p in out.glob("*.jpg")) == ["frame_000010.jpg"]   # frame 20 had no candidates

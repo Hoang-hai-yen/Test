@@ -737,6 +737,9 @@ def main():
     if 0 < args.hard_neg_pool <= args.neg_per_object:
         log.warning("--hard-neg-pool %d <= --neg-per-object %d: nothing to mine, ignoring.",
                     args.hard_neg_pool, args.neg_per_object)
+    if args.loss == "triplet" and args.neg_margin is not None:
+        log.warning("--neg-margin %.3f is ignored with --loss triplet (the triplet margin, --triplet-margin, "
+                    "plays that role); --tau and --bg-init-cos are ignored too.", args.neg_margin)
 
     from aero_eyes.config import load_config
     from aero_eyes.models.features import DINOv3FeatureExtractor, build_feature_extractor

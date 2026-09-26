@@ -978,7 +978,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
 def _run_geco2_candidate_pass(
     detector, extractor, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg, cfg,
-    on_result=None,
+    on_result=None, viz_dir: Path | None = None,
 ) -> dict[int, list[Detection]]:
     """One full sweep over the video's keyframes building candidates.json
     entries -- shared by run_stage12_geco2_candidates's pass 1 (online
@@ -987,7 +987,13 @@ def _run_geco2_candidate_pass(
     _run_geco2_default_pass. on_result(frame_idx, frame_bgr, boxes, feats),
     when given, runs after each keyframe's candidates are built -- pass 1
     uses it to feed dyn_proto_tracker.offer(); pass 2 passes None.
+
+    viz_dir, when given, saves every keyframe that has at least one candidate
+    (after the color postfilter) as viz_dir/frame_XXXXXX.jpg with each box
+    labelled by GeCo2's own score -- the RAW candidates, before Stage 3's
+    cosine threshold/NMS/top-K (Stage 3 draws its own, filtered frames).
     """
+    from aero_eyes.utils import viz as vizmod
     from aero_eyes.utils.video import frame_iterator
 
     candidates: dict[int, list[Detection]] = {}
@@ -1015,6 +1021,8 @@ def _run_geco2_candidate_pass(
             frame_dets.append(d)
         candidates[frame_idx] = frame_dets
         log.debug("[Stage12-GeCo2] frame %d: %d candidates", frame_idx, len(frame_dets))
+        if viz_dir is not None and boxes:
+            vizmod.save_stage2_keyframe(frame_bgr, boxes, None, frame_idx, viz_dir)
         if on_result is not None:
             on_result(frame_idx, frame_bgr, boxes, feats)
     return candidates
@@ -1042,6 +1050,8 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     Writes: <work_dir>/<sample_id>/geco2_prototype.pt (cached GeCo2 exemplar tokens)
             <work_dir>/<sample_id>/prototype.npz (cached DINOv2 prototype, via run_stage1)
             <work_dir>/<sample_id>/candidates.json (+ .feats.npz)
+            <work_dir>/<sample_id>/viz/stage123_geco2/candidates/frame_XXXXXX.jpg
+              (raw candidates + GeCo2 score per box, when runtime.save_visualizations=true)
     """
     from aero_eyes.models.features import build_feature_extractor
     from aero_eyes.models.geco2_detector import GeCo2Detector
@@ -1125,9 +1135,13 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
             dyn_proto_tracker.offer_topk(frame_bgr, boxes, feats, frame_idx=frame_idx)
 
     get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
+    # Raw (pre-Stage-3) candidate frames, only when runtime.save_visualizations is on.
+    cand_viz_dir = (
+        work_dir / "viz" / "stage123_geco2" / "candidates" if cfg.runtime.save_visualizations else None
+    )
     candidates = _run_geco2_candidate_pass(
         detector, extractor, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, cfg,
-        on_result=_offer_best,
+        on_result=_offer_best, viz_dir=cand_viz_dir,
     )
     if dyn_proto_tracker is not None:
         dyn_proto_tracker.log_summary()
@@ -1153,9 +1167,13 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
                 "1, replacing pass 1's candidates.", sample_id, n_dynamic,
             )
             frozen_prototype = dyn_proto_tracker.effective_prototype()
+            if cand_viz_dir is not None and cand_viz_dir.exists():
+                # pass 2 replaces pass 1's candidates -- drop pass 1's frames so none go stale
+                for old in cand_viz_dir.glob("frame_*.jpg"):
+                    old.unlink()
             candidates = _run_geco2_candidate_pass(
                 detector, extractor, video_path, kf_indices, lambda: frozen_prototype,
-                color_sig, cpf_cfg, cfg,
+                color_sig, cpf_cfg, cfg, viz_dir=cand_viz_dir,
             )
 
     _write_candidates_with_features(candidates, cand_path)
@@ -1164,6 +1182,9 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     elapsed = time.time() - t0
     log.info("[Stage12-GeCo2] %s done in %.1fs -> %s (%d keyframes)",
               sample_id, elapsed, cand_path, len(candidates))
+    if cand_viz_dir is not None:
+        log.info("[Stage12-GeCo2] %s: raw candidate frames (%d with >=1 box) saved to %s",
+                 sample_id, sum(1 for d in candidates.values() if d), cand_viz_dir)
     return cand_path
 
 
