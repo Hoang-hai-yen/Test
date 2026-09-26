@@ -259,7 +259,6 @@ accuracy:
     scales: [0.75, 1.0, 1.5]
     tuned_nms: true
     multi_reference_embedding: true   # keep per-ref protos + ensemble match
-    multi_ref_pooling: mean           # mean | max -- how per-reference scores are combined (stage34)
 
   max_accuracy:
     synthetic_viewpoint_aug:

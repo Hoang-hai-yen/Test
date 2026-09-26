@@ -123,9 +123,7 @@ def _run_matching(cfg, sample_id: str) -> Path:
     dynamic_updated = False
     if dyn_enabled:
         for round_idx in range(dyn_rounds):
-            adaptive_high_thresh = float(np.percentile(all_sims, dyn_percentile))
-            if s3.similarity == "cosine":
-                adaptive_high_thresh = max(dyn_abs_floor, adaptive_high_thresh)
+            adaptive_high_thresh = max(dyn_abs_floor, float(np.percentile(all_sims, dyn_percentile)))
             high_conf_mask = all_sims >= adaptive_high_thresh
 
             if int(high_conf_mask.sum()) < dyn_min_support:
@@ -279,12 +277,11 @@ def _track_still_matches(
         and len(per_ref_features) > 0
     )
     pool_fn = _get_pool_fn(cfg)
-    metric = cfg.stage3.similarity
 
     if use_multi_ref:
-        sim = float(pool_fn([_score_against_ref(feats[:1], ref_feat, metric)[0] for ref_feat in per_ref_features]))
+        sim = float(pool_fn([feats[0] @ ref_feat for ref_feat in per_ref_features]))
     else:
-        sim = float(_score_against_ref(feats[:1], prototype, metric)[0])
+        sim = float(feats[0] @ prototype)
 
     return sim >= match_threshold
 
@@ -338,13 +335,12 @@ def _detect_on_frame(
         and len(per_ref_features) > 0
     )
     pool_fn = _get_pool_fn(cfg)
-    metric = cfg.stage3.similarity
 
     if use_multi_ref:
-        sims_per_ref = [_score_against_ref(feats, ref_feat, metric) for ref_feat in per_ref_features]
+        sims_per_ref = [feats @ ref_feat for ref_feat in per_ref_features]
         sims = pool_fn(sims_per_ref, axis=0)
     else:
-        sims = _score_against_ref(feats, prototype, metric)
+        sims = feats @ prototype
 
     best_idx = int(np.argmax(sims))
     if sims[best_idx] >= match_threshold:
