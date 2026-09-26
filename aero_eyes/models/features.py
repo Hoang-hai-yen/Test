@@ -122,7 +122,12 @@ def pad_patch_mask(w: int, h: int, size: int, patch: int = 16, min_content_frac:
         return np.clip(np.minimum(starts + patch, lo + length) - np.maximum(starts, lo), 0, patch)
 
     frac = (overlap(top, new_h)[:, None] * overlap(left, new_w)[None, :]) / float(patch * patch)
-    return ((frac > 0) & (frac >= min_content_frac)).reshape(-1)
+    mask = (frac > 0) & (frac >= min_content_frac)
+    if not mask.any():
+        # a very thin/small crop is under min_content_frac in EVERY patch: keep the best-covered
+        # patches instead of masking the whole image out (an empty patch set has no score)
+        mask = frac >= frac.max()
+    return mask.reshape(-1)
 
 
 def _resize_and_pad_to_square(img_pil: "Image.Image", size: int) -> "Image.Image":

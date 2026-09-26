@@ -76,6 +76,9 @@ def patch_pair_scores(
     R, M = ref.shape[:2]
     cmask = torch.ones(C, N, dtype=torch.bool, device=cand.device) if cand_mask is None else cand_mask.to(cand.device)
     rmask = torch.ones(R, M, dtype=torch.bool, device=cand.device) if ref_mask is None else ref_mask.to(cand.device)
+    # an image with NO valid patch has no score (max over an empty set = -inf): compare all its patches instead
+    cmask = torch.where(cmask.any(-1, keepdim=True), cmask, torch.ones_like(cmask))
+    rmask = torch.where(rmask.any(-1, keepdim=True), rmask, torch.ones_like(rmask))
     n_ref = rmask.sum(-1).clamp(min=1).to(cand.dtype)            # [R]
     neg_inf = float("-inf")
     big = 1e4                                                    # log-weight of a masked-out patch in OT
@@ -87,11 +90,11 @@ def patch_pair_scores(
         if method == "chamfer":
             # ref patch -> best VALID cand patch, averaged over VALID ref patches
             r2c = sim.masked_fill(~cm[:, None, :, None], neg_inf).max(dim=2).values      # [c,R,M]
-            r2c = (r2c * rmask[None]).nan_to_num(0.0).sum(-1) / n_ref[None]               # [c,R]
+            r2c = torch.where(rmask[None], r2c, torch.zeros_like(r2c)).sum(-1) / n_ref[None]     # [c,R]
             score = r2c
             if symmetric:
                 c2r = sim.masked_fill(~rmask[None, :, None, :], neg_inf).max(dim=3).values  # [c,R,N]
-                c2r = (c2r * cm[:, None, :]).nan_to_num(0.0).sum(-1) / n_cand[:, None]      # [c,R]
+                c2r = torch.where(cm[:, None, :], c2r, torch.zeros_like(c2r)).sum(-1) / n_cand[:, None]  # [c,R]
                 score = 0.5 * (r2c + c2r)
         else:
             with torch.no_grad():

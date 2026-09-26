@@ -465,3 +465,25 @@ def test_patch_matching_config_masks_padding_by_default():
 
     c = PatchMatchingConfig()
     assert c.mask_padding is True and c.pad_min_content_frac == 0.5
+
+
+def test_very_thin_crop_never_gets_an_empty_patch_mask():
+    from aero_eyes.models.features import pad_patch_mask
+
+    mask = pad_patch_mask(60, 3, 224, 16)          # 60x3 px crop -> ~11 px of content: under 50% of every patch
+    assert mask.any()
+    assert mask.sum() < mask.size                  # still mostly padding
+
+
+def test_patch_scores_stay_finite_when_an_image_has_no_valid_patch():
+    from aero_eyes.models.patch_match import patch_pair_scores
+
+    g = torch.Generator().manual_seed(0)
+    norm = lambda t: torch.nn.functional.normalize(t, dim=-1)
+    cand, ref = norm(torch.randn(2, 10, 16, generator=g)), norm(torch.randn(2, 12, 16, generator=g))
+    empty_c = torch.zeros(2, 10, dtype=torch.bool)
+    empty_r = torch.zeros(2, 12, dtype=torch.bool)
+    for method in ("chamfer", "ot"):
+        got = patch_pair_scores(cand, ref, method, cand_mask=empty_c, ref_mask=empty_r)
+        assert torch.isfinite(got).all()
+        assert torch.allclose(got, patch_pair_scores(cand, ref, method), atol=1e-5)   # falls back to comparing everything

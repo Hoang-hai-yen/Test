@@ -1006,6 +1006,7 @@ def _run_geco2_candidate_pass(
     from aero_eyes.utils.video import frame_iterator
 
     candidates: dict[int, list[Detection]] = {}
+    n_fused_frames = n_fused_boxes = n_boxes_in = 0
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
@@ -1014,7 +1015,11 @@ def _run_geco2_candidate_pass(
         if color_sig is not None:
             boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
         if fusion_cfg is not None and fusion_cfg.enabled:
+            n_boxes_in += len(boxes)
             boxes = fuse_overlapping_boxes(boxes, fusion_cfg)
+            n_new = sum(1 for b in boxes if getattr(b, "fused", False))
+            n_fused_boxes += n_new
+            n_fused_frames += 1 if n_new else 0
 
         if not encode:
             feats = np.zeros((len(boxes), 1), dtype=np.float32)
@@ -1038,6 +1043,14 @@ def _run_geco2_candidate_pass(
             vizmod.save_stage2_keyframe(frame_bgr, boxes, None, frame_idx, viz_dir)
         if on_result is not None:
             on_result(frame_idx, frame_bgr, boxes, feats)
+    if fusion_cfg is not None and fusion_cfg.enabled:
+        log.info(
+            "[Stage12-GeCo2] candidate_fusion (mode=%s, keep_originals=%s): %d fused box(es) in %d/%d "
+            "keyframe(s), from %d detected box(es)%s",
+            fusion_cfg.mode, fusion_cfg.keep_originals, n_fused_boxes, n_fused_frames, len(candidates),
+            n_boxes_in, "" if n_fused_boxes else " -- nothing was linked; see CandidateFusionConfig "
+            "(containment_thresh / max_union_area_ratio / iou_thresh)",
+        )
     return candidates
 
 

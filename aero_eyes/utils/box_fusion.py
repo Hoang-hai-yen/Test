@@ -127,6 +127,7 @@ def fuse_overlapping_boxes(boxes: list[Box], cfg) -> list[Box]:
         if fused is None:
             kept.extend(members)
             continue
+        fused.fused = True  # type: ignore[attr-defined]  -- only for viz (a distinct color/label); not serialized
         fused_boxes.append(fused)
         if cfg.keep_originals:
             kept.extend(members)

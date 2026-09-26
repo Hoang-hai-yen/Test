@@ -98,3 +98,41 @@ def test_candidate_pass_fuses_before_extracting_features(monkeypatch):
         color_sig=None, cpf_cfg=None, cfg=cfg, fusion_cfg=_cfg(containment_thresh=0.4),
     )
     assert len(cands[10]) == 4 and extractor.calls == [(10, 4)]      # 3 parts + 1 fused box, all embedded
+
+
+def test_fused_boxes_are_tagged_for_viz_and_drawn_in_their_own_color(tmp_path):
+    import cv2
+    import numpy as np
+
+    from aero_eyes.utils.viz import save_stage2_keyframe
+
+    out = fuse_overlapping_boxes(PARTS, _cfg(containment_thresh=0.4))
+    assert [getattr(b, "fused", False) for b in out] == [False] * 4 + [True]
+    frame = np.zeros((300, 600, 3), np.uint8)
+    save_stage2_keyframe(frame, out, None, 7, tmp_path)
+    img = cv2.imread(str(tmp_path / "frame_000007.jpg"))
+    magenta = (img[..., 0] > 200) & (img[..., 1] < 60) & (img[..., 2] > 200)     # BGR (255, 0, 255), jpeg-tolerant
+    assert magenta.any()
+
+
+def test_fusion_summary_is_logged_including_the_nothing_linked_hint(monkeypatch, caplog):
+    import logging
+
+    _patch_frame_iterator(monkeypatch, {10: _frame(10)})
+    cfg = SimpleNamespace(
+        stage2=SimpleNamespace(candidate=SimpleNamespace(feature_crop_pad=0.1)),
+        runtime=SimpleNamespace(batch_size=8),
+    )
+
+    def run(fusion):
+        stage123_geco2._run_geco2_candidate_pass(
+            _FakeDetector({10: [BODY, WHEEL, HANDLE]}), _FakeExtractor(dim=3), Path("/nonexistent.mp4"), {10},
+            lambda: "P", color_sig=None, cpf_cfg=None, cfg=cfg, fusion_cfg=fusion,
+        )
+
+    with caplog.at_level(logging.INFO):
+        run(_cfg(containment_thresh=0.4))
+        assert "1 fused box(es) in 1/1 keyframe(s), from 3 detected" in caplog.text
+        caplog.clear()
+        run(_cfg(containment_thresh=0.99))
+        assert "0 fused box(es)" in caplog.text and "nothing was linked" in caplog.text

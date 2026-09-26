@@ -20,6 +20,7 @@ _COLORS = {
     "track": (0, 165, 255),  # orange
     "gt": (0, 0, 255),       # red
     "tile": (200, 200, 0),   # cyan-ish
+    "fused": (255, 0, 255),  # magenta -- a box made by cosine_rescore.candidate_fusion
 }
 
 
@@ -47,7 +48,10 @@ def save_stage2_keyframe(frame: np.ndarray, boxes: list[Box],
         for tile in tiles:
             cv2.rectangle(vis, (tile.x1, tile.y1), (tile.x2, tile.y2), _COLORS["tile"], 1)
     for b in boxes:
-        draw_box(vis, b, f"{b.score:.2f}", _COLORS["detect"])
+        if getattr(b, "fused", False):
+            draw_box(vis, b, f"F {b.score:.2f}", _COLORS["fused"], thickness=3)
+        else:
+            draw_box(vis, b, f"{b.score:.2f}", _COLORS["detect"])
     cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}.jpg"), vis)
 
 
