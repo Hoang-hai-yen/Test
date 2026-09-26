@@ -29,6 +29,22 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def check_placeholder_features(cand_path: Path, s3, video_path) -> None:
+    """candidates.json written with cosine_rescore.skip_candidate_encoding holds
+    placeholder features: scoring them would be silently meaningless, so refuse
+    unless this run recomputes them (which then overwrites the placeholders)."""
+    from aero_eyes.stages.stage2 import candidates_have_placeholder_features
+
+    if candidates_have_placeholder_features(cand_path) and not (
+        s3.recompute_candidate_features and video_path is not None
+    ):
+        raise ValueError(
+            f"{cand_path} was written with stage123_geco2.cosine_rescore.skip_candidate_encoding (its features "
+            "are placeholders). Run Stage 3 with stage3.recompute_candidate_features=true (and the sample video "
+            "available), or regenerate candidates with skip_candidate_encoding=false."
+        )
+
+
 def apply_whitening(cfg_w, all_feats: np.ndarray, prototype: np.ndarray, per_ref_features: list):
     """stage3.whitening: map candidate features [N,D], the fused prototype [D]
     and per-ref vectors (list of [D]) through the offline-fitted PCA whitening
@@ -918,6 +934,7 @@ def run_stage3(cfg, sample_id: str) -> Path:
     video_path = video_files[0] if video_files else None
 
     s3 = cfg.stage3
+    check_placeholder_features(cand_path, s3, video_path)
     if s3.recompute_candidate_features and video_path is not None:
         # stage3.recompute_candidate_features: re-extract features for the
         # EXISTING candidate boxes with the CURRENTLY configured

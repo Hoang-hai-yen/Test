@@ -2590,6 +2590,15 @@ class Geco2CosineRescoreConfig(BaseModel):
     candidate_topk_per_keyframe: int = 15
     # Fuse overlapping candidate boxes (parts of one object -> a whole-object box) -- see CandidateFusionConfig.
     candidate_fusion: CandidateFusionConfig = CandidateFusionConfig()
+    # true: this stage does NOT embed the candidate crops (saves the whole
+    # per-crop DINO pass and the model load) -- candidates.json is written with
+    # placeholder features and stage3.recompute_candidate_features (REQUIRED,
+    # otherwise this raises) embeds them itself, after box_refine if configured.
+    # Only worth it when recompute is on anyway (it re-embeds every candidate,
+    # so this stage embeddings would just be thrown away). Incompatible with
+    # dynamic_prototype.cross_check_source="feature_extractor" (it scores each
+    # keyframe candidates with those embeddings while this stage runs).
+    skip_candidate_encoding: bool = False
 
 
 class GlobalAdaptiveThresholdConfig(BaseModel):

@@ -196,8 +196,14 @@ def run_stage2(cfg, sample_id: str) -> Path:
 def _write_candidates_with_features(
     candidates: dict[int, list[Detection]],
     path: Path,
+    placeholder_features: bool = False,
 ) -> None:
-    """Write candidates JSON + companion NPZ for feature vectors."""
+    """Write candidates JSON + companion NPZ for feature vectors.
+
+    placeholder_features=True marks the NPZ vectors as meaningless stand-ins
+    (stage123_geco2.cosine_rescore.skip_candidate_encoding): stage3 must
+    recompute them (stage3.recompute_candidate_features) and refuses to score
+    otherwise -- see candidates_have_placeholder_features."""
     import json
     import numpy as np
 
@@ -228,10 +234,23 @@ def _write_candidates_with_features(
 
     # Save feature matrix alongside
     feat_path = path.with_suffix(".feats.npz")
+    marker = np.array(bool(placeholder_features))
     if all_feats:
-        np.savez_compressed(str(feat_path), features=np.stack(all_feats, axis=0))
+        np.savez_compressed(str(feat_path), features=np.stack(all_feats, axis=0), placeholder=marker)
     else:
-        np.savez_compressed(str(feat_path), features=np.zeros((0, 768), dtype=np.float32))
+        np.savez_compressed(str(feat_path), features=np.zeros((0, 768), dtype=np.float32), placeholder=marker)
+
+
+def candidates_have_placeholder_features(path: Path) -> bool:
+    """True when candidates.feats.npz was written with placeholder_features=True
+    (no real embeddings yet). False for a missing file or an older NPZ."""
+    import numpy as np
+
+    feat_path = Path(path).with_suffix(".feats.npz")
+    if not feat_path.exists():
+        return False
+    z = np.load(str(feat_path))
+    return "placeholder" in z.files and bool(z["placeholder"])
 
 
 def read_candidates_with_features(path: Path):

@@ -978,7 +978,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
 def _run_geco2_candidate_pass(
     detector, extractor, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg, cfg,
-    on_result=None, viz_dir: Path | None = None, fusion_cfg=None,
+    on_result=None, viz_dir: Path | None = None, fusion_cfg=None, encode: bool = True,
 ) -> dict[int, list[Detection]]:
     """One full sweep over the video's keyframes building candidates.json
     entries -- shared by run_stage12_geco2_candidates's pass 1 (online
@@ -987,6 +987,10 @@ def _run_geco2_candidate_pass(
     _run_geco2_default_pass. on_result(frame_idx, frame_bgr, boxes, feats),
     when given, runs after each keyframe's candidates are built -- pass 1
     uses it to feed dyn_proto_tracker.offer(); pass 2 passes None.
+
+    encode=False (cosine_rescore.skip_candidate_encoding) skips the per-crop
+    embedding: extractor may then be None and every candidate carries a 1-d zero
+    placeholder feature (stage3.recompute_candidate_features replaces it).
 
     fusion_cfg (a CandidateFusionConfig, from cosine_rescore.candidate_fusion),
     when given and enabled, fuses each keyframe's overlapping boxes before
@@ -1012,7 +1016,9 @@ def _run_geco2_candidate_pass(
         if fusion_cfg is not None and fusion_cfg.enabled:
             boxes = fuse_overlapping_boxes(boxes, fusion_cfg)
 
-        if boxes:
+        if not encode:
+            feats = np.zeros((len(boxes), 1), dtype=np.float32)
+        elif boxes:
             feats = extractor.extract_crops(
                 frame_bgr, boxes,
                 pad_ratio=cfg.stage2.candidate.feature_crop_pad,
@@ -1033,6 +1039,27 @@ def _run_geco2_candidate_pass(
         if on_result is not None:
             on_result(frame_idx, frame_bgr, boxes, feats)
     return candidates
+
+
+def validate_skip_candidate_encoding(cfg) -> None:
+    """cosine_rescore.skip_candidate_encoding needs stage3 to embed the crops
+    itself and nothing in this stage to consume the embeddings."""
+    if not cfg.stage123_geco2.cosine_rescore.skip_candidate_encoding:
+        return
+    if not cfg.stage3.recompute_candidate_features:
+        raise ValueError(
+            "stage123_geco2.cosine_rescore.skip_candidate_encoding=true needs "
+            "stage3.recompute_candidate_features=true -- without it Stage 3 would score placeholder "
+            "features. Enable recompute or turn skip_candidate_encoding off."
+        )
+    dp = cfg.stage123_geco2.dynamic_prototype
+    if dp.enabled and dp.cross_check_source == "feature_extractor":
+        raise ValueError(
+            "stage123_geco2.cosine_rescore.skip_candidate_encoding=true is incompatible with "
+            "stage123_geco2.dynamic_prototype.cross_check_source='feature_extractor' (that mode scores "
+            "each keyframe's candidates with the embeddings this option skips). Use cross_check_source="
+            "'hiera' or turn skip_candidate_encoding off."
+        )
 
 
 def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
@@ -1075,6 +1102,8 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
         log.info("[Stage12-GeCo2] %s: using cached candidates at %s", sample_id, cand_path)
         return cand_path
 
+    validate_skip_candidate_encoding(cfg)    # fail fast, before any model is loaded
+
     # DINOv2 prototype for Stage 3's cosine matching -- independent of (and
     # cached separately from) GeCo2's own exemplar tokens below.
     run_stage1(cfg, sample_id)
@@ -1109,7 +1138,13 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     cpf_cfg = cfg.stage123_geco2.color_postfilter
     color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
 
-    extractor = build_feature_extractor(cfg)
+    skip_encoding = cr.skip_candidate_encoding
+    extractor = None if skip_encoding else build_feature_extractor(cfg)
+    if skip_encoding:
+        log.info(
+            "[Stage12-GeCo2] %s: skip_candidate_encoding -- candidate crops are NOT embedded here; "
+            "stage3.recompute_candidate_features will embed them.", sample_id,
+        )
 
     # stage123_geco2.dynamic_prototype (opt-in): same online/incremental
     # mechanism as run_stage123_geco2's own wiring -- see
@@ -1166,7 +1201,7 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     )
     candidates = _run_geco2_candidate_pass(
         detector, extractor, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, cfg,
-        on_result=_offer_best, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion,
+        on_result=_offer_best, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion, encode=not skip_encoding,
     )
     if dyn_proto_tracker is not None:
         dyn_proto_tracker.log_summary()
@@ -1199,9 +1234,10 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
             candidates = _run_geco2_candidate_pass(
                 detector, extractor, video_path, kf_indices, lambda: frozen_prototype,
                 color_sig, cpf_cfg, cfg, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion,
+                encode=not skip_encoding,
             )
 
-    _write_candidates_with_features(candidates, cand_path)
+    _write_candidates_with_features(candidates, cand_path, placeholder_features=skip_encoding)
     detector.log_peak_contrast_summary(sample_id)
 
     elapsed = time.time() - t0

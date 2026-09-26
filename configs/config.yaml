@@ -1117,6 +1117,9 @@ stage123_geco2:
     # one object -> enclosing box (linked by containment, not IoU); wbf =
     # Weighted Boxes Fusion of near-duplicates (iou_thresh must be < nms_iou).
     # keep_originals=true appends the fused box so Stage 3's cosine can choose.
+    # true = do not embed candidate crops here; needs stage3.recompute_candidate_features
+    # (which re-embeds them anyway). See Geco2CosineRescoreConfig.skip_candidate_encoding.
+    skip_candidate_encoding: false
     candidate_fusion:
       enabled: false
       mode: union              # union | wbf
