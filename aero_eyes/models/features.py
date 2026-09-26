@@ -91,7 +91,7 @@ class VDTFeatureExtractor:
         except ImportError:
             log.warning("Could not import build_vdt_model from aero_eyes.models.vdt_model. Falling back to timm vit_base_patch16_224 as a placeholder.")
             import timm
-            model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=0)
+            model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=0, img_size=(256, 128))
 
         state_dict = torch.load(self.weights_path, map_location=self.device)
         if "module." in list(state_dict.keys())[0]:
