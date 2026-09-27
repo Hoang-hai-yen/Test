@@ -229,6 +229,8 @@ stage1:
     #                  fill) -- never discards content, likely closer to
     #                  what the Oxford/Paris arm of D.8 actually means.
     # NOT YET VALIDATED on real footage -- A/B before trusting any of this.
+    # Applies to dinov2 / dinov3 / ensemble / fgclip (fgclip always ends at
+    # 224x224 regardless of mode; keep stretch as its default, A/B pad_to_square).
     # --------------------------------------------------------------------
     preprocess_mode: stretch
     # Reference photos (stage1.py, deliberately close-up/object-framed)

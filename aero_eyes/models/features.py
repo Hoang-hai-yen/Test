@@ -1095,11 +1095,19 @@ class FGCLIPFeatureExtractor:
     # own comment for why this isn't optional.
     _IMAGE_SIZE = 224
 
-    def __init__(self, variant: str = "base", device: str = "auto"):
+    def __init__(
+        self, variant: str = "base", device: str = "auto", preprocess_mode: str = "stretch",
+        candidate_preprocess_mode: str | None = None,
+    ):
         if variant not in self._VARIANT_MAP:
             raise ValueError(f"Unknown FG-CLIP variant '{variant}'. Must be one of {list(self._VARIANT_MAP)}.")
         self.variant = variant
         self.device  = _resolve_device(device)
+        self.preprocess_mode = preprocess_mode
+        # None = candidate crops inherit preprocess_mode (same convention as DINOv2/v3).
+        self.candidate_preprocess_mode = (
+            candidate_preprocess_mode if candidate_preprocess_mode is not None else preprocess_mode
+        )
         self.model, self.processor = self._load(variant)
         self.model.eval().to(self.device)
         log.info("FG-CLIP %s on %s  (dim=%d)", variant, self.device, self._dim())
@@ -1130,9 +1138,12 @@ class FGCLIPFeatureExtractor:
         return model, processor
 
     @torch.no_grad()
-    def extract(self, images: list[np.ndarray], batch_size: int = 16) -> np.ndarray:
+    def extract(
+        self, images: list[np.ndarray], batch_size: int = 16, preprocess_mode: str | None = None,
+    ) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
+        mode = preprocess_mode if preprocess_mode is not None else self.preprocess_mode
         # Confirmed on this project's own GPU run: skipping this manual
         # resize (i.e. trusting AutoImageProcessor's own resizing, the
         # pattern every OTHER extractor in this module uses) produces a
@@ -1140,7 +1151,8 @@ class FGCLIPFeatureExtractor:
         # embedding table size -- NOT a clear shape-mismatch error at the
         # input, but a CUDA device-side assert deep inside the vision
         # encoder ("indexSelectLargeIndex ... srcIndex < srcSelectDimSize").
-        pil_imgs = [_bgr_to_pil(im).resize((self._IMAGE_SIZE, self._IMAGE_SIZE), Image.BICUBIC) for im in images]
+        # Every mode still yields exactly _IMAGE_SIZE x _IMAGE_SIZE, so that guarantee holds.
+        pil_imgs = [self._to_square(_bgr_to_pil(im), mode) for im in images]
         out: list[np.ndarray] = []
         for i in range(0, len(pil_imgs), batch_size):
             batch_pil = pil_imgs[i:i+batch_size]
@@ -1154,7 +1166,17 @@ class FGCLIPFeatureExtractor:
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
+        return self.extract(
+            [crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size,
+            preprocess_mode=self.candidate_preprocess_mode,
+        )
+
+    def _to_square(self, img: "Image.Image", mode: str) -> "Image.Image":
+        if mode == "resize_then_crop":
+            return _resize_shorter_side_then_center_crop(img, self._IMAGE_SIZE)
+        if mode == "pad_to_square":
+            return _resize_and_pad_to_square(img, self._IMAGE_SIZE)
+        return img.resize((self._IMAGE_SIZE, self._IMAGE_SIZE), Image.BICUBIC)
 
     def _dim(self) -> int:
         return self._DIMS.get(self.variant, 512)
@@ -1786,6 +1808,8 @@ def build_feature_extractor(cfg):
         base = FGCLIPFeatureExtractor(
             variant = fe.fgclip_variant,
             device  = dev,
+            preprocess_mode = fe.preprocess_mode,
+            candidate_preprocess_mode = fe.candidate_preprocess_mode,
         )
     elif fe.model == "radio":
         base = RadioFeatureExtractor(
