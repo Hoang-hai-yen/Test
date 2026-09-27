@@ -19,7 +19,10 @@ pipeline:
   detector: legacy   # <<< "legacy" (Stage1/2/3, this file's stage1/stage2/stage3
                       #     sections) | "geco2" (single merged stage using the
                       #     vendored GECO2/ few-shot exemplar detector instead
-                      #     -- see the stage123_geco2 section below).
+                      #     -- see the stage123_geco2 section below) |
+                      #     "grounding_dino" (single merged stage using an
+                      #     open-vocabulary TEXT-prompted detector instead --
+                      #     see the stage123_gdino section below).
                       # Stage4/Stage5 run unchanged either way.
 
 # ----------------------------------------------------------------------------
@@ -1937,6 +1940,47 @@ stage5:
 # scripts/check_st_iou_breakdown.py) -- distinct from stage4.verify_interval,
 # which addresses tracking COVERAGE (a box that's simply missing), not
 # precision. Disabled by default.
+# ----------------------------------------------------------------------------
+# STAGE 1+2+3 (grounding_dino) — open-vocabulary TEXT-prompted detector,
+# selected via pipeline.detector: grounding_dino above. Unlike the geco2/
+# legacy paths, this one never reads data.refs_subdir's reference photos --
+# see Stage123GDinoConfig's own docstring (aero_eyes/config.py) and
+# resolve_text_prompt() (aero_eyes/stages/stage123_gdino.py) for exactly how
+# a sample's prompt is chosen. NOT YET VALIDATED on this project's own
+# footage -- A/B against geco2/legacy before trusting it.
+# ----------------------------------------------------------------------------
+stage123_gdino:
+  # tiny (Swin-T) | base (Swin-B) -- the only 2 checkpoints IDEA-Research has
+  # published on the HF Hub. No "large"/"edge" -- see the config class
+  # docstring for why those are deliberately not offered here.
+  variant: tiny
+  # Fallback prompt used when neither a per-sample prompt.txt file nor
+  # text_prompts below has an entry for the current sample_id. Grounding
+  # DINO's own convention: lowercase, each phrase separated by ". ", e.g.
+  # "black backpack. red backpack." -- the wrapper lowercases/adds a
+  # trailing "." for you but does NOT split multi-phrase text itself.
+  default_text_prompt: ""
+  # Per-sample override: {sample_id: "prompt text"}. Takes precedence over
+  # default_text_prompt above, but NOT over a prompt.txt file in the
+  # sample's own directory (prompt_file_name below).
+  text_prompts: {}
+  # <data.data_root>/<sample_id>/<prompt_file_name>, if present, wins over
+  # BOTH fields above -- lets you drop a per-sample prompt file without
+  # touching this config at all.
+  prompt_file_name: prompt.txt
+  box_threshold: 0.35
+  text_threshold: 0.25
+  keyframe_interval: 8
+  nms_iou: 0.5
+  topk_per_keyframe: 5
+  min_box_area_enabled: false
+  min_box_area: 24
+  isolated_detection_filter:
+    enabled: false
+    max_gap_intervals: 2
+    keep_conf_threshold: null
+    mode: offline
+
 # ----------------------------------------------------------------------------
 # IMPORTANT (measured on this project's 6 labeled samples, not just
 # theoretical): whether ANY box_refine method helps or hurts ST-IoU depends

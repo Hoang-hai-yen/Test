@@ -2165,7 +2165,13 @@ class PipelineConfig(BaseModel):
     # "geco2"   = single merged stage (stage123_geco2.py) using the vendored
     #             GECO2/ few-shot exemplar detector in place of all three.
     #             Stage 4/5 are unchanged either way.
-    detector: Literal["legacy", "geco2"] = "legacy"
+    # "grounding_dino" = single merged stage (stage123_gdino.py) using an
+    #             open-vocabulary TEXT-prompted detector (HuggingFace
+    #             transformers Grounding DINO) instead of Stage1's image
+    #             exemplar + Stage2/3's proposal+matching. Reference images
+    #             (data.refs_subdir) are NOT used by this detector -- see
+    #             Stage123GDinoConfig for how the text prompt is supplied.
+    detector: Literal["legacy", "geco2", "grounding_dino"] = "legacy"
 
 
 class ScaleCalibrationConfig(BaseModel):
@@ -3233,6 +3239,67 @@ class Stage123Geco2Config(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+class Stage123GDinoConfig(BaseModel):
+    """Only used when pipeline.detector == 'grounding_dino'. Requires
+    `pip install transformers` (already a project dependency) at a version
+    that ships GroundingDinoForObjectDetection (verify with
+    `python -c "from transformers import AutoModelForZeroShotObjectDetection"`
+    before relying on this -- add/upgrade the pin in requirements.txt if it's
+    missing).
+
+    Unlike stage1/stage123_geco2, this detector never looks at
+    data.refs_subdir's reference photos -- it is TEXT-prompted (open-
+    vocabulary), so the "exemplar" is whatever text describes the target
+    object. See resolve_text_prompt() (aero_eyes/stages/stage123_gdino.py)
+    for how that text is chosen per sample.
+
+    Only "tiny" (Swin-T, IDEA-Research/grounding-dino-tiny) and "base"
+    (Swin-B, IDEA-Research/grounding-dino-base) are wired -- these are the
+    only two checkpoints IDEA-Research has published on the HuggingFace Hub
+    as of this writing. There is no public "Swin-L"/"large" Grounding DINO
+    checkpoint, and Grounding DINO 1.5 Edge is a SEPARATE, mostly closed
+    IDEA-Research product (gated weights/API, its own inference code, not
+    loadable through transformers) -- neither is wired here; deliberately
+    NOT stubbed as a `variant` value so picking it can't look supported.
+    NOT YET VALIDATED on this project's own footage.
+    """
+    variant: Literal["tiny", "base"] = "tiny"
+    # Passed verbatim as `text=` to the HF processor -- Grounding DINO's own
+    # convention is lowercase, each candidate phrase separated by ". " with
+    # a trailing period (e.g. "white backpack. black backpack."); the
+    # detector wrapper lowercases and appends a trailing "." for you if
+    # missing, but does NOT split/reformat multi-phrase text, so follow that
+    # separator convention yourself for more than one phrase.
+    default_text_prompt: str = ""
+    # Per-sample override, keyed by sample_id -- takes precedence over
+    # default_text_prompt above but NOT over a prompt.txt file in the
+    # sample's own directory (see prompt_file_name below), so a per-sample
+    # file can override a config-level entry without editing this map.
+    text_prompts: dict[str, str] = {}
+    # If <data.data_root>/<sample_id>/<prompt_file_name> exists, its content
+    # (whitespace-stripped) is used as this sample's prompt, taking priority
+    # over both text_prompts and default_text_prompt above -- lets you add a
+    # per-sample prompt file without touching config.yaml at all. Not
+    # required to exist; when absent, falls through to text_prompts / -
+    # default_text_prompt. resolve_text_prompt() raises if NONE of the three
+    # sources yields non-empty text for a sample.
+    prompt_file_name: str = "prompt.txt"
+    box_threshold: float = 0.35
+    text_threshold: float = 0.25
+    keyframe_interval: int = 8
+    nms_iou: float = 0.5
+    topk_per_keyframe: int = 5
+    # Same area-floor rationale as stage123_geco2.min_box_area (a degenerate
+    # near-zero-area box chokes downstream feature/crop code) -- NOT
+    # re-surveyed against this project's own GT for Grounding DINO's box
+    # scale specifically; re-check against your own data before trusting
+    # the default.
+    min_box_area_enabled: bool = False
+    min_box_area: int = 24
+    isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
+
+
+# ---------------------------------------------------------------------------
 class AdaptiveContextMarginConfig(BaseModel):
     """box_refine.adaptive_context_margin -- box_refine.context_margin is
     ONE flat value applied to every box regardless of size, but the right
@@ -3574,6 +3641,7 @@ class AeroEyesConfig(BaseModel):
     stage4: Stage4Config = Stage4Config()
     stage5: Stage5Config = Stage5Config()
     stage123_geco2: Stage123Geco2Config = Stage123Geco2Config()
+    stage123_gdino: Stage123GDinoConfig = Stage123GDinoConfig()
     accuracy: AccuracyConfig = AccuracyConfig()
     eval: EvalConfig = EvalConfig()
     box_refine: BoxRefineConfig = BoxRefineConfig()

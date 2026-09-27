@@ -105,6 +105,7 @@ def run_stage4(cfg, sample_id: str) -> Path:
     is_none_tracker = isinstance(tracker, NoneTracker)
     s4 = cfg.stage4
     use_geco2 = cfg.pipeline.detector == "geco2"
+    use_gdino = cfg.pipeline.detector == "grounding_dino"
 
     # ---- stage4.backward_tracking: separate tracker instance + rolling
     # frame buffer, built only when the feature is actually used (a second
@@ -161,9 +162,13 @@ def run_stage4(cfg, sample_id: str) -> Path:
     geco2_detector = None
     geco2_prototype = None
     geco2_color_sig = None
+    gdino_detector = None
+    gdino_text_prompt = None
     if is_none_tracker:
         if use_geco2:
             geco2_detector, geco2_prototype, geco2_color_sig = _load_geco2(cfg, sample_id, work_dir)
+        elif use_gdino:
+            gdino_detector, gdino_text_prompt = _load_gdino(cfg, sample_id)
         else:
             from aero_eyes.models.features import build_feature_extractor
             from aero_eyes.models.proposals import build_proposal_model
@@ -619,6 +624,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         cosine_prototype=prototype if s4.geco2_redetect_cosine_filter else None,
                         per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
                     )
+                elif use_gdino:
+                    raw_box, source = _detect_on_frame_gdino(frame_bgr, gdino_detector, gdino_text_prompt)
                 else:
                     raw_box, source = _detect_on_frame(
                         frame_bgr, frame_idx, proposal_model, extractor,
@@ -926,6 +933,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 cosine_prototype=prototype if s4.geco2_redetect_cosine_filter else None,
                                 per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
                             )
+                        elif use_gdino:
+                            if gdino_detector is None:
+                                gdino_detector, gdino_text_prompt = _load_gdino(cfg, sample_id)
+                            raw_box, source = _detect_on_frame_gdino(frame_bgr, gdino_detector, gdino_text_prompt)
                         else:
                             # Lazy-init for re-detect fallback -- guarded
                             # independently (not both under one "proposal_model
@@ -1180,6 +1191,35 @@ def _detect_on_frame_geco2(
         if not boxes:
             return None, "none"
 
+    best = max(boxes, key=lambda b: b.score)
+    return best, "detect"
+
+
+def _load_gdino(cfg, sample_id: str):
+    """Grounding DINO equivalent of _load_geco2: builds the detector +
+    resolves this sample's text prompt (see stage123_gdino.
+    resolve_text_prompt) for Stage 4's own re-detection. Unlike GeCo2 there
+    is no on-disk exemplar cache to be missing -- the model is
+    open-vocabulary, so this only fails if the prompt itself can't be
+    resolved (resolve_text_prompt raises) or transformers/the checkpoint
+    can't load (GroundingDinoDetector raises)."""
+    from aero_eyes.models.grounding_dino_detector import GroundingDinoDetector
+    from aero_eyes.stages.stage123_gdino import resolve_text_prompt
+
+    text_prompt = resolve_text_prompt(cfg, sample_id)
+    detector = GroundingDinoDetector(cfg)
+    return detector, text_prompt
+
+
+def _detect_on_frame_gdino(frame_bgr, detector, text_prompt: str | None):
+    """Grounding DINO equivalent of _detect_on_frame_geco2: single best
+    re-detection box on one frame, or (None, "none") if nothing passed
+    threshold/NMS or the detector wasn't available."""
+    if detector is None or not text_prompt:
+        return None, "none"
+    boxes = detector.detect_frame(frame_bgr, text_prompt)
+    if not boxes:
+        return None, "none"
     best = max(boxes, key=lambda b: b.score)
     return best, "detect"
 

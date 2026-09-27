@@ -33,6 +33,10 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
                   as one merged step (stage34.run_stage34) so a --from-stage
                   resume can never run tracking against a stale/missing
                   detections.json -- see Geco2CosineRescoreConfig in config.py.
+      "grounding_dino" -> merged Stage1+2+3 (stage123_gdino.py, TEXT-prompted
+                  open-vocabulary detection, no reference-image exemplar),
+                  Stage4, Stage5 (3 stage_fns entries, same shape as "geco2"
+                  without cosine_rescore).
     Stage numbers in --from-stage always refer to the ORIGINAL 1-5 scheme
     (e.g. --from-stage 4 resumes at tracking either way) so switching
     detector doesn't change what a given --from-stage value means.
@@ -78,6 +82,10 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
         from aero_eyes.stages.stage123_geco2 import run_stage123_geco2
         # stage_num=1 covers what legacy Stage1-3 do combined.
         stage_fns: list[tuple[int, object]] = [(1, run_stage123_geco2), (4, run_stage4), (5, run_stage5)]
+    elif cfg.pipeline.detector == "grounding_dino":
+        from aero_eyes.stages.stage123_gdino import run_stage123_gdino
+        # stage_num=1 covers what legacy Stage1-3 do combined.
+        stage_fns = [(1, run_stage123_gdino), (4, run_stage4), (5, run_stage5)]
     else:
         from aero_eyes.stages.stage1 import run_stage1
         from aero_eyes.stages.stage2 import run_stage2
