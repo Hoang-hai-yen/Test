@@ -94,14 +94,34 @@ class _FakeProcessor:
                  "scores": torch.tensor(self._scores, dtype=torch.float32)}]
 
 
+class _FakeProcessorNewSignature:
+    """transformers>=4.51 renamed box_threshold -> threshold -- this fake
+    only accepts the NEW name, so a test wired to it fails unless
+    _postprocess's primary (not just fallback) call path is correct."""
+
+    def __init__(self, boxes, scores):
+        self._boxes = boxes
+        self._scores = scores
+
+    def __call__(self, images, text, return_tensors="pt"):
+        return _FakeBatch(input_ids=torch.zeros(1, 1, dtype=torch.long))
+
+    def post_process_grounded_object_detection(
+        self, outputs, input_ids, threshold, text_threshold, target_sizes,
+    ):
+        return [{"boxes": torch.tensor(self._boxes, dtype=torch.float32),
+                 "scores": torch.tensor(self._scores, dtype=torch.float32)}]
+
+
 class _FakeModel:
     def __call__(self, **kwargs):
         return object()
 
 
-def _wire_fake(det: "gd_mod.GroundingDinoDetector", boxes, scores) -> None:
+def _wire_fake(det: "gd_mod.GroundingDinoDetector", boxes, scores, new_signature: bool = False) -> None:
     det.model = _FakeModel()
-    det.processor = _FakeProcessor(boxes, scores)
+    cls = _FakeProcessorNewSignature if new_signature else _FakeProcessor
+    det.processor = cls(boxes, scores)
 
 
 def test_detect_frame_filters_by_min_box_area():
@@ -140,6 +160,17 @@ def test_detect_frame_empty_when_no_boxes():
     _wire_fake(det, boxes=np.zeros((0, 4)), scores=[])
     out = det.detect_frame(np.zeros((100, 100, 3), dtype=np.uint8), "an object")
     assert out == []
+
+
+def test_detect_frame_uses_current_threshold_kwarg_name(monkeypatch):
+    """transformers>=4.51 renamed box_threshold -> threshold (confirmed via
+    the transformers source, see _postprocess's own docstring) -- this must
+    work WITHOUT falling back to the deprecated box_threshold= kwarg."""
+    det = _make_detector(nms_iou=0.99, topk_per_keyframe=10)
+    _wire_fake(det, boxes=[[10, 10, 50, 50]], scores=[0.9], new_signature=True)
+    out = det.detect_frame(np.zeros((100, 100, 3), dtype=np.uint8), "an object")
+    assert len(out) == 1
+    assert out[0].score == pytest.approx(0.9)
 
 
 # ---------------------------------------------------------------------------

@@ -89,20 +89,37 @@ class GroundingDinoDetector:
         transformers version skew (post_process_grounded_object_detection's
         signature/return keys have changed across releases -- e.g. `labels`
         vs newer `text_labels`) behind a single call site, so a version
-        bump only needs fixing here."""
+        bump only needs fixing here.
+
+        VERIFIED (transformers source, huggingface/transformers
+        src/transformers/models/grounding_dino/processing_grounding_dino.py):
+        the box-score threshold kwarg was renamed `box_threshold` ->
+        `threshold` in transformers>=4.51.0, and older releases (<4.51) only
+        accept `box_threshold`. Tries the current name first (matches any
+        transformers version this project is likely to run, including 5.x),
+        falling back to the old name on a bare TypeError -- NOT wrapped in
+        the outer except below, so a real signature drift beyond just this
+        one rename still surfaces as a clear error instead of silently
+        retrying forever."""
         h, w = frame_shape
         try:
             results = self.processor.post_process_grounded_object_detection(
-                outputs, inputs["input_ids"], box_threshold=self.box_threshold,
+                outputs, inputs["input_ids"], threshold=self.box_threshold,
                 text_threshold=self.text_threshold, target_sizes=[(h, w)],
             )
-        except TypeError as e:
-            raise RuntimeError(
-                "GroundingDinoProcessor.post_process_grounded_object_detection's signature "
-                "doesn't match what this wrapper expects -- likely a transformers version "
-                f"mismatch (original error: {e}). Pin/upgrade transformers and re-check "
-                "this method's current signature."
-            ) from e
+        except TypeError as e_new:
+            try:
+                results = self.processor.post_process_grounded_object_detection(
+                    outputs, inputs["input_ids"], box_threshold=self.box_threshold,
+                    text_threshold=self.text_threshold, target_sizes=[(h, w)],
+                )
+            except TypeError as e_old:
+                raise RuntimeError(
+                    "GroundingDinoProcessor.post_process_grounded_object_detection's signature "
+                    "doesn't match what this wrapper expects with EITHER `threshold=` (current) "
+                    f"or `box_threshold=` (pre-4.51) (errors: {e_new!r} / {e_old!r}). Check "
+                    "this method's current signature for your installed transformers version."
+                ) from e_old
         return results[0]
 
     def detect_frame(self, frame_bgr: np.ndarray, text_prompt: str) -> list[Box]:
