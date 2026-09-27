@@ -35,8 +35,14 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
                   detections.json -- see Geco2CosineRescoreConfig in config.py.
       "grounding_dino" -> merged Stage1+2+3 (stage123_gdino.py, TEXT-prompted
                   open-vocabulary detection, no reference-image exemplar),
-                  Stage4, Stage5 (3 stage_fns entries, same shape as "geco2"
-                  without cosine_rescore).
+                  Stage4, Stage5, UNLESS stage123_gdino.cosine_rescore.enabled,
+                  in which case Grounding DINO only generates candidates
+                  (run_stage12_gdino_candidates) and Stage3's DINOv3 (or
+                  whatever stage1.feature_extractor is configured) cosine
+                  matching + Stage4's tracking run as one merged step
+                  (stage34.run_stage34) -- same shape/rationale as the geco2
+                  cosine_rescore branch above -- see GDinoCosineRescoreConfig
+                  in config.py.
     Stage numbers in --from-stage always refer to the ORIGINAL 1-5 scheme
     (e.g. --from-stage 4 resumes at tracking either way) so switching
     detector doesn't change what a given --from-stage value means.
@@ -82,6 +88,13 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
         from aero_eyes.stages.stage123_geco2 import run_stage123_geco2
         # stage_num=1 covers what legacy Stage1-3 do combined.
         stage_fns: list[tuple[int, object]] = [(1, run_stage123_geco2), (4, run_stage4), (5, run_stage5)]
+    elif cfg.pipeline.detector == "grounding_dino" and cfg.stage123_gdino.cosine_rescore.enabled:
+        from aero_eyes.stages.stage34 import run_stage34
+        from aero_eyes.stages.stage123_gdino import run_stage12_gdino_candidates
+        # Same stage_num=1/4 shape as the geco2 cosine_rescore branch above,
+        # for the same reason (a bare --from-stage 4 must still run matching
+        # before tracking).
+        stage_fns = [(1, run_stage12_gdino_candidates), (4, run_stage34), (5, run_stage5)]
     elif cfg.pipeline.detector == "grounding_dino":
         from aero_eyes.stages.stage123_gdino import run_stage123_gdino
         # stage_num=1 covers what legacy Stage1-3 do combined.

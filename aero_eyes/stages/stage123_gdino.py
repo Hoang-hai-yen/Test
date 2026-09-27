@@ -137,6 +137,106 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
     return det_path
 
 
+def run_stage12_gdino_candidates(cfg, sample_id: str) -> Path:
+    """Stage 1+2 replacement (cosine_rescore variant) -- Grounding DINO as a
+    CANDIDATE generator instead of the final word. Used instead of
+    run_stage123_gdino when stage123_gdino.cosine_rescore.enabled=true.
+
+    Differs from run_stage123_gdino in exactly one way: Grounding DINO's own
+    box_threshold/topk_per_keyframe are replaced with the looser
+    cosine_rescore.candidate_* values (so real detections aren't filtered
+    out before Stage 3 gets to see them), each surviving candidate crop is
+    embedded with stage1.feature_extractor (an INSTANCE-level signal
+    Grounding DINO's own category-level score can't provide -- see
+    GDinoCosineRescoreConfig's own docstring), and the result is written to
+    candidates.json (+ .feats.npz) in the same schema Stage 2 writes,
+    instead of straight to detections.json.
+    aero_eyes.stages.stage3.run_stage3 then does the actual threshold/NMS/
+    top-K filtering that produces detections.json for Stage 4/5.
+
+    Reads:  cfg.data reference images + video (+ this sample's text prompt)
+    Writes: <work_dir>/<sample_id>/prototype.npz (via stage1.run_stage1)
+            <work_dir>/<sample_id>/candidates.json (+ .feats.npz)
+            <work_dir>/<sample_id>/viz/stage123_gdino/candidates/frame_XXXXXX.jpg
+              (raw candidates + Grounding DINO's own score per box, when
+              runtime.save_visualizations=true)
+    """
+    from aero_eyes.models.features import build_feature_extractor
+    from aero_eyes.models.grounding_dino_detector import GroundingDinoDetector
+    from aero_eyes.stages.stage1 import run_stage1
+    from aero_eyes.stages.stage2 import _write_candidates_with_features
+    from aero_eyes.utils.video import frame_iterator, keyframe_indices, video_info
+
+    t0 = time.time()
+    work_dir = Path(cfg.project.work_dir) / sample_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    cand_path = work_dir / "candidates.json"
+    if cfg.project.use_cache and cand_path.exists():
+        log.info("[Stage12-GDINO] %s: using cached candidates at %s", sample_id, cand_path)
+        return cand_path
+
+    text_prompt = resolve_text_prompt(cfg, sample_id)
+    log.info("[Stage12-GDINO] %s: text prompt = %r", sample_id, text_prompt)
+
+    # stage1.feature_extractor's prototype -- an independent, instance-level
+    # signal Stage 3's cosine matching will check candidates against.
+    run_stage1(cfg, sample_id)
+    extractor = build_feature_extractor(cfg)
+
+    detector = GroundingDinoDetector(cfg)
+    cr = cfg.stage123_gdino.cosine_rescore
+    # Loosen Grounding DINO's own cut so real detections survive through to
+    # Stage 3's cosine matching -- see GDinoCosineRescoreConfig docstring.
+    detector.box_threshold = cr.candidate_box_threshold
+    detector.topk_per_keyframe = cr.candidate_topk_per_keyframe
+
+    video_path = _locate_video(cfg, sample_id)
+    info = video_info(video_path)
+    total_frames = info["total_frames"]
+    log.info("[Stage12-GDINO] %s: video=%s (%d frames)", sample_id, video_path.name, total_frames)
+
+    kf_indices = set(keyframe_indices(total_frames, cfg.stage123_gdino.keyframe_interval))
+    cand_viz_dir = (
+        work_dir / "viz" / "stage123_gdino" / "candidates" if cfg.runtime.save_visualizations else None
+    )
+
+    candidates: dict[int, list[Detection]] = {}
+    for frame_idx, frame_bgr in frame_iterator(video_path):
+        if frame_idx not in kf_indices:
+            continue
+        boxes = detector.detect_frame(frame_bgr, text_prompt)
+        if boxes:
+            feats = extractor.extract_crops(
+                frame_bgr, boxes,
+                pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+                batch_size=cfg.runtime.batch_size,
+            )
+        else:
+            feats = None
+
+        frame_dets: list[Detection] = []
+        for i, box in enumerate(boxes):
+            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="candidate")
+            d._feature = feats[i]  # type: ignore[attr-defined]
+            frame_dets.append(d)
+        candidates[frame_idx] = frame_dets
+        log.debug("[Stage12-GDINO] frame %d: %d candidates", frame_idx, len(frame_dets))
+        if cand_viz_dir is not None and boxes:
+            from aero_eyes.utils import viz as vizmod
+            vizmod.save_stage2_keyframe(frame_bgr, boxes, None, frame_idx, cand_viz_dir)
+
+    _write_candidates_with_features(candidates, cand_path, placeholder_features=False)
+
+    elapsed = time.time() - t0
+    log.info("[Stage12-GDINO] %s done in %.1fs -> %s (%d keyframes)",
+              sample_id, elapsed, cand_path, len(candidates))
+    if cand_viz_dir is not None:
+        log.info("[Stage12-GDINO] %s: raw candidate frames (%d with >=1 box) saved to %s",
+                 sample_id, sum(1 for d in candidates.values() if d), cand_viz_dir)
+    return cand_path
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description="Run Stage 1+2+3 (Grounding DINO) for one sample")

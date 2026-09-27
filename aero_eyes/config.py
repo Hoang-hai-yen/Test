@@ -2059,6 +2059,23 @@ class Stage4Config(BaseModel):
     # False (default) = disabled -- GeCo2 re-detect behavior unchanged.
     geco2_redetect_cosine_filter: bool = False
 
+    # Same idea as geco2_redetect_cosine_filter above, for
+    # pipeline.detector=grounding_dino: Grounding DINO's own re-detect score
+    # is a CATEGORY-level text-grounding confidence, not an instance-level
+    # signal -- it can lock onto a different object of the same category
+    # (e.g. a different backpack) since it has no notion of "the object in
+    # the reference photos" at all. When enabled, every Grounding DINO
+    # re-detect additionally embeds each candidate box with
+    # stage1.feature_extractor (DINOv3, or whatever is configured) and drops
+    # any candidate whose cosine similarity to prototype.npz falls below the
+    # SAME match_threshold Stage 3 used. Needs a prototype.npz to check
+    # against -- always available when stage123_gdino.cosine_rescore.enabled
+    # built one (see stage1.run_stage1); no effect (logged once) otherwise,
+    # since plain grounding_dino (no cosine_rescore) has no such embedding
+    # space. False (default) = disabled -- Grounding DINO re-detect behavior
+    # unchanged.
+    gdino_redetect_cosine_filter: bool = False
+
     kalman_motion_check: KalmanMotionCheckConfig = KalmanMotionCheckConfig()
 
     @field_validator("tracker")
@@ -3239,6 +3256,39 @@ class Stage123Geco2Config(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+class GDinoCosineRescoreConfig(BaseModel):
+    """Optional extra matching pass inserted between Grounding DINO detection
+    and Stage 4 tracking, mirroring Geco2CosineRescoreConfig's own design:
+    instead of Grounding DINO's own box_threshold/topk_per_keyframe alone
+    deciding detections.json, Grounding DINO first produces a WIDER
+    per-keyframe candidate set (this config's own looser threshold/topk
+    below), each candidate crop is embedded with stage1.feature_extractor
+    (DINOv3, or whatever is configured -- built the same way legacy stage1.py
+    does, from the same reference images), and
+    aero_eyes.stages.stage3.run_stage3's cosine matching (threshold/NMS/
+    top-K, optionally stage3.adaptive_threshold/dynamic_prototype) decides
+    what actually writes detections.json.
+
+    This is the point of the whole exercise: Grounding DINO's text-grounding
+    score answers "is this a <category>", never "is this the SAME
+    <category> instance as the reference photos" -- it structurally cannot
+    reject a different object of the same category. DINOv3's cosine
+    similarity to the reference-image prototype is an INSTANCE-level signal
+    that can. The two are independent evidence from different backbones, not
+    one re-deriving the other's answer.
+
+    Disabled by default: run_stage123_gdino alone decides detections.json
+    exactly as before this option existed (original behavior, unchanged).
+    """
+    enabled: bool = False
+    # Looser than stage123_gdino.box_threshold/topk_per_keyframe -- this
+    # stage only needs to not throw away the true positive; Stage 3's cosine
+    # matching does the real cut.
+    candidate_box_threshold: float = 0.15
+    candidate_topk_per_keyframe: int = 15
+
+
+# ---------------------------------------------------------------------------
 class Stage123GDinoConfig(BaseModel):
     """Only used when pipeline.detector == 'grounding_dino'. Requires
     `pip install transformers` (already a project dependency) at a version
@@ -3296,7 +3346,25 @@ class Stage123GDinoConfig(BaseModel):
     # the default.
     min_box_area_enabled: bool = False
     min_box_area: int = 24
+    # Rejects a box covering more than max_box_area_frac of the frame's own
+    # area -- essentially never the real target here (a small drone-viewed
+    # object). Grounding DINO's open-set query regression has NO built-in
+    # ceiling on box size the way YOLO/FastSAM (anchor-constrained) or GeCo2
+    # (regression anchored to the reference exemplar's own size) implicitly
+    # do -- when nothing in the frame truly matches the text prompt, a query
+    # can still emit a box of ANY size, up to and including near-full-frame,
+    # and plain IoU-based NMS does NOT reject it just because a smaller,
+    # correct box also survives (IoU between a small box nested inside a
+    # much larger one is LOW by construction, so NMS suppresses neither).
+    # Same idea as stage1.segmentation.max_area_frac, applied to detection
+    # boxes instead of reference-photo masks. Enabled by default (unlike
+    # min_box_area_enabled above) -- an oversized box is a much more certain
+    # false positive than a slightly-too-small one, so this is a safe
+    # default rather than an opt-in.
+    max_box_area_frac_enabled: bool = True
+    max_box_area_frac: float = 0.5
     isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
+    cosine_rescore: GDinoCosineRescoreConfig = GDinoCosineRescoreConfig()
 
 
 # ---------------------------------------------------------------------------

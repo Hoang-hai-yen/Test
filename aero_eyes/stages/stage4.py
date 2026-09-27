@@ -226,6 +226,25 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 sample_id, proto_path,
             )
 
+    # gdino_redetect_cosine_filter's own equivalent -- see
+    # geco2_redetect_cosine_filter above for the same rationale, one
+    # detector down.
+    if use_gdino and s4.gdino_redetect_cosine_filter and extractor is None:
+        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.utils.io import read_prototype
+
+        proto_path = work_dir / cfg.stage1.prototype.cache_name
+        if proto_path.exists():
+            extractor = build_feature_extractor(cfg)
+            prototype, _, per_ref_features = read_prototype(proto_path)
+        else:
+            log.warning(
+                "[Stage4] %s: stage4.gdino_redetect_cosine_filter=true but no prototype.npz "
+                "found at %s -- cosine filter unavailable this run (needs "
+                "stage123_gdino.cosine_rescore.enabled to have built one).",
+                sample_id, proto_path,
+            )
+
     # backward_tracking.validate_against_boundary.cosine_arbitration needs
     # the same DINOv2 extractor/prototype as verify_interval above, loaded
     # here if nothing else already did -- see CosineArbitrationConfig.
@@ -625,7 +644,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
                     )
                 elif use_gdino:
-                    raw_box, source = _detect_on_frame_gdino(frame_bgr, gdino_detector, gdino_text_prompt)
+                    raw_box, source = _detect_on_frame_gdino(
+                        frame_bgr, gdino_detector, gdino_text_prompt,
+                        cosine_extractor=extractor if s4.gdino_redetect_cosine_filter else None,
+                        cosine_prototype=prototype if s4.gdino_redetect_cosine_filter else None,
+                        per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
+                    )
                 else:
                     raw_box, source = _detect_on_frame(
                         frame_bgr, frame_idx, proposal_model, extractor,
@@ -936,7 +960,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         elif use_gdino:
                             if gdino_detector is None:
                                 gdino_detector, gdino_text_prompt = _load_gdino(cfg, sample_id)
-                            raw_box, source = _detect_on_frame_gdino(frame_bgr, gdino_detector, gdino_text_prompt)
+                            raw_box, source = _detect_on_frame_gdino(
+                                frame_bgr, gdino_detector, gdino_text_prompt,
+                                cosine_extractor=extractor if s4.gdino_redetect_cosine_filter else None,
+                                cosine_prototype=prototype if s4.gdino_redetect_cosine_filter else None,
+                                per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
+                            )
                         else:
                             # Lazy-init for re-detect fallback -- guarded
                             # independently (not both under one "proposal_model
@@ -1211,15 +1240,49 @@ def _load_gdino(cfg, sample_id: str):
     return detector, text_prompt
 
 
-def _detect_on_frame_gdino(frame_bgr, detector, text_prompt: str | None):
+def _detect_on_frame_gdino(
+    frame_bgr, detector, text_prompt: str | None,
+    cosine_extractor=None, cosine_prototype=None, per_ref_features=None,
+    cfg=None, match_threshold=None,
+):
     """Grounding DINO equivalent of _detect_on_frame_geco2: single best
     re-detection box on one frame, or (None, "none") if nothing passed
-    threshold/NMS or the detector wasn't available."""
+    threshold/NMS or the detector wasn't available.
+
+    cosine_extractor/cosine_prototype (stage4.gdino_redetect_cosine_filter):
+    Grounding DINO's own score is a CATEGORY-level text-grounding
+    confidence, not a similarity to a known target, so it can lock onto a
+    different object of the same category instead of reporting "not found".
+    When given, every surviving candidate is additionally embedded with
+    stage1.feature_extractor and dropped unless its cosine similarity to
+    cosine_prototype clears match_threshold (the same adaptive/fixed
+    threshold Stage 3 used) -- the best Grounding DINO score among the
+    SURVIVORS wins, or (None, "none") if none survive."""
     if detector is None or not text_prompt:
         return None, "none"
     boxes = detector.detect_frame(frame_bgr, text_prompt)
     if not boxes:
         return None, "none"
+
+    if cosine_extractor is not None and cosine_prototype is not None:
+        feats = cosine_extractor.extract_crops(
+            frame_bgr, boxes,
+            pad_ratio=cfg.stage2.candidate.feature_crop_pad,
+            batch_size=cfg.runtime.batch_size,
+        )
+        use_multi_ref = (
+            cfg.accuracy.mode in ("cheap_boosters", "max_accuracy")
+            and cfg.accuracy.cheap_boosters.multi_reference_embedding
+            and per_ref_features
+        )
+        if use_multi_ref:
+            sims = np.mean([feats @ ref_feat for ref_feat in per_ref_features], axis=0)
+        else:
+            sims = feats @ cosine_prototype
+        boxes = [b for b, sim in zip(boxes, sims) if sim >= match_threshold]
+        if not boxes:
+            return None, "none"
+
     best = max(boxes, key=lambda b: b.score)
     return best, "detect"
 

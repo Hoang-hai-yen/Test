@@ -66,6 +66,8 @@ class GroundingDinoDetector:
         self.topk_per_keyframe = g.topk_per_keyframe
         self.min_box_area_enabled = g.min_box_area_enabled
         self.min_box_area = g.min_box_area
+        self.max_box_area_frac_enabled = g.max_box_area_frac_enabled
+        self.max_box_area_frac = g.max_box_area_frac
         self.device = _resolve_device(cfg.device())
         self.model, self.processor = self._load(_HF_MAP[g.variant])
         log.info("Grounding DINO %s (%s) on %s", g.variant, _HF_MAP[g.variant], self.device)
@@ -139,6 +141,21 @@ class GroundingDinoDetector:
         ]
         if self.min_box_area_enabled:
             boxes = [b for b in boxes if b.area() >= self.min_box_area]
+        if self.max_box_area_frac_enabled:
+            # A near-full-frame (or large-fraction-of-background) box is
+            # essentially never the real target here (a small drone-viewed
+            # object) -- see this project's own SegmentationConfig.
+            # max_area_frac for the same idea applied to reference-photo
+            # masks. Grounding DINO has no such ceiling built in: unlike
+            # YOLO/FastSAM (anchor/architecture-constrained box sizes) or
+            # GeCo2 (box regression anchored to the reference exemplar's own
+            # size), its open-set query regression can emit a box of ANY
+            # size when nothing in the frame truly matches the text prompt,
+            # and plain IoU-NMS does NOT reject it just because a smaller,
+            # correct box also exists (IoU between a small box nested inside
+            # a much larger one is LOW, so NMS doesn't suppress either).
+            frame_area = float(h * w)
+            boxes = [b for b in boxes if b.area() <= self.max_box_area_frac * frame_area]
         if not boxes:
             return []
         keep = nms(boxes, self.nms_iou)

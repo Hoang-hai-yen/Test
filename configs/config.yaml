@@ -1892,6 +1892,19 @@ stage4:
   # false (default) = disabled, GeCo2 re-detect behavior unchanged.
   geco2_redetect_cosine_filter: false
 
+  # pipeline.detector=grounding_dino only: same idea as
+  # geco2_redetect_cosine_filter above -- Grounding DINO's own re-detect
+  # score is a CATEGORY-level text-grounding confidence (e.g. "is this a
+  # backpack"), not an instance-level signal, so it can lock onto a
+  # DIFFERENT object of the same category. When enabled, every Grounding
+  # DINO re-detect additionally embeds each candidate box with
+  # stage1.feature_extractor and drops any candidate whose cosine similarity
+  # to the prototype falls below the SAME match_threshold Stage 3 used.
+  # Needs stage123_gdino.cosine_rescore.enabled to have built prototype.npz
+  # (same requirement as that section's own docstring).
+  # false (default) = disabled, Grounding DINO re-detect behavior unchanged.
+  gdino_redetect_cosine_filter: false
+
   # Cheap per-frame drift-plausibility check, complementary to
   # verify_interval's (appearance-based) cosine check above -- catches a
   # confuser that LOOKS similar enough to pass cosine but sits somewhere the
@@ -1975,11 +1988,32 @@ stage123_gdino:
   topk_per_keyframe: 5
   min_box_area_enabled: false
   min_box_area: 24
+  # Rejects a box covering more than max_box_area_frac of the frame -- see
+  # Stage123GDinoConfig's own docstring (aero_eyes/config.py) for why
+  # Grounding DINO specifically needs this (no built-in size ceiling the
+  # way YOLO/FastSAM/GeCo2 implicitly have, and plain NMS can't catch it).
+  # true (default, unlike min_box_area_enabled above) -- an oversized box is
+  # a much more certain false positive than a slightly-too-small one.
+  max_box_area_frac_enabled: true
+  max_box_area_frac: 0.5
   isolated_detection_filter:
     enabled: false
     max_gap_intervals: 2
     keep_conf_threshold: null
     mode: offline
+  # Optional extra matching pass: instead of box_threshold/topk_per_keyframe
+  # above deciding detections.json directly, Grounding DINO first produces a
+  # WIDER candidate set (candidate_* below), each candidate crop is embedded
+  # with stage1.feature_extractor (DINOv3, or whatever is configured) as an
+  # INSTANCE-level cross-check Grounding DINO's own category-level score
+  # can't provide, and stage3's cosine matching (threshold/NMS/top-K,
+  # adaptive_threshold/dynamic_prototype all apply) decides what's actually
+  # kept. See GDinoCosineRescoreConfig's own docstring (aero_eyes/config.py)
+  # for the full rationale. false (default) = disabled, unchanged behavior.
+  cosine_rescore:
+    enabled: false
+    candidate_box_threshold: 0.15
+    candidate_topk_per_keyframe: 15
 
 # ----------------------------------------------------------------------------
 # IMPORTANT (measured on this project's 6 labeled samples, not just

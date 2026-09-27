@@ -59,6 +59,7 @@ def test_unknown_variant_rejected():
 def _make_detector(
     nms_iou: float = 0.5, topk_per_keyframe: int = 5,
     min_box_area_enabled: bool = False, min_box_area: int = 24,
+    max_box_area_frac_enabled: bool = False, max_box_area_frac: float = 0.5,
 ) -> "gd_mod.GroundingDinoDetector":
     """Bypasses __init__ (which needs a real HF checkpoint download) --
     only sets the attributes detect_frame's own filtering logic touches,
@@ -70,6 +71,8 @@ def _make_detector(
     det.topk_per_keyframe = topk_per_keyframe
     det.min_box_area_enabled = min_box_area_enabled
     det.min_box_area = min_box_area
+    det.max_box_area_frac_enabled = max_box_area_frac_enabled
+    det.max_box_area_frac = max_box_area_frac
     det.device = "cpu"
     return det
 
@@ -131,6 +134,27 @@ def test_detect_frame_filters_by_min_box_area():
     out = det.detect_frame(np.zeros((100, 100, 3), dtype=np.uint8), "an object")
     assert len(out) == 1
     assert out[0].area() == pytest.approx(400.0)
+
+
+def test_detect_frame_filters_by_max_box_area_frac():
+    # 100x100 frame (area 10000); max_box_area_frac=0.5 -> ceiling 5000px^2.
+    # box 0: near-full-frame (90x90=8100, over ceiling, dropped); box 1:
+    # 20x20=400 (well under ceiling, kept).
+    det = _make_detector(max_box_area_frac_enabled=True, max_box_area_frac=0.5, nms_iou=0.99)
+    _wire_fake(det, boxes=[[0, 0, 90, 90], [10, 10, 30, 30]], scores=[0.9, 0.8])
+    out = det.detect_frame(np.zeros((100, 100, 3), dtype=np.uint8), "an object")
+    assert len(out) == 1
+    assert out[0].area() == pytest.approx(400.0)
+
+
+def test_detect_frame_max_box_area_frac_disabled_by_default_in_this_helper():
+    # _make_detector defaults max_box_area_frac_enabled=False -- a
+    # near-full-frame box survives unless the caller opts in, matching how
+    # this test file's OTHER filter tests are structured.
+    det = _make_detector(nms_iou=0.99)
+    _wire_fake(det, boxes=[[0, 0, 99, 99]], scores=[0.9])
+    out = det.detect_frame(np.zeros((100, 100, 3), dtype=np.uint8), "an object")
+    assert len(out) == 1
 
 
 def test_detect_frame_applies_nms():
