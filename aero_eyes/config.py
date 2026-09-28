@@ -1305,6 +1305,92 @@ class WhiteningConfig(BaseModel):
     weights_path: Optional[str] = None
 
 
+class RelativeScoreFusionConfig(BaseModel):
+    """stage3.relative_score_fusion -- MUSE's (arXiv:2510.17866, "Model-based
+    Uncertainty-aware Similarity Estimation") "joint similarity score" idea,
+    applied to THIS project's own candidates: MUSE found that an ABSOLUTE
+    similarity score alone (each candidate scored independently against the
+    reference) fails to discriminate "hard negative" cases -- several
+    candidates that are all visually similar to the target, where only ONE
+    is the real instance and the rest are same-category confusers -- because
+    absolute similarity doesn't compare candidates against EACH OTHER.
+
+    When enabled, computes a RELATIVE score per keyframe: a temperature-
+    scaled softmax of that keyframe's own candidates' scores (whatever
+    stage3.similarity + patch_matching/dynamic_prototype/domain_prompter
+    already produced, i.e. all_sims at that point), so a candidate's
+    relative score reflects how it ranks against ITS OWN keyframe's other
+    candidates, not just its raw similarity value. The final score fed to
+    threshold/NMS/top-K becomes:
+        joint = beta * all_sims + (1 - beta) * relative_score
+    matching MUSE's own Eq. 6 (S_joint = beta*S_abs + (1-beta)*S_rel). A
+    keyframe with only 1 candidate has nothing to rank against -- its
+    relative score is trivially 1.0 (softmax of a single value), so joint
+    reduces to a fixed blend with a constant there, not a no-op; consider
+    this when interpreting single-candidate keyframes.
+
+    beta/temperature default to MUSE's own reported values (beta=0.8,
+    temperature=tau=0.02 in their notation), but MUSE computed this over
+    Tanimoto-similarity scores from a DIFFERENT embedding/similarity setup
+    (DINOv2 class+patch GeM features) than this project's default (plain
+    CLS cosine) -- temperature in particular controls how SHARP the softmax
+    is and has no reason to transfer numerically between different score
+    distributions. NOT YET VALIDATED on this project's own footage --
+    sweep both parameters against your own data before trusting the
+    defaults; a too-small temperature can make relative_score collapse to
+    near one-hot (winner-take-all per keyframe) even for candidates whose
+    absolute similarity is nearly identical.
+    """
+    enabled: bool = False
+    temperature: float = 0.02
+    beta: float = 0.8
+
+
+class DetectorConfidenceFusionConfig(BaseModel):
+    """stage3.detector_confidence_fusion -- MUSE's (arXiv:2510.17866)
+    "uncertainty-aware objectness prior" idea: the box/candidate-generating
+    detector's OWN confidence (Box.score -- Grounding DINO's text-grounding
+    score, GeCo2's own per-box score, or a legacy proposal model's
+    objectness/conf, whichever produced candidates.json) carries information
+    a pure appearance-similarity score doesn't: how much the detector itself
+    trusts this region as a real object proposal AT ALL, independent of
+    which instance it might be. MUSE's own ablation found this the single
+    largest post-proposal-quality refinement (+0.028 mAP, second only to
+    upgrading the proposal generator itself) -- see its Table 3.
+
+    When enabled, the final score fed to threshold/NMS/top-K becomes:
+        final = (box.score ** gamma) * joint
+    (joint = stage3.relative_score_fusion's output if that's ALSO enabled,
+    else plain all_sims) -- matching MUSE's own Eq. 10
+    (S_final = P_scaled(O|p) * S_joint), applied AFTER every other
+    stage3 scoring step (patch_matching, dynamic_prototype, domain_prompter,
+    relative_score_fusion), so it always acts on whatever score those
+    produced.
+
+    gamma defaults to 1.0 (plain multiplication) here, NOT MUSE's own 0.1 --
+    MUSE explicitly chose gamma<1 to BOOST a generically-low objectness
+    score (Grounding DINO prompted with the word "items" tends to produce
+    weak confidence for everything); this project's own prompts are
+    specific (e.g. "red helmet."), so their own confidence is less likely
+    to be uniformly weak, and blindly copying gamma=0.1 would compress away
+    a lot of real signal this project's box.score distribution may actually
+    carry. Sweep gamma on your own data rather than assuming either value.
+
+    CAVEAT (not present in MUSE's own setup): if stage3.similarity="cosine"
+    (or another metric whose scores can go NEGATIVE), multiplying by a
+    box.score in [0,1] pulls a negative score TOWARD zero (i.e. makes a bad
+    match look LESS bad, not worse) -- the opposite of the intended
+    "low detector confidence should never help" direction. In practice this
+    only matters for candidates whose similarity was already deeply
+    negative (rarely near a real match_threshold), but be aware of it
+    before trusting this near stage3.match_threshold=0 or with a similarity
+    metric whose typical range straddles zero. NOT YET VALIDATED on this
+    project's own footage.
+    """
+    enabled: bool = False
+    gamma: float = 1.0
+
+
 class Stage3Config(BaseModel):
     # Dev/debug convenience: candidates.json's companion candidates.feats.npz
     # is written by Stage 2 (see aero_eyes/stages/stage2.py::
@@ -1581,6 +1667,12 @@ class Stage3Config(BaseModel):
     identity_chain_filter: IdentityChainFilterConfig = IdentityChainFilterConfig()
     # Hard-negative "negative prototype" filter -- see NegativePrototypeFilterConfig.
     negative_prototype_filter: NegativePrototypeFilterConfig = NegativePrototypeFilterConfig()
+    # MUSE-style (arXiv:2510.17866) relative/softmax score component -- see
+    # RelativeScoreFusionConfig.
+    relative_score_fusion: RelativeScoreFusionConfig = RelativeScoreFusionConfig()
+    # MUSE-style (arXiv:2510.17866) detector-confidence prior -- see
+    # DetectorConfidenceFusionConfig.
+    detector_confidence_fusion: DetectorConfidenceFusionConfig = DetectorConfidenceFusionConfig()
 
 
 class BuiltinTrackerConfig(BaseModel):
@@ -2470,6 +2562,18 @@ class ColorPostfilterConfig(BaseModel):
     # docstring) -- kept coarse for the same small-crop-sample-size reason
     # as hue_bins/sat_bins above.
     value_bins: int = 8
+    # Circularly smooths the Hue axis of compute_hs_histogram's 2D
+    # histogram (in BINS, not degrees) before comparison -- tolerates a
+    # moderate lighting-driven hue shift (e.g. the SAME orange object
+    # reading more yellow in direct sunlight than under neutral/shaded
+    # light) that plain bin-to-bin Bhattacharyya/correlation would
+    # otherwise score as a mismatch. See smooth_hue_axis's own docstring
+    # (aero_eyes/utils/color.py) for why this must be CIRCULAR (Hue wraps
+    # at 0/179), not a plain blur. 0.0 (default) = no-op, unchanged
+    # behavior. NOT YET VALIDATED on this project's own footage -- start
+    # small (e.g. 1.0-1.5 bins) and check the effect on
+    # min_similarity/color_postfilter's own logged stats before trusting it.
+    hue_smoothing_sigma: float = 0.0
     metric: Literal["bhattacharyya", "correlation"] = "bhattacharyya"
     # Candidates scoring below this similarity (roughly 0..1, higher = more
     # similar) against EVERY reference photo are dropped outright. This is
@@ -3288,6 +3392,164 @@ class GDinoCosineRescoreConfig(BaseModel):
     candidate_topk_per_keyframe: int = 15
 
 
+class GDinoOnlineAdaptiveThresholdConfig(BaseModel):
+    """stage123_gdino.online_adaptive_threshold -- causal, streaming-
+    compatible per-video threshold for Grounding DINO's own box score,
+    mirroring aero_eyes.stages.stage3.OnlineAdaptiveThreshold one detector
+    down. Grounding DINO's box_threshold is a FIXED, global cutoff applied
+    identically to every sample, but how well "true target" separates from
+    "this video's own clutter" varies per object/video (a confuser scoring
+    0.3 against a target scoring 0.6-0.7 needs a very different cutoff than
+    one scoring 0.5 against a 0.55 target) -- see the discussion that
+    motivated this field for a concrete before/after example.
+
+    UNLIKE a whole-video batch pass, this NEVER looks at a future keyframe
+    to decide the current one's threshold -- required for a live/online
+    feed, where the video isn't fully available up front. Each keyframe is
+    decided using only the raw box scores observed at STRICTLY EARLIER
+    keyframes (a running window of the last window_size raw scores across
+    all keyframes so far), cold-starting at abs_floor until min_samples have
+    been observed; that keyframe's OWN raw scores are folded into the
+    running window only AFTER its own decision, so it can only ever
+    influence FUTURE keyframes.
+
+    Costs NO extra Grounding DINO forward pass: each keyframe already needs
+    exactly one raw_boxes_and_scores() call (box_threshold=0, so every
+    candidate is visible) to both (a) decide against the running threshold
+    and (b) feed that same call's scores into the running window for future
+    keyframes -- text_threshold stays at its own configured value throughout
+    (only the box-score cutoff is calibrated here).
+
+    Disabled by default -- stage123_gdino.box_threshold decides
+    detections.json exactly as before this option existed. Only applies to
+    run_stage123_gdino (the default grounding_dino path); has no effect when
+    stage123_gdino.cosine_rescore.enabled (that path's own Stage 3 cosine
+    matching decides the final threshold instead, and deliberately LOOSENS
+    box_threshold via cosine_rescore.candidate_box_threshold, which this
+    would fight against). NOT YET VALIDATED on this project's own footage.
+    """
+    enabled: bool = False
+    z_score: float = 1.0
+    abs_floor: float = 0.15
+    min_samples: int = 20
+    window_size: int = 200
+
+
+class GDinoOnlineFusionConfig(BaseModel):
+    """stage123_gdino.online_fusion -- causal, streaming-compatible
+    combination of Grounding DINO's own box confidence AND DINOv3 (or
+    whatever stage1.feature_extractor is configured) cosine similarity,
+    replacing GDinoOnlineAdaptiveThreshold's raw-GDINO-score-only decision
+    with a fused one -- the LIVE-COMPATIBLE counterpart to
+    stage123_gdino.cosine_rescore (that path needs a fully-written
+    candidates.json before Stage 3 can run -- batch by construction,
+    since candidate generation and cosine scoring are separate stages --
+    so it CANNOT serve a genuinely live feed; this field merges both into
+    ONE per-keyframe causal loop instead, at the cost of duplicating
+    cosine_rescore's DINOv3-scoring idea in an online-safe form).
+
+    Rationale for standardizing (z-scoring) BOTH scores before combining,
+    instead of the plain `gdino_score**gamma * cosine_sim` product
+    stage3.detector_confidence_fusion uses: that product is dominated by
+    whichever score has the larger RAW margin between target and clutter,
+    not whichever is more informative -- if Grounding DINO's own margin is
+    large (e.g. 0.65 vs 0.30) while DINOv3 cosine's margin is small (e.g.
+    0.55 vs 0.50, compressed by the ground-to-aerial domain gap), the raw
+    product is effectively decided by Grounding DINO alone, and DINOv3's
+    identity-level signal -- the whole reason it's here, to reject a
+    same-category-but-wrong-identity confuser Grounding DINO's own
+    category-level score can't separate -- gets diluted to near a constant
+    multiplier. See CausalRunningStats's own docstring
+    (aero_eyes/stages/stage123_gdino.py) for the full mechanism: each score
+    is z-scored against its OWN running per-video distribution before being
+    combined, so each contributes according to how many of ITS OWN standard
+    deviations it deviates by, not its raw units.
+
+    fused = weight*z_gdino + (1-weight)*z_cosine, then a SEPARATE causal
+    threshold (`threshold`, a GDinoOnlineAdaptiveThresholdConfig reused
+    generically -- its z_score/abs_floor/min_samples/window_size now
+    describe the FUSED score's own running distribution, not raw GDINO
+    score) decides accept/reject, using GDinoOnlineAdaptiveThreshold as-is
+    (its logic never referenced anything GDINO-specific).
+
+    candidate_pool caps how many of a keyframe's raw (box_threshold=0)
+    candidates get embedded with DINOv3 per keyframe -- embedding is far
+    more expensive than reading Grounding DINO's already-computed box
+    score, so only the top candidate_pool candidates BY GDINO SCORE are
+    embedded; z_gdino's own running stats still observe EVERY raw
+    candidate's score (cheap), so its background estimate is richer than
+    z_cosine's (bounded by candidate_pool every keyframe) -- an accepted,
+    documented asymmetry, not an oversight.
+
+    Needs stage1.feature_extractor's prototype.npz (built via
+    stage1.run_stage1, same as cosine_rescore -- run once, cached). Mutually
+    exclusive with stage123_gdino.online_adaptive_threshold in effect (both
+    could be enabled, but online_fusion's OWN threshold on the fused score
+    decides accept/reject when it is enabled -- online_adaptive_threshold's
+    raw-GDINO-score threshold is then unused; a warning is logged).
+    Disabled by default. NOT YET VALIDATED on this project's own footage.
+    """
+    enabled: bool = False
+    weight: float = 0.5
+    window_size: int = 200
+    min_samples: int = 20
+    candidate_pool: int = 10
+    threshold: GDinoOnlineAdaptiveThresholdConfig = GDinoOnlineAdaptiveThresholdConfig(z_score=0.5, abs_floor=-1e9)
+
+
+class GDinoCascadeVerificationConfig(BaseModel):
+    """stage123_gdino.cascade_verification -- Pass-2 "zoom-in" re-
+    verification against Grounding DINO's OWN Pass-1 boxes, done at the
+    IMAGE level (crop + re-run) rather than by touching anything inside the
+    decoder. Rationale: a false positive commonly arises from the model
+    correlating local texture with its surrounding GLOBAL context (a rock,
+    shadow, or clutter patch that only resembles the text prompt in
+    relation to what's around it in the FULL frame) -- crop that context
+    away and re-run the SAME forward pass on just the padded region around
+    the box; a genuine true positive's own local appearance doesn't depend
+    on the wider frame, so its score survives (often rises, from the
+    effective zoom on a small object), while a context-dependent FP's score
+    typically drops sharply once the confusing surroundings are gone.
+
+    For each Pass-1 box (already NMS'd/top-K'd/area-filtered), crops a
+    pad_ratio-padded region around it (aero_eyes.utils.geometry.
+    crop_with_pad -- same padding convention as stage2.candidate.
+    feature_crop_pad: a fraction of the box's own width/height added on
+    EACH side, so pad_ratio=0.5 doubles the box's width/height), re-runs
+    Grounding DINO on JUST that crop with the SAME text prompt, and keeps
+    the box only if the crop pass's best score is at least
+    min_score_ratio * the box's own Pass-1 score (an empty crop-pass result
+    counts as score 0.0, i.e. always rejected). A surviving box keeps its
+    ORIGINAL Pass-1 score unchanged -- this is a pure accept/reject filter,
+    not a rescoring step, so every downstream consumer (NMS, thresholds,
+    cosine_rescore, isolated_detection_filter) sees the same score it
+    always did.
+
+    Costs one EXTRA Grounding DINO forward pass per SURVIVING Pass-1 box
+    (not per raw candidate) -- with topk_per_keyframe boxes per keyframe,
+    up to topk_per_keyframe extra forward passes per keyframe. Only catches
+    CONTEXT-dependent false positives; a confuser whose own LOCAL
+    appearance genuinely resembles the text prompt (indistinguishable from
+    the target at the crop level, with no reliance on surrounding context)
+    will still pass Pass 2 unchanged -- this is a narrower net than
+    cosine_rescore/online_fusion (which check INSTANCE identity via a
+    separate embedding model), not a replacement for either.
+
+    Disabled by default -- run_stage123_gdino's boxes are used exactly as
+    Pass 1 produced them, unchanged. NOT YET VALIDATED on this project's
+    own footage.
+    """
+    enabled: bool = False
+    pad_ratio: float = 0.5
+    # A surviving box's crop-pass score must be >= this fraction of its own
+    # Pass-1 score. 1.0 = score must not drop at all (strict); lower values
+    # tolerate some drop before treating it as a context-dependent illusion.
+    min_score_ratio: float = 0.7
+    # Extra floor on the crop-pass score itself, independent of
+    # min_score_ratio -- 0.0 (default) disables this second check.
+    min_absolute_score: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 class Stage123GDinoConfig(BaseModel):
     """Only used when pipeline.detector == 'grounding_dino'. Requires
@@ -3365,6 +3627,9 @@ class Stage123GDinoConfig(BaseModel):
     max_box_area_frac: float = 0.5
     isolated_detection_filter: IsolatedDetectionFilterConfig = IsolatedDetectionFilterConfig()
     cosine_rescore: GDinoCosineRescoreConfig = GDinoCosineRescoreConfig()
+    online_adaptive_threshold: GDinoOnlineAdaptiveThresholdConfig = GDinoOnlineAdaptiveThresholdConfig()
+    online_fusion: GDinoOnlineFusionConfig = GDinoOnlineFusionConfig()
+    cascade_verification: GDinoCascadeVerificationConfig = GDinoCascadeVerificationConfig()
 
 
 # ---------------------------------------------------------------------------

@@ -905,6 +905,27 @@ stage3:
     # (recall-preserving) filter.
     tau_negative_margin: 0.0
 
+  # MUSE-style (arXiv:2510.17866) "joint similarity score" -- see
+  # RelativeScoreFusionConfig's own docstring (aero_eyes/config.py) for the
+  # full rationale (helps separate several same-category confusers in one
+  # keyframe, where absolute similarity alone can't tell them apart).
+  # NOT YET VALIDATED on this project's footage -- sweep beta/temperature.
+  relative_score_fusion:
+    enabled: false
+    temperature: 0.02
+    beta: 0.8
+
+  # MUSE-style (arXiv:2510.17866) "uncertainty-aware objectness prior" --
+  # weights the final score by the candidate's OWN detector confidence
+  # (Grounding DINO's text-grounding score, GeCo2's own score, or a legacy
+  # proposal model's conf -- whichever produced candidates.json). See
+  # DetectorConfidenceFusionConfig's own docstring for the full rationale
+  # and the gamma=1.0 vs MUSE's own gamma=0.1 choice, plus the
+  # negative-similarity caveat. NOT YET VALIDATED on this project's footage.
+  detector_confidence_fusion:
+    enabled: false
+    gamma: 1.0
+
 # ----------------------------------------------------------------------------
 # STAGE 1+2+3 REPLACEMENT — GeCo2 exemplar detector.
 # Only used when pipeline.detector == "geco2". Ignores stage1/stage2/stage3
@@ -1535,6 +1556,15 @@ stage123_geco2:
     hue_bins: 12
     sat_bins: 8
     value_bins: 8   # for the separate Value-only histogram, same small-crop reasoning
+    # Circularly smooths the Hue axis (in BINS, not degrees) before
+    # comparison -- tolerates a moderate lighting-driven hue shift (e.g.
+    # the SAME orange object reading more yellow in direct sunlight than
+    # under neutral/shaded light) that plain bin-to-bin comparison would
+    # otherwise score as a mismatch. See ColorPostfilterConfig's own
+    # docstring (aero_eyes/config.py). 0.0 (default) = no-op. NOT YET
+    # VALIDATED -- start small (1.0-1.5) and check the effect on the
+    # logged sim_hs stats before trusting it.
+    hue_smoothing_sigma: 0.0
     metric: bhattacharyya   # bhattacharyya | correlation
     # Candidates scoring below this similarity (~0..1, higher=more similar)
     # against EVERY reference photo are dropped outright. This is the ONLY
@@ -2014,6 +2044,84 @@ stage123_gdino:
     enabled: false
     candidate_box_threshold: 0.15
     candidate_topk_per_keyframe: 15
+  # Causal, streaming-compatible per-video threshold calibration for
+  # Grounding DINO's own box score (mirrors stage3.adaptive_threshold_online
+  # one detector down) -- see GDinoOnlineAdaptiveThresholdConfig's own
+  # docstring (aero_eyes/config.py) for the full rationale. Costs NO extra
+  # forward pass (one raw_boxes_and_scores() call per keyframe already sees
+  # every candidate). NEVER looks at a future keyframe -- safe for a live
+  # feed, unlike a whole-video batch pass. No effect when
+  # cosine_rescore.enabled above (that path's own Stage 3 cosine matching
+  # decides the threshold instead). NOT YET VALIDATED on this project's
+  # footage.
+  online_adaptive_threshold:
+    enabled: false
+    z_score: 1.0
+    abs_floor: 0.15
+    min_samples: 20     # cold-start floor until this many raw scores observed
+    window_size: 200    # running window of raw scores across keyframes
+
+  # LIVE-COMPATIBLE counterpart to cosine_rescore above: cosine_rescore needs
+  # a fully-written candidates.json before Stage 3 can run (batch, since
+  # candidate generation and cosine scoring are separate stages) -- this
+  # instead fuses Grounding DINO's own box confidence AND DINOv3 (or
+  # whatever stage1.feature_extractor is configured) cosine similarity in
+  # ONE causal per-keyframe loop. Standardizes (z-scores) BOTH signals
+  # against their OWN running per-video distribution before combining --
+  # NOT a plain product -- because a raw product/sum is dominated by
+  # whichever signal has the larger RAW margin between target and clutter,
+  # not whichever is more informative: if Grounding DINO's own margin is
+  # large (e.g. 0.65 vs 0.30) while DINOv3 cosine's margin is small (e.g.
+  # 0.55 vs 0.50, common when the ground-to-aerial domain gap compresses
+  # cosine similarity), a raw product is effectively decided by Grounding
+  # DINO alone. See GDinoOnlineFusionConfig's own docstring
+  # (aero_eyes/config.py) and CausalRunningStats's own docstring
+  # (aero_eyes/stages/stage123_gdino.py) for the full mechanism.
+  # Needs stage1.feature_extractor's prototype.npz (built via
+  # stage1.run_stage1, same as cosine_rescore -- run once, cached). If BOTH
+  # this and online_adaptive_threshold above are enabled, this one's own
+  # threshold on the FUSED score decides accept/reject (a warning is
+  # logged). NOT YET VALIDATED on this project's own footage.
+  online_fusion:
+    enabled: false
+    weight: 0.5          # weight on Grounding DINO's z-score; (1-weight) on DINOv3 cosine's z-score
+    window_size: 200
+    min_samples: 20
+    # Only the top candidate_pool raw candidates (by Grounding DINO's own
+    # score) get embedded with DINOv3 per keyframe -- embedding is far more
+    # expensive than reading Grounding DINO's already-computed box score.
+    candidate_pool: 10
+    # Causal threshold on the FUSED z-score's own running distribution
+    # (reuses GDinoOnlineAdaptiveThresholdConfig's shape generically --
+    # nothing in its logic is GDINO-specific). z-scored values center
+    # around 0 by construction, so a much lower z_score/abs_floor than
+    # online_adaptive_threshold's own defaults is appropriate here.
+    threshold:
+      z_score: 0.5
+      abs_floor: -1.0e9  # effectively off -- cold start already returns 0.0 from both z-score trackers
+      min_samples: 20
+      window_size: 200
+
+  # Pass-2 "zoom-in" re-verification, done at the IMAGE level (crop + re-run)
+  # instead of touching the decoder: for each surviving Pass-1 box, crop a
+  # pad_ratio-padded region around it and re-run Grounding DINO on JUST that
+  # crop with the same text prompt. A context-dependent false positive (a
+  # rock/shadow that only resembles the prompt in relation to its
+  # surroundings) typically scores much lower once cropped away from that
+  # context; a genuine true positive's score survives (or rises, from the
+  # effective zoom). Keeps a box only if the crop pass's best score is >=
+  # min_score_ratio * the box's own Pass-1 score -- the surviving box keeps
+  # its ORIGINAL Pass-1 score, this only decides accept/reject. See
+  # GDinoCascadeVerificationConfig's own docstring (aero_eyes/config.py) for
+  # the cost (one extra forward pass per surviving box per keyframe) and its
+  # limits (only catches CONTEXT-dependent FPs, not ones that genuinely
+  # resemble the prompt locally). false (default) = disabled, unchanged
+  # behavior. NOT YET VALIDATED on this project's own footage.
+  cascade_verification:
+    enabled: false
+    pad_ratio: 0.5
+    min_score_ratio: 0.7
+    min_absolute_score: 0.0
 
 # ----------------------------------------------------------------------------
 # IMPORTANT (measured on this project's 6 labeled samples, not just

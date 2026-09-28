@@ -612,7 +612,7 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
             )
 
         hs_hists = [
-            compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins)
+            compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins, cpf.hue_smoothing_sigma)
             for img, mask in zip(ref_imgs, masks)
         ]
         v_hists = [
@@ -681,7 +681,7 @@ def apply_color_postfilter(
         # color histogram is measured from.
         color_box = inset_box(box, cpf_cfg.candidate_inset_ratio)
         crop = crop_with_pad(frame_bgr, color_box, pad_ratio=0.0)
-        hs_hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins)
+        hs_hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins, cpf_cfg.hue_smoothing_sigma)
         v_hist = compute_value_histogram(crop, None, cpf_cfg.value_bins)
         sim_hs = max(histogram_similarity(hs_hist, r, cpf_cfg.metric) for r in color_sig.hs_hists)
         sim_v = max(histogram_similarity(v_hist, r, cpf_cfg.metric) for r in color_sig.v_hists)

@@ -25,11 +25,173 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from collections import deque
 from pathlib import Path
+
+import numpy as np
 
 from aero_eyes.types import Detection
 
 log = logging.getLogger(__name__)
+
+
+class GDinoOnlineAdaptiveThreshold:
+    """Causal, streaming-compatible per-video threshold for Grounding DINO's
+    own box score -- see GDinoOnlineAdaptiveThresholdConfig's own docstring
+    (aero_eyes/config.py) for the full rationale. Mirrors
+    aero_eyes.stages.stage3.OnlineAdaptiveThreshold's own contract:
+    threshold_for_next_frame() decides using ONLY scores observed at
+    STRICTLY EARLIER keyframes; observe() then feeds THIS keyframe's own
+    raw scores in, called AFTER its own accept/reject decision was already
+    made against the pre-update window."""
+
+    def __init__(self, cfg_oat):
+        self.cfg = cfg_oat
+        self.history: deque = deque(maxlen=cfg_oat.window_size)
+
+    def threshold_for_next_frame(self) -> float:
+        if len(self.history) < self.cfg.min_samples:
+            return self.cfg.abs_floor
+        scores = np.array(self.history)
+        raw_threshold = float(scores.mean() + self.cfg.z_score * scores.std())
+        return max(self.cfg.abs_floor, raw_threshold)
+
+    def observe(self, raw_scores: np.ndarray) -> None:
+        self.history.extend(raw_scores.tolist())
+
+
+class CausalRunningStats:
+    """Causal, streaming-compatible running mean/std over a bounded window
+    -- used by stage123_gdino.online_fusion (GDinoOnlineFusionConfig) to
+    z-score TWO differently-scaled score streams (Grounding DINO's own box
+    confidence, DINOv3 cosine similarity) against each OTHER's raw units
+    before combining them.
+
+    Rationale: a plain multiplicative/weighted combination of two raw
+    scores is dominated by whichever one happens to have the larger
+    ABSOLUTE margin between target and clutter in RAW units, regardless of
+    which one is actually more informative -- e.g. if Grounding DINO scores
+    0.65 (target) vs 0.30 (clutter) but DINOv3 cosine scores 0.55 vs 0.50
+    (much smaller raw margin, common when the ground-to-aerial domain gap
+    compresses cosine similarity), a raw product/sum is effectively decided
+    by Grounding DINO alone -- DINOv3's identity signal gets diluted to
+    near a constant multiplier, defeating the entire reason it was added
+    (catching a same-category-but-wrong-identity confuser Grounding DINO's
+    own category-level score cannot separate). Standardizing each stream to
+    its OWN running mean/std first (z-score) means each contributes
+    according to how many of ITS OWN standard deviations it deviates by --
+    a small raw margin that is still statistically decisive (low noise)
+    keeps its full weight; a small raw margin that is ALSO noisy (i.e.
+    DINOv3 genuinely isn't discriminative in this domain) correctly
+    collapses toward zero instead of silently doing nothing while looking
+    like it's contributing.
+
+    z_score(value) uses ONLY values observed via observe() so far (a keyframe
+    must call z_score() for its OWN candidates BEFORE observe(), same
+    causality contract as GDinoOnlineAdaptiveThreshold) -- returns 0.0
+    during cold start (fewer than min_samples observed, or a degenerate
+    zero-variance window), a neutral value that neither helps nor hurts a
+    downstream weighted combination while there isn't enough history to
+    trust mean/std yet.
+    """
+
+    def __init__(self, window_size: int, min_samples: int):
+        self.min_samples = min_samples
+        self.history: deque = deque(maxlen=window_size)
+
+    def z_score(self, value: float) -> float:
+        if len(self.history) < self.min_samples:
+            return 0.0
+        arr = np.array(self.history)
+        std = float(arr.std())
+        if std < 1e-8:
+            return 0.0
+        return float((value - arr.mean()) / std)
+
+    def observe(self, values) -> None:
+        self.history.extend(np.atleast_1d(values).tolist())
+
+
+def online_fusion_detect_frame(
+    frame_bgr, text_prompt: str, detector, extractor, prototype,
+    gdino_stats: CausalRunningStats, cosine_stats: CausalRunningStats,
+    fused_threshold_tracker: GDinoOnlineAdaptiveThreshold, cfg_fusion, cfg,
+):
+    """One keyframe of stage123_gdino.online_fusion -- see
+    GDinoOnlineFusionConfig's own docstring for the full rationale. Reads
+    every tracker to make THIS keyframe's decision, then updates them
+    AFTER, so no keyframe's own candidates can influence their own
+    decision (same causality contract as GDinoOnlineAdaptiveThreshold).
+    Returns (boxes, threshold_used) -- the latter only for logging.
+
+    gdino_stats observes EVERY raw candidate's score (cheap); cosine_stats
+    only observes the pooled (cfg_fusion.candidate_pool) candidates that
+    actually got embedded -- see the config's own docstring for why this
+    asymmetry is accepted, not an oversight.
+    """
+    from aero_eyes.types import Box
+
+    boxes_xyxy, gdino_scores = detector.raw_boxes_and_scores(
+        frame_bgr, text_prompt, box_threshold=0.0, text_threshold=detector.text_threshold,
+    )
+    threshold = fused_threshold_tracker.threshold_for_next_frame()
+    if len(boxes_xyxy) == 0:
+        gdino_stats.observe(gdino_scores)
+        return [], threshold
+
+    pool_n = min(cfg_fusion.candidate_pool, len(boxes_xyxy))
+    top_idx = np.argsort(gdino_scores)[::-1][:pool_n]
+    pooled_boxes_xyxy = boxes_xyxy[top_idx]
+    pooled_gdino_scores = gdino_scores[top_idx]
+
+    pooled_boxes = [
+        Box(x1=float(b[0]), y1=float(b[1]), x2=float(b[2]), y2=float(b[3])) for b in pooled_boxes_xyxy
+    ]
+    feats = extractor.extract_crops(
+        frame_bgr, pooled_boxes,
+        pad_ratio=cfg.stage2.candidate.feature_crop_pad, batch_size=cfg.runtime.batch_size,
+    )
+    cosine_sims = feats @ prototype
+
+    fused_scores = np.array([
+        cfg_fusion.weight * gdino_stats.z_score(float(g)) + (1.0 - cfg_fusion.weight) * cosine_stats.z_score(float(c))
+        for g, c in zip(pooled_gdino_scores, cosine_sims)
+    ])
+    keep = fused_scores >= threshold
+    result = detector.filter_boxes(pooled_boxes_xyxy[keep], fused_scores[keep], frame_bgr.shape[:2])
+
+    # Update every tracker AFTER the decision -- causality.
+    gdino_stats.observe(gdino_scores)
+    cosine_stats.observe(cosine_sims)
+    fused_threshold_tracker.observe(fused_scores)
+    return result, threshold
+
+
+def cascade_verify_boxes(detector, frame_bgr, text_prompt: str, boxes: list, cfg_cascade) -> list:
+    """stage123_gdino.cascade_verification -- Pass-2 "zoom-in" re-check of
+    already-decided Pass-1 boxes -- see GDinoCascadeVerificationConfig's own
+    docstring (aero_eyes/config.py) for the full rationale. For each box,
+    crops a padded region around it and re-runs Grounding DINO on JUST that
+    crop with the same text prompt; keeps the box only if the crop pass's
+    own best score is at least cfg_cascade.min_score_ratio * the box's
+    Pass-1 score (and >= min_absolute_score). Does NOT touch a surviving
+    box's own score -- pure accept/reject, so callers keep using each box's
+    original Pass-1 score afterward."""
+    from aero_eyes.utils.geometry import crop_with_pad
+
+    kept = []
+    for box in boxes:
+        crop = crop_with_pad(frame_bgr, box, cfg_cascade.pad_ratio)
+        _, pass2_scores = detector.raw_boxes_and_scores(
+            crop, text_prompt, box_threshold=0.0, text_threshold=detector.text_threshold,
+        )
+        pass2_score = float(pass2_scores.max()) if len(pass2_scores) else 0.0
+        if pass2_score < cfg_cascade.min_absolute_score:
+            continue
+        if pass2_score < cfg_cascade.min_score_ratio * box.score:
+            continue
+        kept.append(box)
+    return kept
 
 
 def _locate_video(cfg, sample_id: str) -> Path:
@@ -94,17 +256,71 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
     viz_dir = work_dir / "viz" / "stage123_gdino"
     save_viz = cfg.runtime.save_visualizations
 
+    oat_cfg = cfg.stage123_gdino.online_adaptive_threshold
+    fusion_cfg = cfg.stage123_gdino.online_fusion
+    cascade_cfg = cfg.stage123_gdino.cascade_verification
+    online_threshold = GDinoOnlineAdaptiveThreshold(oat_cfg) if oat_cfg.enabled and not fusion_cfg.enabled else None
+    if oat_cfg.enabled and fusion_cfg.enabled:
+        log.warning(
+            "[Stage123-GDINO] %s: both online_adaptive_threshold and online_fusion are enabled -- "
+            "online_fusion's own threshold on the FUSED score decides accept/reject; "
+            "online_adaptive_threshold's raw-GDINO-score threshold is unused.", sample_id,
+        )
+
+    extractor = prototype = None
+    gdino_stats = cosine_stats = fused_threshold_tracker = None
+    if fusion_cfg.enabled:
+        from aero_eyes.models.features import build_feature_extractor
+        from aero_eyes.stages.stage1 import run_stage1
+        from aero_eyes.utils.io import read_prototype
+
+        run_stage1(cfg, sample_id)
+        extractor = build_feature_extractor(cfg)
+        prototype, _, _ = read_prototype(work_dir / cfg.stage1.prototype.cache_name)
+        gdino_stats = CausalRunningStats(fusion_cfg.window_size, fusion_cfg.min_samples)
+        cosine_stats = CausalRunningStats(fusion_cfg.window_size, fusion_cfg.min_samples)
+        fused_threshold_tracker = GDinoOnlineAdaptiveThreshold(fusion_cfg.threshold)
+
     detections: dict[int, list[Detection]] = {}
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
-        boxes = detector.detect_frame(frame_bgr, text_prompt)
+        if fusion_cfg.enabled:
+            boxes, threshold = online_fusion_detect_frame(
+                frame_bgr, text_prompt, detector, extractor, prototype,
+                gdino_stats, cosine_stats, fused_threshold_tracker, fusion_cfg, cfg,
+            )
+        elif online_threshold is not None:
+            # ONE forward pass, box_threshold=0 (see everything) -- reused
+            # both for THIS keyframe's decision (against the running
+            # threshold, built from strictly earlier keyframes only) and to
+            # extend the running window for FUTURE keyframes, in that
+            # order, so no keyframe's own scores can influence its own
+            # threshold. text_threshold stays at its own configured value.
+            boxes_xyxy, scores = detector.raw_boxes_and_scores(
+                frame_bgr, text_prompt, box_threshold=0.0, text_threshold=detector.text_threshold,
+            )
+            threshold = online_threshold.threshold_for_next_frame()
+            keep = scores >= threshold
+            boxes = detector.filter_boxes(boxes_xyxy[keep], scores[keep], frame_bgr.shape[:2])
+            online_threshold.observe(scores)
+        else:
+            threshold = cfg.stage123_gdino.box_threshold
+            boxes = detector.detect_frame(frame_bgr, text_prompt)
+        if cascade_cfg.enabled and boxes:
+            pre_n = len(boxes)
+            boxes = cascade_verify_boxes(detector, frame_bgr, text_prompt, boxes, cascade_cfg)
+            if len(boxes) != pre_n:
+                log.debug(
+                    "[Stage123-GDINO] frame %d: cascade_verification dropped %d/%d box(es)",
+                    frame_idx, pre_n - len(boxes), pre_n,
+                )
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
             for b in boxes
         ]
         detections[frame_idx] = result_dets
-        log.debug("[Stage123-GDINO] frame %d: %d detections", frame_idx, len(result_dets))
+        log.debug("[Stage123-GDINO] frame %d: %d detections (threshold=%.3f)", frame_idx, len(result_dets), threshold)
         if save_viz:
             from aero_eyes.utils import viz as vizmod
             vizmod.save_stage3_detections(
@@ -129,7 +345,13 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
                 idf_cfg.keep_conf_threshold, len(isolated), sorted(isolated),
             )
 
-    write_detections(detections, det_path, threshold=cfg.stage123_gdino.box_threshold)
+    # online_adaptive_threshold varies per keyframe -- no single scalar
+    # applies to the whole video, so record None (informational only, same
+    # convention run_stage123_geco2 uses for its own per-frame-relative path).
+    recorded_threshold = (
+        None if (online_threshold is not None or fusion_cfg.enabled) else cfg.stage123_gdino.box_threshold
+    )
+    write_detections(detections, det_path, threshold=recorded_threshold)
 
     elapsed = time.time() - t0
     log.info("[Stage123-GDINO] %s done in %.1fs -> %s (%d detection frames)",
@@ -178,6 +400,14 @@ def run_stage12_gdino_candidates(cfg, sample_id: str) -> Path:
 
     text_prompt = resolve_text_prompt(cfg, sample_id)
     log.info("[Stage12-GDINO] %s: text prompt = %r", sample_id, text_prompt)
+
+    if cfg.stage123_gdino.online_adaptive_threshold.enabled:
+        log.warning(
+            "[Stage12-GDINO] %s: stage123_gdino.online_adaptive_threshold.enabled=true has no "
+            "effect here -- this path already loosens Grounding DINO's own cutoff via "
+            "cosine_rescore.candidate_box_threshold and lets Stage 3's cosine matching decide "
+            "the final threshold instead.", sample_id,
+        )
 
     # stage1.feature_extractor's prototype -- an independent, instance-level
     # signal Stage 3's cosine matching will check candidates against.

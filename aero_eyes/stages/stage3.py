@@ -162,6 +162,58 @@ def _pool_sims(
     return np.mean(sims_per_ref, axis=0)
 
 
+def compute_relative_scores(
+    all_sims: np.ndarray, all_frame_idxs: list[int], temperature: float,
+) -> np.ndarray:
+    """Per-keyframe temperature-scaled softmax of all_sims -- MUSE's S_rel
+    (arXiv:2510.17866, Eq. 5), adapted from "softmax over candidate
+    TEMPLATES for one proposal" to "softmax over candidate PROPOSALS within
+    one keyframe" (see RelativeScoreFusionConfig's own docstring for why).
+    Numerically stable (subtracts each group's own max before exp). A
+    keyframe with a single candidate returns 1.0 for it (softmax of one
+    value)."""
+    from collections import defaultdict as _defaultdict
+
+    groups: dict[int, list[int]] = _defaultdict(list)
+    for i, fi in enumerate(all_frame_idxs):
+        groups[fi].append(i)
+
+    rel = np.zeros_like(all_sims)
+    for idxs in groups.values():
+        vals = all_sims[idxs] / temperature
+        vals = vals - vals.max()
+        exp = np.exp(vals)
+        rel[idxs] = exp / exp.sum()
+    return rel
+
+
+def apply_relative_score_fusion(
+    all_sims: np.ndarray, all_frame_idxs: list[int], cfg,
+) -> np.ndarray:
+    """stage3.relative_score_fusion, opt-in -- see RelativeScoreFusionConfig's
+    own docstring. No-op (returns all_sims unchanged) when cfg.enabled is
+    False."""
+    if not cfg.enabled:
+        return all_sims
+    rel = compute_relative_scores(all_sims, all_frame_idxs, cfg.temperature)
+    return cfg.beta * all_sims + (1.0 - cfg.beta) * rel
+
+
+def apply_detector_confidence_fusion(
+    all_sims: np.ndarray, all_dets: list[Detection], cfg,
+) -> np.ndarray:
+    """stage3.detector_confidence_fusion, opt-in -- see
+    DetectorConfidenceFusionConfig's own docstring. No-op (returns all_sims
+    unchanged) when cfg.enabled is False. Reads each candidate's own
+    detector confidence from Detection.box.score (source-agnostic: whichever
+    stage produced candidates.json -- Grounding DINO, GeCo2, or a legacy
+    proposal model -- already stores its own native confidence there)."""
+    if not cfg.enabled:
+        return all_sims
+    confidences = np.array([d.box.score for d in all_dets], dtype=all_sims.dtype)
+    return (confidences ** cfg.gamma) * all_sims
+
+
 def _otsu_threshold(sims: np.ndarray, num_bins: int) -> float:
     """Otsu's method on a real-valued 1-D array: histogram into num_bins,
     then pick the bin-edge split maximizing the between-class variance of
@@ -1260,6 +1312,12 @@ def run_stage3(cfg, sample_id: str) -> Path:
                 "stage3.similarity='cosine'. Disable domain_prompter or switch back to cosine."
             )
         all_sims = _apply_domain_prompter(all_feats, prototype, all_sims, cfg)
+
+    # ---- MUSE-style score fusion (both opt-in, applied LAST so each acts on
+    # whatever score every earlier step -- patch_matching, dynamic_prototype,
+    # domain_prompter -- already produced) ----
+    all_sims = apply_relative_score_fusion(all_sims, all_frame_idxs, s3.relative_score_fusion)
+    all_sims = apply_detector_confidence_fusion(all_sims, all_dets, s3.detector_confidence_fusion)
 
     # Always log the raw similarity distribution — the ground-to-aerial domain
     # gap means a fixed match_threshold tuned on one dataset can silently pass

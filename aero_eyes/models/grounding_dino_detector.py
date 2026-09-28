@@ -86,12 +86,19 @@ class GroundingDinoDetector:
         model.eval().to(self.device)
         return model, processor
 
-    def _postprocess(self, outputs: Any, inputs: dict, frame_shape: tuple[int, int]) -> list[dict]:
+    def _postprocess(
+        self, outputs: Any, inputs: dict, frame_shape: tuple[int, int],
+        box_threshold: float, text_threshold: float,
+    ) -> list[dict]:
         """Isolates the one part of this wrapper most exposed to
         transformers version skew (post_process_grounded_object_detection's
         signature/return keys have changed across releases -- e.g. `labels`
         vs newer `text_labels`) behind a single call site, so a version
-        bump only needs fixing here.
+        bump only needs fixing here. Takes box_threshold/text_threshold as
+        explicit arguments (not self.box_threshold/self.text_threshold)
+        so raw_boxes_and_scores below can request a near-zero cutoff for
+        threshold-calibration tooling without touching this instance's own
+        configured thresholds.
 
         VERIFIED (transformers source, huggingface/transformers
         src/transformers/models/grounding_dino/processing_grounding_dino.py):
@@ -106,14 +113,14 @@ class GroundingDinoDetector:
         h, w = frame_shape
         try:
             results = self.processor.post_process_grounded_object_detection(
-                outputs, inputs["input_ids"], threshold=self.box_threshold,
-                text_threshold=self.text_threshold, target_sizes=[(h, w)],
+                outputs, inputs["input_ids"], threshold=box_threshold,
+                text_threshold=text_threshold, target_sizes=[(h, w)],
             )
         except TypeError as e_new:
             try:
                 results = self.processor.post_process_grounded_object_detection(
-                    outputs, inputs["input_ids"], box_threshold=self.box_threshold,
-                    text_threshold=self.text_threshold, target_sizes=[(h, w)],
+                    outputs, inputs["input_ids"], box_threshold=box_threshold,
+                    text_threshold=text_threshold, target_sizes=[(h, w)],
                 )
             except TypeError as e_old:
                 raise RuntimeError(
@@ -124,17 +131,46 @@ class GroundingDinoDetector:
                 ) from e_old
         return results[0]
 
-    def detect_frame(self, frame_bgr: np.ndarray, text_prompt: str) -> list[Box]:
+    def raw_boxes_and_scores(
+        self, frame_bgr: np.ndarray, text_prompt: str,
+        box_threshold: float = 0.0, text_threshold: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """One forward pass + post-process, BEFORE min_box_area/
+        max_box_area_frac/NMS/top-K filtering -- the shared primitive behind
+        detect_frame (called with this instance's OWN configured
+        thresholds) and threshold-calibration tooling (called with a
+        near-zero threshold, to see every candidate Grounding DINO
+        considered at all -- see stage123_gdino.py's
+        global_adaptive_threshold and scripts/calibrate_gdino_threshold.py).
+        Returns (boxes_xyxy [N,4], scores [N]), both plain numpy, empty
+        arrays if nothing cleared box_threshold/text_threshold."""
         h, w = frame_bgr.shape[:2]
         pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         prompt = _normalize_prompt(text_prompt)
         inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
-        result = self._postprocess(outputs, inputs, (h, w))
+        result = self._postprocess(outputs, inputs, (h, w), box_threshold, text_threshold)
+        return result["boxes"].cpu().numpy(), result["scores"].cpu().numpy()
 
-        boxes_xyxy = result["boxes"].cpu().numpy()
-        scores = result["scores"].cpu().numpy()
+    def detect_frame(self, frame_bgr: np.ndarray, text_prompt: str) -> list[Box]:
+        h, w = frame_bgr.shape[:2]
+        boxes_xyxy, scores = self.raw_boxes_and_scores(
+            frame_bgr, text_prompt, self.box_threshold, self.text_threshold,
+        )
+        return self.filter_boxes(boxes_xyxy, scores, (h, w))
+
+    def filter_boxes(
+        self, boxes_xyxy: np.ndarray, scores: np.ndarray, frame_shape: tuple[int, int],
+    ) -> list[Box]:
+        """min_box_area/max_box_area_frac/NMS/top-K over already-decoded raw
+        boxes -- the tail half of detect_frame, factored out so
+        threshold-calibration tooling (stage123_gdino.py's
+        global_adaptive_threshold pass 2, scripts/calibrate_gdino_threshold.py)
+        can apply the SAME filtering to a raw_boxes_and_scores() call made
+        with a threshold other than self.box_threshold, without duplicating
+        this logic."""
+        h, w = frame_shape
         boxes = [
             Box(x1=float(b[0]), y1=float(b[1]), x2=float(b[2]), y2=float(b[3]), score=float(s))
             for b, s in zip(boxes_xyxy, scores)
