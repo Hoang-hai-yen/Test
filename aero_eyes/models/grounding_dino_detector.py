@@ -59,6 +59,15 @@ def _normalize_prompt(text: str) -> str:
     return text
 
 
+def _split_phrases(prompt: str) -> list[str]:
+    """Splits an already-_normalize_prompt'd, ". "-joined multi-phrase
+    string back into individual phrase strings -- needed for MM-Grounding-
+    DINO's own `text=[[phrase, ...]]` list-of-lists input convention (see
+    GroundingDinoDetector.raw_boxes_and_scores's own docstring for why).
+    Drops the trailing "." and any empty pieces from a double separator."""
+    return [p for p in (s.strip() for s in prompt.rstrip(".").split(". ")) if p]
+
+
 class GroundingDinoDetector:
     """Wraps one HF Grounding DINO checkpoint. detect_frame() takes a BGR
     frame + a text prompt and returns Box objects in absolute pixel xyxy,
@@ -173,11 +182,27 @@ class GroundingDinoDetector:
         considered at all -- see stage123_gdino.py's
         global_adaptive_threshold and scripts/calibrate_gdino_threshold.py).
         Returns (boxes_xyxy [N,4], scores [N]), both plain numpy, empty
-        arrays if nothing cleared box_threshold/text_threshold."""
+        arrays if nothing cleared box_threshold/text_threshold.
+
+        For self.variant.startswith("mm_") (MM-Grounding-DINO), `text=` is
+        passed as list-of-lists (`[[phrase, ...]]`) instead of the original
+        checkpoints' single ". "-joined string -- HF's own official MM
+        Grounding DINO usage example uses this format (text_labels=[["a
+        cat", "a remote control"]]), not the string convention shown for
+        the original checkpoints on that same docs page. NOT independently
+        confirmed to change scoring for a single-phrase prompt (this
+        project's typical case) -- matches documented usage defensively
+        rather than from an observed behavior difference in THIS wrapper.
+        If real footage still shows mm_* under-detecting true positives
+        after this, recalibrate box_threshold/text_threshold for that
+        checkpoint specifically (scripts/calibrate_gdino_threshold.py,
+        which works unchanged for any stage123_gdino.variant) before
+        suspecting the input format further."""
         h, w = frame_bgr.shape[:2]
         pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         prompt = _normalize_prompt(text_prompt)
-        inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt").to(self.device)
+        text_input = [_split_phrases(prompt)] if self.variant.startswith("mm_") else prompt
+        inputs = self.processor(images=pil_img, text=text_input, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
         result = self._postprocess(outputs, inputs, (h, w), box_threshold, text_threshold)

@@ -3822,6 +3822,24 @@ class Stage123GDinoConfig(BaseModel):
     isolates the most likely version-skew point, same as for the original
     checkpoints.
 
+    EMPIRICALLY OBSERVED (on this project's own footage): mm_tiny
+    under-detected the true target while scoring background clutter
+    higher than the original checkpoints ever did on the same video --
+    the OPPOSITE pattern from what broader training data should produce.
+    Investigated and fixed one plausible contributor: HF's own official MM
+    Grounding DINO usage example passes `text=` as list-of-lists
+    (`text_labels=[["a cat", "a remote control"]]`), not the original
+    checkpoints' single ". "-joined string -- GroundingDinoDetector.
+    raw_boxes_and_scores now uses that format specifically for
+    variant.startswith("mm_") (see that method's own docstring). NOT
+    confirmed this was the (or the only) actual cause -- if mm_* still
+    under-detects after this, the more likely remaining explanation is
+    that box_threshold/text_threshold (0.35/0.25, tuned against the
+    ORIGINAL checkpoints) simply don't transfer to this checkpoint's own
+    score distribution -- recalibrate per checkpoint with
+    scripts/calibrate_gdino_threshold.py (works unchanged for any
+    stage123_gdino.variant) rather than assuming the original defaults.
+
     NOT YET VALIDATED on this project's own footage.
     """
     variant: Literal["tiny", "base", "mm_tiny", "mm_base", "mm_large"] = "tiny"
