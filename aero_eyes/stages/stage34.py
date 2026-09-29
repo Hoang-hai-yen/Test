@@ -1,3 +1,4 @@
+%%writefile /kaggle/working/aero_eyes/aero_eyes/stages/stage34.py
 """Stage B — Match & Track (xử lý chính).
 
 Gộp từ 2 stage cũ:
