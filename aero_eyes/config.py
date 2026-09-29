@@ -3803,42 +3803,59 @@ class Stage123GDinoConfig(BaseModel):
     clip_tiebreak above, which all assume Grounding DINO's own score as a
     given rather than trying to improve it. Unlike the original checkpoints,
     a "large" size genuinely exists here, hence mm_large being offered.
-    Checkpoints (openmmlab-community org on the HF Hub): mm_tiny ->
-    mm_grounding_dino_tiny_o365v1_goldg_grit_v3det (their strongest tiny),
-    mm_base -> mm_grounding_dino_base_all, mm_large ->
-    mm_grounding_dino_large_all (their strongest of each size tier, "_all"
-    = trained on the full combined data mixture). Requires a transformers
+    Checkpoints (openmmlab-community org on the HF Hub) -- see _HF_MAP's
+    own comment (aero_eyes/models/grounding_dino_detector.py) for the full,
+    now data-composition-driven picking rationale below: mm_tiny ->
+    mm_grounding_dino_tiny_o365v1_goldg, mm_base ->
+    mm_grounding_dino_base_o365v1_goldg_v3det, mm_large ->
+    mm_grounding_dino_large_o365v2_oiv6_goldg. Requires a transformers
     release that ships MMGroundingDinoForObjectDetection (added ~August
     2025) -- verify with `python -c "from transformers import
     MMGroundingDinoForObjectDetection"` before relying on it; upgrade via
     `pip install -U transformers` if missing, same as the note above for
-    the original checkpoints. NOT YET VALIDATED end-to-end in THIS
-    pipeline (this environment has no transformers installed to smoke-test
-    against) -- the checkpoint names and Auto-class loading path are
-    confirmed from HF's own MM Grounding DINO docs, but
-    post_process_grounded_object_detection's exact output schema for this
-    specific processor has not been exercised here; _postprocess's own
-    try/except (old vs. new `threshold=`/`box_threshold=` kwarg) already
-    isolates the most likely version-skew point, same as for the original
-    checkpoints.
+    the original checkpoints.
 
-    EMPIRICALLY OBSERVED (on this project's own footage): mm_tiny
-    under-detected the true target while scoring background clutter
-    higher than the original checkpoints ever did on the same video --
-    the OPPOSITE pattern from what broader training data should produce.
-    Investigated and fixed one plausible contributor: HF's own official MM
-    Grounding DINO usage example passes `text=` as list-of-lists
-    (`text_labels=[["a cat", "a remote control"]]`), not the original
-    checkpoints' single ". "-joined string -- GroundingDinoDetector.
-    raw_boxes_and_scores now uses that format specifically for
-    variant.startswith("mm_") (see that method's own docstring). NOT
-    confirmed this was the (or the only) actual cause -- if mm_* still
-    under-detects after this, the more likely remaining explanation is
-    that box_threshold/text_threshold (0.35/0.25, tuned against the
-    ORIGINAL checkpoints) simply don't transfer to this checkpoint's own
-    score distribution -- recalibrate per checkpoint with
-    scripts/calibrate_gdino_threshold.py (works unchanged for any
-    stage123_gdino.variant) rather than assuming the original defaults.
+    EMPIRICAL INVESTIGATION TRAIL (this project's own footage) -- kept in
+    full since each step ruled something out, not just fixed something:
+    1. First pick was each tier's HIGHEST-BENCHMARK checkpoint
+       (tiny_o365v1_goldg_grit_v3det, base_all, large_all -- broadest
+       training data, best COCO/LVIS numbers). Result: mm_tiny
+       under-detected the true target while scoring background clutter
+       HIGHER than the original checkpoints ever did on the same video --
+       the OPPOSITE pattern broader training data should produce.
+    2. Tried the `text=[[...]]` list-of-lists input format (HF's own
+       official MM Grounding DINO usage example, vs. the original
+       checkpoints' single ". "-joined string) -- see
+       GroundingDinoDetector.raw_boxes_and_scores's own docstring. No
+       change.
+    3. Tried omitting `input_ids` from post_process_grounded_object_
+       detection for mm_* (also matching that same official example) --
+       see _postprocess's own docstring. No change.
+    4. Neither (2) nor (3) helped -> pointed at the checkpoint's TRAINING
+       DATA itself, not an API-usage mismatch: the broadest-data
+       checkpoints add GRIT (large-scale, long/descriptive PHRASE
+       grounding, not short category names) and V3Det (13000+ fine-
+       grained categories, pushes toward needing more SPECIFIC category
+       matches) on top of O365+GoldG -- plausibly shifting the model's own
+       calibration away from what matches this project's short,
+       category-name-style prompts (e.g. "a backpack."), which the
+       ORIGINAL Grounding DINO checkpoints (trained on just
+       O365+GoldG+Cap4M, no GRIT/V3Det) were never exposed to during
+       training either. Swapped mm_tiny/mm_base/mm_large to the NARROWEST
+       available checkpoint per tier instead (closest to what the
+       corresponding original checkpoint was itself trained on) -- see
+       _HF_MAP's own comment for exactly which datasets each one still
+       does/doesn't share with the original recipe.
+    Only step 4's mm_tiny swap has real evidence behind picking it
+    (steps 1-3's failure); mm_base/mm_large's own swaps apply the same
+    reasoning but have NOT been separately confirmed to fix anything on
+    this project's footage. If mm_tiny STILL under-detects after this
+    swap, recalibrate box_threshold/text_threshold for it specifically
+    with scripts/calibrate_gdino_threshold.py or scripts/
+    debug_gdino_raw_scores.py (both variant-agnostic) rather than
+    assuming the original checkpoints' own 0.35/0.25 defaults transfer,
+    and treat "no MM-Grounding-DINO checkpoint suits this domain" as a
+    real possible conclusion, not just an unexplored one.
 
     NOT YET VALIDATED on this project's own footage.
     """

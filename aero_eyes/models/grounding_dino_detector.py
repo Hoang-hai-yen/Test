@@ -38,13 +38,35 @@ log = logging.getLogger(__name__)
 _HF_MAP = {
     "tiny": "IDEA-Research/grounding-dino-tiny",   # Swin-T
     "base": "IDEA-Research/grounding-dino-base",   # Swin-B
-    # MM-Grounding-DINO (arXiv:2401.02361) -- same architecture, broader
-    # training data (Objects365+GoldG+V3Det+GRIT vs. the original's own
-    # smaller set). "_all" = trained on the full combined data mixture
-    # (OpenMMLab's own strongest checkpoint per size tier).
-    "mm_tiny": "openmmlab-community/mm_grounding_dino_tiny_o365v1_goldg_grit_v3det",
-    "mm_base": "openmmlab-community/mm_grounding_dino_base_all",
-    "mm_large": "openmmlab-community/mm_grounding_dino_large_all",
+    # MM-Grounding-DINO (arXiv:2401.02361) -- same architecture, retrained
+    # by OpenMMLab. Picked the checkpoint CLOSEST to each original GDino
+    # checkpoint's OWN training data, not the highest-benchmark one --
+    # EMPIRICALLY OBSERVED (this project's own footage): the broader-data
+    # "_grit_v3det"/"_all" checkpoints (this wrapper's first pick) badly
+    # under-detected the true target versus original GDino, even after
+    # fixing the text=[[...]] input format and dropping input_ids from
+    # post-processing (see _postprocess's own docstring) -- neither fix
+    # helped, pointing at a genuine calibration/behavior shift from GRIT
+    # (large-scale, long/descriptive phrase grounding, not short category
+    # names) and V3Det (13000+ fine-grained categories, pushes toward
+    # needing more SPECIFIC category matches) diverging from this
+    # project's own short, category-name-style prompts. Swapped to the
+    # narrowest available checkpoint per tier instead:
+    #   original GroundingDINO-Tiny trained on O365+GoldG+Cap4M -- mm_tiny
+    #     now maps to o365v1_goldg (same core O365+GoldG, missing only
+    #     Cap4M -- no openmmlab checkpoint matches it exactly, this is the
+    #     closest available).
+    #   original GroundingDINO-Base's own exact recipe wasn't confirmed
+    #     here -- mm_base maps to o365v1_goldg_v3det (still carries V3Det,
+    #     no bare o365v1_goldg-only Base checkpoint is published) rather
+    #     than "_all" (O365+EVERYTHING), and mm_large to
+    #     o365v2_oiv6_goldg rather than "_all", for the same
+    #     narrower-is-closer-to-original reasoning -- NEITHER has been
+    #     confirmed on this project's own footage the way mm_tiny's
+    #     failure mode was.
+    "mm_tiny": "openmmlab-community/mm_grounding_dino_tiny_o365v1_goldg",
+    "mm_base": "openmmlab-community/mm_grounding_dino_base_o365v1_goldg_v3det",
+    "mm_large": "openmmlab-community/mm_grounding_dino_large_o365v2_oiv6_goldg",
 }
 
 
