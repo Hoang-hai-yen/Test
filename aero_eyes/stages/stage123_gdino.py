@@ -18,7 +18,13 @@ Flow:  text prompt (resolve_text_prompt)
 
 Reads:  cfg.data video (+ this sample's text prompt)
 Writes: <work_dir>/<sample_id>/detections.json
+        <work_dir>/<sample_id>/cascade_verification.jsonl (one line per
+          Pass-1 box, only when stage123_gdino.cascade_verification.enabled
+          -- see cascade_verify_boxes's own docstring)
 Viz:    <work_dir>/<sample_id>/viz/stage123_gdino/ (when save_visualizations=true)
+        <work_dir>/<sample_id>/viz/stage123_gdino/cascade/ (Pass-1 vs Pass-2
+          score per box, green=kept/red=dropped -- only when
+          cascade_verification.enabled AND save_visualizations=true)
 """
 from __future__ import annotations
 
@@ -167,7 +173,9 @@ def online_fusion_detect_frame(
     return result, threshold
 
 
-def cascade_verify_boxes(detector, frame_bgr, text_prompt: str, boxes: list, cfg_cascade) -> list:
+def cascade_verify_boxes(
+    detector, frame_bgr, text_prompt: str, boxes: list, cfg_cascade, records: list | None = None,
+) -> list:
     """stage123_gdino.cascade_verification -- Pass-2 "zoom-in" re-check of
     already-decided Pass-1 boxes -- see GDinoCascadeVerificationConfig's own
     docstring (aero_eyes/config.py) for the full rationale. For each box,
@@ -176,7 +184,14 @@ def cascade_verify_boxes(detector, frame_bgr, text_prompt: str, boxes: list, cfg
     own best score is at least cfg_cascade.min_score_ratio * the box's
     Pass-1 score (and >= min_absolute_score). Does NOT touch a surviving
     box's own score -- pure accept/reject, so callers keep using each box's
-    original Pass-1 score afterward."""
+    original Pass-1 score afterward.
+
+    When `records` is given (a list the caller owns), appends one dict per
+    INPUT box -- {x1,y1,x2,y2,pass1_score,pass2_score,ratio,kept} -- for
+    EVERY box, not just survivors, so a caller can inspect why a box was
+    kept/dropped (e.g. write it to cascade_verification.jsonl, or feed it to
+    aero_eyes.utils.viz.save_cascade_verification) instead of only seeing
+    the post-filter box count."""
     from aero_eyes.utils.geometry import crop_with_pad
 
     kept = []
@@ -186,11 +201,19 @@ def cascade_verify_boxes(detector, frame_bgr, text_prompt: str, boxes: list, cfg
             crop, text_prompt, box_threshold=0.0, text_threshold=detector.text_threshold,
         )
         pass2_score = float(pass2_scores.max()) if len(pass2_scores) else 0.0
-        if pass2_score < cfg_cascade.min_absolute_score:
-            continue
-        if pass2_score < cfg_cascade.min_score_ratio * box.score:
-            continue
-        kept.append(box)
+        keep = (
+            pass2_score >= cfg_cascade.min_absolute_score
+            and pass2_score >= cfg_cascade.min_score_ratio * box.score
+        )
+        if keep:
+            kept.append(box)
+        if records is not None:
+            records.append({
+                "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
+                "pass1_score": box.score, "pass2_score": pass2_score,
+                "ratio": (pass2_score / box.score) if box.score > 0 else None,
+                "kept": keep,
+            })
     return kept
 
 
@@ -282,6 +305,7 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
         fused_threshold_tracker = GDinoOnlineAdaptiveThreshold(fusion_cfg.threshold)
 
     detections: dict[int, list[Detection]] = {}
+    cascade_records: list[dict] = []
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
@@ -309,11 +333,22 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
             boxes = detector.detect_frame(frame_bgr, text_prompt)
         if cascade_cfg.enabled and boxes:
             pre_n = len(boxes)
-            boxes = cascade_verify_boxes(detector, frame_bgr, text_prompt, boxes, cascade_cfg)
+            frame_cascade_records: list[dict] = []
+            boxes = cascade_verify_boxes(
+                detector, frame_bgr, text_prompt, boxes, cascade_cfg, records=frame_cascade_records,
+            )
+            for r in frame_cascade_records:
+                r["frame_idx"] = frame_idx
+            cascade_records.extend(frame_cascade_records)
             if len(boxes) != pre_n:
                 log.debug(
                     "[Stage123-GDINO] frame %d: cascade_verification dropped %d/%d box(es)",
                     frame_idx, pre_n - len(boxes), pre_n,
+                )
+            if save_viz:
+                from aero_eyes.utils import viz as vizmod
+                vizmod.save_cascade_verification(
+                    frame_bgr, frame_cascade_records, frame_idx, viz_dir / "cascade",
                 )
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
@@ -327,6 +362,24 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
                 frame_bgr, [d.box for d in result_dets], [d.similarity for d in result_dets],
                 frame_idx, viz_dir,
             )
+
+    if cascade_cfg.enabled and cascade_records:
+        import json
+
+        cascade_log_path = work_dir / "cascade_verification.jsonl"
+        with open(cascade_log_path, "w", encoding="utf-8") as f:
+            for r in cascade_records:
+                f.write(json.dumps(r) + "\n")
+        n_dropped = sum(1 for r in cascade_records if not r["kept"])
+        ratios = [r["ratio"] for r in cascade_records if r["ratio"] is not None]
+        log.info(
+            "[Stage123-GDINO] %s: cascade_verification dropped %d/%d box(es) total "
+            "(pass2/pass1 ratio mean=%.3f, median=%.3f) -> %s",
+            sample_id, n_dropped, len(cascade_records),
+            float(np.mean(ratios)) if ratios else float("nan"),
+            float(np.median(ratios)) if ratios else float("nan"),
+            cascade_log_path,
+        )
 
     idf_cfg = cfg.stage123_gdino.isolated_detection_filter
     if idf_cfg.enabled:

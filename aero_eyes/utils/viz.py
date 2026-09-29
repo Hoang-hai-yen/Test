@@ -21,6 +21,7 @@ _COLORS = {
     "gt": (0, 0, 255),       # red
     "tile": (200, 200, 0),   # cyan-ish
     "fused": (255, 0, 255),  # magenta -- a box made by cosine_rescore.candidate_fusion
+    "reject": (0, 0, 255),   # red -- dropped by stage123_gdino.cascade_verification
 }
 
 
@@ -62,6 +63,27 @@ def save_stage3_detections(frame: np.ndarray, boxes: list[Box], sims: list[float
     for b, s in zip(boxes, sims):
         draw_box(vis, b, f"{s:.2f}", _COLORS["detect"])
     cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_det.jpg"), vis)
+
+
+def save_cascade_verification(frame: np.ndarray, records: list[dict], frame_idx: int, out_dir: Path) -> None:
+    """stage123_gdino.cascade_verification (debug, gated by runtime.
+    save_visualizations): draws every Pass-1 box labeled with its own
+    Pass-1 vs Pass-2 ("zoom-in" re-run) score -- green = kept, red =
+    dropped as a context-dependent false positive -- so a rejection (or a
+    surprising non-rejection) can be inspected visually instead of only
+    from cascade_verification.jsonl's raw numbers. `records` is the list
+    aero_eyes.stages.stage123_gdino.cascade_verify_boxes fills via its own
+    `records` argument, one dict per box: {x1,y1,x2,y2,pass1_score,
+    pass2_score,kept,...}. No-op (still creates out_dir) if records is
+    empty, e.g. no boxes survived Pass 1 for this keyframe."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis = frame.copy()
+    for r in records:
+        box = Box(x1=r["x1"], y1=r["y1"], x2=r["x2"], y2=r["y2"])
+        color = _COLORS["detect"] if r["kept"] else _COLORS["reject"]
+        label = f"p1={r['pass1_score']:.2f} p2={r['pass2_score']:.2f}"
+        draw_box(vis, box, label, color)
+    cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_cascade.jpg"), vis)
 
 
 def draw_frame_annotation(frame: np.ndarray, box: Box | None, source: str,
