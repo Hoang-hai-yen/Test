@@ -148,17 +148,40 @@ class GroundingDinoDetector:
         falling back to the old name on a bare TypeError -- NOT wrapped in
         the outer except below, so a real signature drift beyond just this
         one rename still surfaces as a clear error instead of silently
-        retrying forever."""
+        retrying forever.
+
+        TRIED (unverified, no live environment to confirm against --
+        EMPIRICALLY OBSERVED on this project's own footage: mm_tiny
+        under-detected the true object with background scoring higher,
+        opposite the direction broader training data should push):
+        omits `input_ids` entirely for self.variant.startswith("mm_"),
+        matching HF's own official MM Grounding DINO usage example (which
+        calls post_process_grounded_object_detection WITHOUT input_ids at
+        all when text was passed as list-of-lists, unlike the original
+        checkpoints' own docs example, which always passes it) -- see
+        raw_boxes_and_scores's own docstring for the matching input-side
+        change (list-of-lists text=). Reasoning for why omitting it is
+        plausibly correct rather than just copying the doc example
+        blindly: input_ids here is only used to decode detected boxes'
+        token spans back into human-readable label strings (this wrapper
+        never reads that `labels`/`text_labels` output field, only
+        `boxes`/`scores`) -- NOT re-fed into score computation itself,
+        which already happened during the model's own forward pass. If
+        mm_* STILL under-detects after this, this was not (or not the
+        only) actual cause -- recalibrate box_threshold/text_threshold
+        per checkpoint instead (scripts/calibrate_gdino_threshold.py or
+        the lighter scripts/debug_gdino_raw_scores.py)."""
         h, w = frame_shape
+        args = (outputs,) if self.variant.startswith("mm_") else (outputs, inputs["input_ids"])
         try:
             results = self.processor.post_process_grounded_object_detection(
-                outputs, inputs["input_ids"], threshold=box_threshold,
+                *args, threshold=box_threshold,
                 text_threshold=text_threshold, target_sizes=[(h, w)],
             )
         except TypeError as e_new:
             try:
                 results = self.processor.post_process_grounded_object_detection(
-                    outputs, inputs["input_ids"], box_threshold=box_threshold,
+                    *args, box_threshold=box_threshold,
                     text_threshold=text_threshold, target_sizes=[(h, w)],
                 )
             except TypeError as e_old:
