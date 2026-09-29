@@ -72,13 +72,12 @@ class SegmentationConfig(BaseModel):
 
 
 class FeatureExtractorConfig(BaseModel):
-    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble", "vdt"] = "dinov2"
+    model: Literal["dinov2", "dinov3", "clip", "siglip", "ensemble"] = "dinov2"
     dinov2_variant: Literal["vits14", "vitb14", "vitl14", "vitg14"] = "vitb14"
     dinov3_variant: Literal["vits16", "vitb16", "vitl16"] = "vitb16"
     clip_variant: str = "vit-b/32"
     siglip_variant: Literal["base", "large", "so400m"] = "base"
     weights: Optional[str] = None
-    vdt_weights: Optional[str] = None
     image_size: int = 224
 
 
@@ -174,9 +173,19 @@ class BuiltinTrackerConfig(BaseModel):
 
 
 class LiteTrackConfig(BaseModel):
-    onnx_path_z: Optional[str] = None
-    onnx_path_x: Optional[str] = None
-    input_size: int = 256
+    # LiteTrack's real network is 2 separate graphs (see
+    # aero_eyes/models/trackers.py module docstring for why one ONNX file
+    # isn't enough), both produced by LiteTrack/tracking/export_litetrack_onnx.py
+    # from a real trained checkpoint (e.g. LiteTrack_ep0300.pth.tar).
+    onnx_path_z: Optional[str] = None   # template crop -> template_feats (run once per track init)
+    onnx_path_x: Optional[str] = None   # template_feats + search crop -> response/size/offset maps (every tracked frame)
+    # Must match the exported checkpoint's own experiment yaml (TEST.* /
+    # MODEL.BACKBONE.STRIDE) -- defaults here are LiteTrack's B4 config.
+    template_size: int = 128
+    search_size: int = 256
+    template_factor: float = 2.0
+    search_factor: float = 4.0
+    stride: int = 16
 
 
 class DetectionConfirmationConfig(BaseModel):
@@ -235,7 +244,6 @@ class CheapBoostersConfig(BaseModel):
     scales: list[float] = [0.75, 1.0, 1.5]
     tuned_nms: bool = True
     multi_reference_embedding: bool = True
-    multi_ref_pooling: Literal["mean", "max", "concat_then_pca"] = "mean"
 
 
 class MaxAccuracyConfig(BaseModel):
@@ -333,21 +341,18 @@ class AeroEyesConfig(BaseModel):
     eval: EvalConfig = EvalConfig()
 
     @model_validator(mode="after")
-    def check_requirements(self) -> "AeroEyesConfig":
-        # Tracker check
+    def check_litetrack_path(self) -> "AeroEyesConfig":
         if self.stage4.tracker == "litetrack":
-            if not self.stage4.litetrack.onnx_path_z or not self.stage4.litetrack.onnx_path_x:
+            missing = [
+                f for f in ("onnx_path_z", "onnx_path_x")
+                if not getattr(self.stage4.litetrack, f)
+            ]
+            if missing:
                 raise ValueError(
-                    "stage4.tracker is 'litetrack' but stage4.litetrack.onnx_path_z or "
-                    "stage4.litetrack.onnx_path_x is not set."
-                )
-        
-        # Feature Extractor (VDT) check
-        if self.stage1.feature_extractor.model == "vdt":
-            if not self.stage1.feature_extractor.vdt_weights:
-                raise ValueError(
-                    "stage1.feature_extractor.model is 'vdt' but stage1.feature_extractor.vdt_weights is not set. "
-                    "Please set the path to your VDT .pth weights file."
+                    f"stage4.tracker is 'litetrack' but stage4.litetrack.{missing[0]} is not set. "
+                    "Export both ONNX graphs from a trained checkpoint with "
+                    "LiteTrack/tracking/export_litetrack_onnx.py and set "
+                    "stage4.litetrack.onnx_path_z / onnx_path_x in your config."
                 )
         return self
 
