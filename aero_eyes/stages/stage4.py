@@ -1168,7 +1168,9 @@ def _load_geco2(cfg, sample_id: str, work_dir: Path):
     color_sig = None
     if cfg.stage123_geco2.color_postfilter.enabled:
         from aero_eyes.stages.stage123_geco2 import build_color_signature
-        color_sig = build_color_signature(cfg, sample_id, work_dir)
+        color_sig = build_color_signature(
+            cfg, sample_id, work_dir, cfg.stage123_geco2.color_postfilter, cfg.stage123_geco2.segmentation,
+        )
     return detector, prototype, color_sig
 
 

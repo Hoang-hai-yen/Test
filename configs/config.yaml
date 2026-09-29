@@ -1622,6 +1622,54 @@ stage123_geco2:
     # commonly sits at a MID brightness that pulls both a black and a white
     # candidate's Value histogram toward each other). 0.0 = no-op.
     candidate_inset_ratio: 0.15
+    # Overexposure/highlight-clipping gating (docs/attribute_taxonomy_plan.md
+    # SS9.10/SS9.11): a harshly sunlit crop can have a clipped color channel
+    # (dominant channel pegs at ~255 while another keeps climbing), which
+    # reads as a WRONG hue (e.g. real orange/red reading as yellow), not
+    # just a noisier one -- information-theoretically unrecoverable, so
+    # instead of correcting it, effective_sim is blended toward 1.0 (i.e.
+    # abstain -- color alone can never reject an overexposed candidate)
+    # whenever the fraction of clipped pixels is high. Calibrated from this
+    # project's own measurements: 31-34% clipped reliably meant a wrong Hue
+    # reading, 4% did not. overexposure_ramp_frac<=0 disables this gating
+    # (old, pre-this-field behavior). See ColorPostfilterConfig's own
+    # docstring (aero_eyes/config.py) and aero_eyes/utils/color.py's
+    # compute_overexposed_fraction / hue_confidence_from_overexposure.
+    overexposure_clip_threshold: 250
+    overexposure_ramp_frac: 0.40
+    # Dense (full-frame-context) segmentation for CANDIDATE crops
+    # (docs/attribute_taxonomy_plan.md SS9.1/SS9.2/SS9.8 -- background
+    # contamination was the single largest measured color error source;
+    # candidate_inset_ratio above is a much cruder proxy for the same
+    # problem). NOTE: currently only wired up for stage123_gdino's own
+    # color_postfilter (below) -- this field exists here too (shared
+    # ColorPostfilterConfig) but run_stage123_geco2 doesn't yet pass a
+    # segmenter into apply_color_postfilter, so it's a no-op here even if
+    # set true. See ColorPostfilterConfig's own docstring (aero_eyes/config.py).
+    candidate_segmentation_enabled: false
+    candidate_segmentation_margin: 0.3
+    candidate_segmentation_min_mask_px: 10
+    # Shadow-pixel exclusion (docs/attribute_taxonomy_plan.md SS4 point 2) --
+    # see aero_eyes.utils.color.lit_pixel_mask's own docstring. Applied on
+    # BOTH the reference photos and candidate crops when enabled. NOT YET
+    # VALIDATED -- unlike overexposure's thresholds above, these have no
+    # calibrated numbers from this project's own footage yet.
+    shadow_filter_enabled: false
+    shadow_min_saturation: 40.0
+    shadow_min_value: 60.0
+    # is_high_vis agreement gate (docs/attribute_taxonomy_plan.md SS3.2/SS4
+    # point 4/SS8.1) -- fraction of the crop's TOP-percentile-saturation
+    # pixels landing in the safety orange/yellow hue band. UNLIKE the two
+    # gates above, this is EVIDENCE not just confidence: effective_sim *=
+    # 1 - |ref_is_high_vis - candidate_is_high_vis| -- a total mismatch can
+    # zero effective_sim outright, not just abstain. hue_max/min_value ARE
+    # calibrated (SS8.1/SS8.4: widening hue_max to 0-35 moved LifeJacket's
+    # own reading from 0.44 to 0.97) -- still opt-in since applying this to
+    # EVERY candidate (not just known safety-colored objects) is new wiring.
+    is_high_vis_gating_enabled: false
+    is_high_vis_percentile: 80.0
+    is_high_vis_hue_max: 35.0
+    is_high_vis_min_value: 140.0
 
 # ----------------------------------------------------------------------------
 # DAVE VERIFICATION -- infrastructure for DAVE's (arXiv:2404.16622) OWN
@@ -2117,11 +2165,107 @@ stage123_gdino:
   # limits (only catches CONTEXT-dependent FPs, not ones that genuinely
   # resemble the prompt locally). false (default) = disabled, unchanged
   # behavior. NOT YET VALIDATED on this project's own footage.
+  #
+  # IMPORTANT confound (confirmed on this project's own footage): the HF
+  # processor resizes whatever it's given to the model's fixed input size,
+  # so a small box's pad_ratio-only crop gets magnified FAR more than the
+  # box was within the full frame -- mostly interpolation, not genuine
+  # detail -- which was observed to INFLATE false positives' scores rather
+  # than collapse them (the opposite of the intended effect). max_zoom caps
+  # that magnification: crop_with_pad's min_side floors the crop's shorter
+  # side at min(frame_h, frame_w) / max_zoom, overriding pad_ratio whenever
+  # the two disagree. 0.0 disables the cap (old, confound-prone behavior).
   cascade_verification:
     enabled: false
     pad_ratio: 0.5
     min_score_ratio: 0.7
     min_absolute_score: 0.0
+    max_zoom: 6.0
+
+  # Reuses the SAME color-histogram post-filter stage123_geco2.
+  # color_postfilter uses (see that block's own comments above, and
+  # ColorPostfilterConfig's docstring in aero_eyes/config.py, for the full
+  # rationale) -- Grounding DINO's text-grounding score has the identical
+  # blind spot (answers "is this a <category>", not "is this the right
+  # COLOR of <category>"), so a same-shape/-category, different-color
+  # confuser scores just as well as the real target. Applied BEFORE
+  # cascade_verification (cheap pure-OpenCV check first, so the far more
+  # expensive extra Grounding DINO forward pass only runs on candidates
+  # that already survive color). Uses stage1.segmentation to mask the
+  # reference photos (this detector has no segmentation config of its
+  # own) and caches to its own "color_signature_gdino.npz" (kept separate
+  # from GeCo2's "color_signature.npz" so the two can never silently share
+  # a stale cache if their hue_bins/sat_bins/segmentation settings ever
+  # differ). false (default) = disabled. NOT YET VALIDATED on this
+  # project's own footage.
+  color_postfilter:
+    enabled: false
+    hue_bins: 12
+    sat_bins: 8
+    value_bins: 8
+    hue_smoothing_sigma: 0.0
+    metric: bhattacharyya   # bhattacharyya | correlation
+    min_similarity: 0.3
+    reweight: false
+    min_ref_saturation: 65.0
+    saturation_full_confidence: 130.0
+    min_ref_value: 50.0
+    value_full_confidence: 160.0
+    candidate_inset_ratio: 0.15
+    # Overexposure gating -- see the identical field under
+    # stage123_geco2.color_postfilter above for the full rationale
+    # (docs/attribute_taxonomy_plan.md SS9.10/SS9.11).
+    overexposure_clip_threshold: 250
+    overexposure_ramp_frac: 0.40
+    # Dense candidate segmentation -- UNLIKE stage123_geco2's own block
+    # above, this IS fully wired up here: reuses stage1.segmentation's
+    # configured model (must also have stage1.segmentation.enabled=true)
+    # to segment each candidate box in DENSE (full-frame-context) mode
+    # before sampling its color histogram, instead of the cruder
+    # candidate_inset_ratio inward-shrink. See ColorPostfilterConfig.
+    # candidate_segmentation_enabled's own docstring (aero_eyes/config.py)
+    # for the full rationale (docs/attribute_taxonomy_plan.md
+    # SS9.1/SS9.2/SS9.8). Falls back to candidate_inset_ratio whenever
+    # segmentation is unavailable or too small for a given box.
+    candidate_segmentation_enabled: false
+    candidate_segmentation_margin: 0.3
+    candidate_segmentation_min_mask_px: 10
+    # Shadow-pixel exclusion -- see the identical field under
+    # stage123_geco2.color_postfilter above (docs/attribute_taxonomy_plan.md
+    # SS4 point 2). NOT YET VALIDATED.
+    shadow_filter_enabled: false
+    shadow_min_saturation: 40.0
+    shadow_min_value: 60.0
+    # is_high_vis agreement gate -- see the identical field under
+    # stage123_geco2.color_postfilter above (docs/attribute_taxonomy_plan.md
+    # SS3.2/SS4 point 4/SS8.1).
+    is_high_vis_gating_enabled: false
+    is_high_vis_percentile: 80.0
+    is_high_vis_hue_max: 35.0
+    is_high_vis_min_value: 140.0
+
+  # A SEPARATE, independent check reserved for keyframes where Grounding
+  # DINO's own box scores are too close together to trust the ranking:
+  # when two (or more) surviving boxes' scores fall within `margin` of
+  # each other, that "tied" group is re-scored with CLIP's own image-TEXT
+  # similarity (CLIPModel.get_text_features against this sample's own
+  # text_prompt, encoded once and reused every keyframe) -- an
+  # INSTANCE/semantic-alignment signal orthogonal to both Grounding DINO's
+  # own re-run-on-crop score (cascade_verification) and HSV color
+  # histograms (color_postfilter). A tied candidate is dropped if its own
+  # CLIP similarity falls more than drop_margin below the tied group's own
+  # best CLIP similarity. A keyframe with one clear winner (no score gap
+  # <= margin) is skipped entirely -- no CLIP forward pass paid on
+  # keyframes that don't need it. Applied AFTER cascade_verification, as a
+  # final tie-break among whatever survives it. See
+  # GDinoClipTiebreakConfig's own docstring (aero_eyes/config.py). false
+  # (default) = disabled. NOT YET VALIDATED on this project's own footage.
+  clip_tiebreak:
+    enabled: false
+    variant: vit-b/32   # vit-b/32 | vit-l/14
+    margin: 0.05
+    pad_ratio: 0.1
+    drop_margin: 0.05
 
 # ----------------------------------------------------------------------------
 # IMPORTANT (measured on this project's 6 labeled samples, not just

@@ -554,20 +554,43 @@ class ColorSignature:
     objects; Value is the only reliable signal for exactly those, at the
     cost of being lighting-sensitive)."""
 
-    def __init__(self, hs_hists: list[np.ndarray], v_hists: list[np.ndarray], confidence: float):
+    def __init__(
+        self, hs_hists: list[np.ndarray], v_hists: list[np.ndarray], confidence: float,
+        ref_agreement: float = 1.0, is_high_vis: float = 0.0,
+    ):
         self.hs_hists = hs_hists
         self.v_hists = v_hists
         self.confidence = confidence
+        # Mean pairwise Hue+Saturation histogram similarity AMONG the ref
+        # photos themselves -- see ColorPostfilterConfig.overexposure_ramp_
+        # frac's neighboring docstring (the "ref_color_agreement" field) for
+        # the full rationale (docs/attribute_taxonomy_plan.md SS8.3). 1.0 =
+        # fully agree (or trivially true with a single ref photo).
+        self.ref_agreement = ref_agreement
+        # Mean is_high_vis (aero_eyes.utils.color.compute_is_high_vis) across
+        # the ref photos -- see ColorPostfilterConfig.is_high_vis_gating_
+        # enabled's own docstring.
+        self.is_high_vis = is_high_vis
 
 
-def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature:
+def build_color_signature(
+    cfg, sample_id: str, work_dir: Path, cpf_cfg, seg_cfg,
+    cache_name: str = "color_signature.npz", log_prefix: str = "Stage123-GeCo2",
+) -> ColorSignature:
     """Color histograms of each reference image's masked object region --
     used by apply_color_postfilter() to catch same-shape-different-color
-    false positives that GeCo2 itself cannot distinguish (it has no color
-    signal, see stage123_geco2.color_postfilter). Cached independently of
-    geco2_prototype.pt (this is pure OpenCV, does not need the GeCo2 model
-    at all) -- so it's computed even on a cache hit for the prototype file,
-    and vice versa; the two caches don't need to be in sync.
+    false positives a detector's own vision backbone cannot distinguish by
+    shape/texture alone (see ColorPostfilterConfig's own docstring).
+    Detector-agnostic despite living in stage123_geco2.py (kept here to
+    avoid duplicating ~90 lines -- aero_eyes.stages.stage123_gdino imports
+    it too, passing its OWN cpf_cfg/seg_cfg/cache_name instead of GeCo2's):
+    cpf_cfg/seg_cfg are passed in explicitly rather than read from
+    cfg.stage123_geco2.* internally, and cache_name lets two different
+    callers on the same work_dir avoid silently sharing a cache built under
+    different hue_bins/sat_bins/segmentation settings. Cached independently
+    of geco2_prototype.pt (this is pure OpenCV, does not need the GeCo2
+    model at all) -- so it's computed even on a cache hit for the prototype
+    file, and vice versa; the two caches don't need to be in sync.
 
     .confidence in [0,1] (see saturation_value_confidence) controls how
     apply_color_postfilter() blends the two histogram sets: 1 = trust
@@ -575,29 +598,30 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
     fully (near-achromatic reference object, where Hue+Saturation is pure
     noise but Value still reliably tells e.g. black from white).
 
-    Note: if segmentation.enabled, this runs its OWN MobileSAM pass over
-    the reference images -- independent from (and possibly duplicating)
-    the one build_exemplar_prototype already ran, since that function may
-    have taken its cached-prototype early-return path without computing
-    masks at all this run. Kept decoupled for simplicity; MobileSAM
-    (ViT-tiny) is cheap relative to GeCo2's own SAM2-Hiera-base backbone.
+    Note: if seg_cfg.enabled, this runs its OWN MobileSAM pass over the
+    reference images -- independent from (and possibly duplicating)
+    whatever segmentation build_exemplar_prototype/run_stage1 already ran,
+    since that function may have taken its cached-prototype early-return
+    path without computing masks at all this run. Kept decoupled for
+    simplicity; MobileSAM (ViT-tiny) is cheap relative to either detector's
+    own backbone.
     """
     from aero_eyes.utils.color import (
-        compute_hs_histogram, compute_mean_saturation, compute_mean_value,
-        compute_value_histogram, saturation_value_confidence,
+        compute_hs_histogram, compute_is_high_vis, compute_mean_saturation, compute_mean_value,
+        compute_value_histogram, histogram_similarity, lit_pixel_mask, saturation_value_confidence,
     )
 
-    cpf = cfg.stage123_geco2.color_postfilter
-    sig_path = work_dir / "color_signature.npz"
+    cpf = cpf_cfg
+    sig_path = work_dir / cache_name
     if cfg.project.use_cache and sig_path.exists():
         data = np.load(sig_path)
         hs_hists = [data[k] for k in sorted(data.files) if k.startswith("hshist_")]
         v_hists = [data[k] for k in sorted(data.files) if k.startswith("vhist_")]
         mean_sat = float(data["mean_saturation"])
         mean_val = float(data["mean_value"])
+        is_high_vis = float(data["is_high_vis"]) if "is_high_vis" in data else 0.0
     else:
         ref_imgs = _load_ref_images(cfg, sample_id)
-        seg_cfg = cfg.stage123_geco2.segmentation
         masks: list[np.ndarray | None] = [None] * len(ref_imgs)
         if seg_cfg.enabled:
             from aero_eyes.models.segmentation import build_segmenter
@@ -605,15 +629,28 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
             masks = [segmenter.segment(img) for img in ref_imgs]
         else:
             log.warning(
-                "[Stage123-GeCo2] %s: color_postfilter.enabled but segmentation.enabled=false -- "
+                "[%s] %s: color_postfilter.enabled but segmentation.enabled=false -- "
                 "color signature built from the WHOLE reference photo (diluted by background), "
                 "not just the object.",
-                sample_id,
+                log_prefix, sample_id,
             )
+
+        # Shadow-pixel exclusion (SS4 point 2) -- see ColorPostfilterConfig.
+        # shadow_filter_enabled's own docstring. Applied on the REFERENCE
+        # side here, and symmetrically on the CANDIDATE side in
+        # apply_color_postfilter -- filtering only one side would introduce
+        # a new ref/candidate asymmetry instead of fixing one. Falls back
+        # to the unfiltered mask if too few pixels survive.
+        hue_masks = masks
+        if cpf.shadow_filter_enabled:
+            hue_masks = []
+            for img, mask in zip(ref_imgs, masks):
+                lit = lit_pixel_mask(img, mask, cpf.shadow_min_saturation, cpf.shadow_min_value)
+                hue_masks.append(lit if lit.sum() >= 10 else mask)
 
         hs_hists = [
             compute_hs_histogram(img, mask, cpf.hue_bins, cpf.sat_bins, cpf.hue_smoothing_sigma)
-            for img, mask in zip(ref_imgs, masks)
+            for img, mask in zip(ref_imgs, hue_masks)
         ]
         v_hists = [
             compute_value_histogram(img, mask, cpf.value_bins)
@@ -621,11 +658,16 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
         ]
         mean_sat = float(np.mean([compute_mean_saturation(img, mask) for img, mask in zip(ref_imgs, masks)]))
         mean_val = float(np.mean([compute_mean_value(img, mask) for img, mask in zip(ref_imgs, masks)]))
+        is_high_vis = float(np.mean([
+            compute_is_high_vis(img, mask, cpf.is_high_vis_percentile, cpf.is_high_vis_hue_max, cpf.is_high_vis_min_value)
+            for img, mask in zip(ref_imgs, masks)
+        ]))
         work_dir.mkdir(parents=True, exist_ok=True)
         save_kwargs = {f"hshist_{i}": h for i, h in enumerate(hs_hists)}
         save_kwargs.update({f"vhist_{i}": h for i, h in enumerate(v_hists)})
         save_kwargs["mean_saturation"] = np.array(mean_sat)
         save_kwargs["mean_value"] = np.array(mean_val)
+        save_kwargs["is_high_vis"] = np.array(is_high_vis)
         np.savez(sig_path, **save_kwargs)
 
     confidence = saturation_value_confidence(
@@ -633,24 +675,49 @@ def build_color_signature(cfg, sample_id: str, work_dir: Path) -> ColorSignature
         cpf.min_ref_saturation, cpf.saturation_full_confidence,
         cpf.min_ref_value, cpf.value_full_confidence,
     )
-    log.info("[Stage123-GeCo2] %s: reference object mean HSV saturation=%.1f, value=%.1f "
+    log.info("[%s] %s: reference object mean HSV saturation=%.1f, value=%.1f "
              "[0-255 scale] -> color_confidence=%.2f (1=trust Hue+Sat, 0=trust Value only)",
-             sample_id, mean_sat, mean_val, confidence)
+             log_prefix, sample_id, mean_sat, mean_val, confidence)
     if confidence < 1.0:
         log.warning(
-            "[Stage123-GeCo2] %s: color_postfilter blending %.0f%% Value-based comparison "
+            "[%s] %s: color_postfilter blending %.0f%% Value-based comparison "
             "in (and %.0f%% Hue+Saturation) -- reference object's color (saturation=%.1f, "
             "value=%.1f) is not fully trustworthy for Hue-based comparison alone "
             "(near-achromatic objects give unstable Hue; Value still separates e.g. black "
             "from white).",
-            sample_id, (1 - confidence) * 100, confidence * 100, mean_sat, mean_val,
+            log_prefix, sample_id, (1 - confidence) * 100, confidence * 100, mean_sat, mean_val,
         )
-    return ColorSignature(hs_hists, v_hists, confidence)
+
+    # Cross-photo consistency (SS8.3) -- see ColorPostfilterConfig's
+    # overexposure_ramp_frac-neighboring docstring for the full rationale.
+    # Mean pairwise Hue+Saturation similarity among the ref photos
+    # themselves; 1.0 (trivially "fully agree") with fewer than 2 refs.
+    if len(hs_hists) >= 2:
+        pair_sims = [
+            histogram_similarity(hs_hists[i], hs_hists[j], cpf.metric)
+            for i in range(len(hs_hists)) for j in range(i + 1, len(hs_hists))
+        ]
+        ref_agreement = float(np.mean(pair_sims))
+    else:
+        ref_agreement = 1.0
+    log.info(
+        "[%s] %s: ref_color_agreement=%.2f (mean pairwise Hue+Sat similarity among the "
+        "%d reference photos themselves -- low means the refs don't agree on color, so no "
+        "candidate comparison against them can be fully trusted)",
+        log_prefix, sample_id, ref_agreement, len(hs_hists),
+    )
+    if cpf.is_high_vis_gating_enabled:
+        log.info(
+            "[%s] %s: reference is_high_vis=%.2f (SS3.2/SS8.1 safety orange/yellow signal, "
+            "mean across ref photos -- 0=not a safety color, 1=strongly is)",
+            log_prefix, sample_id, is_high_vis,
+        )
+    return ColorSignature(hs_hists, v_hists, confidence, ref_agreement, is_high_vis)
 
 
 def apply_color_postfilter(
     frame_bgr: np.ndarray, boxes: list[Box], color_sig: ColorSignature, cpf_cfg,
-    stats_out: list[tuple[float, float, float]] | None = None,
+    stats_out: list[tuple[float, float, float, float]] | None = None, segmenter=None,
 ) -> list[Box]:
     """Drop/downweight candidate boxes whose color doesn't match the
     reference object's own color signature (best-of-N-refs match per
@@ -661,18 +728,74 @@ def apply_color_postfilter(
     exist and how they're weighted (Hue+Sat alone cannot tell e.g. black
     from white; Value alone is more lighting-sensitive).
 
-    stats_out: if given, appends (sim_hs, sim_v, effective_sim) for EVERY
-    candidate evaluated (before the min_similarity cutoff) -- lets a
-    caller collect the REAL distribution of similarity scores seen on
-    actual video frames, since a threshold picked from a synthetic/clean
-    test image (as this codebase already learned the hard way once, with
-    score_threshold_abs) may not reflect what real footage produces. See
-    run_stage123_geco2's end-of-run summary log.
+    Beyond that base comparison, THREE independent signals from
+    docs/attribute_taxonomy_plan.md's color investigation (SS4/SS8/SS9)
+    each further adjust effective_sim, compounding (multiplying) with each
+    other -- two are CONFIDENCE gates (blend effective_sim toward 1.0, i.e.
+    abstain: color alone can never REJECT a candidate through these, only
+    a genuine histogram mismatch can), one is EVIDENCE (can actively push
+    effective_sim toward 0, a real reject signal):
+      1. [confidence gate] Overexposure (SS9.10/SS9.11) -- a clipped color
+         channel reads as a WRONG hue, not just a noisier one. See
+         compute_overexposed_fraction/hue_confidence_from_overexposure and
+         overexposure_ramp_frac.
+      2. [confidence gate] Cross-photo disagreement (SS8.3) --
+         color_sig.ref_agreement; if the 3 ref photos don't even agree on
+         their OWN color, no candidate comparison against them can be
+         trusted regardless of how well it matches any single one.
+      3. [evidence] is_high_vis agreement (SS3.2/SS4 point 4/SS8.1, opt-in
+         via cpf_cfg.is_high_vis_gating_enabled) -- a ref that IS a safety-
+         colored object (LifeJacket/Lifering) but whose candidate ISN'T (or
+         vice versa) is real information the Hue+Sat/Value histograms
+         alone might miss. See compute_is_high_vis's own docstring.
+
+    Also applies shadow-pixel exclusion (SS4 point 2, opt-in via
+    cpf_cfg.shadow_filter_enabled -- see lit_pixel_mask's own docstring)
+    and, when `segmenter` is given and cpf_cfg.candidate_segmentation_
+    enabled, DENSE full-frame-context segmentation for each candidate crop
+    (SS9.1/SS9.2/SS9.8 -- background contamination was the single largest
+    measured color error source; candidate_inset_ratio's inward shrink is
+    a much cruder proxy for the same problem) instead of the plain
+    candidate_inset_ratio crop, falling back to it whenever segmentation
+    is unavailable or returns too small a mask for this box.
+
+    stats_out: if given, appends (sim_hs, sim_v, effective_sim,
+    overexposed_fraction) for EVERY candidate evaluated (before the
+    min_similarity cutoff) -- lets a caller collect the REAL distribution
+    of similarity scores seen on actual video frames, since a threshold
+    picked from a synthetic/clean test image (as this codebase already
+    learned the hard way once, with score_threshold_abs) may not reflect
+    what real footage produces. See run_stage123_geco2's end-of-run
+    summary log.
+
+    segmenter: an already-constructed MobileSAM/FastSAM/SAM2Segmenter (see
+    aero_eyes.models.segmentation.build_segmenter), or None (default) to
+    skip dense segmentation entirely and use candidate_inset_ratio as
+    before -- even when cpf_cfg.candidate_segmentation_enabled is true,
+    passing no segmenter here is a no-op fallback, not an error. Calls
+    segmenter.set_frame(frame_bgr) ONCE per call (this function is already
+    called once per keyframe), reusing it via segment_box_cached() for
+    every box -- same "encode once, reuse per box" pattern box_refine's
+    own dense methods use.
     """
-    from aero_eyes.utils.color import compute_hs_histogram, compute_value_histogram, histogram_similarity
+    from aero_eyes.utils.color import (
+        compute_hs_histogram, compute_is_high_vis, compute_overexposed_fraction, compute_value_histogram,
+        histogram_similarity, hue_confidence_from_overexposure, lit_pixel_mask,
+    )
     from aero_eyes.utils.geometry import crop_with_pad, inset_box
 
     conf = color_sig.confidence
+    h, w = frame_bgr.shape[:2]
+
+    dense_ready = False
+    if segmenter is not None and cpf_cfg.candidate_segmentation_enabled:
+        dense_ready = segmenter.set_frame(frame_bgr)
+        if not dense_ready:
+            log.debug(
+                "color_postfilter: dense candidate segmentation unavailable for this frame "
+                "-- falling back to candidate_inset_ratio for every box this keyframe."
+            )
+
     kept: list[Box] = []
     for box in boxes:
         # Sample color from an INSET box (see ColorPostfilterConfig.
@@ -681,13 +804,49 @@ def apply_color_postfilter(
         # color histogram is measured from.
         color_box = inset_box(box, cpf_cfg.candidate_inset_ratio)
         crop = crop_with_pad(frame_bgr, color_box, pad_ratio=0.0)
-        hs_hist = compute_hs_histogram(crop, None, cpf_cfg.hue_bins, cpf_cfg.sat_bins, cpf_cfg.hue_smoothing_sigma)
-        v_hist = compute_value_histogram(crop, None, cpf_cfg.value_bins)
+
+        mask = None
+        if dense_ready:
+            full_mask = segmenter.segment_box_cached(box, margin=cpf_cfg.candidate_segmentation_margin)
+            if full_mask is not None:
+                x1 = max(0, int(color_box.x1)); y1 = max(0, int(color_box.y1))
+                x2 = min(w, int(color_box.x2)); y2 = min(h, int(color_box.y2))
+                cand_mask = full_mask[y1:y2, x1:x2]
+                if cand_mask.shape == crop.shape[:2] and cand_mask.sum() >= cpf_cfg.candidate_segmentation_min_mask_px:
+                    mask = cand_mask
+
+        hue_mask = mask
+        if cpf_cfg.shadow_filter_enabled:
+            lit = lit_pixel_mask(crop, mask, cpf_cfg.shadow_min_saturation, cpf_cfg.shadow_min_value)
+            hue_mask = lit if lit.sum() >= 10 else mask
+
+        hs_hist = compute_hs_histogram(crop, hue_mask, cpf_cfg.hue_bins, cpf_cfg.sat_bins, cpf_cfg.hue_smoothing_sigma)
+        v_hist = compute_value_histogram(crop, mask, cpf_cfg.value_bins)
         sim_hs = max(histogram_similarity(hs_hist, r, cpf_cfg.metric) for r in color_sig.hs_hists)
         sim_v = max(histogram_similarity(v_hist, r, cpf_cfg.metric) for r in color_sig.v_hists)
         effective_sim = conf * sim_hs + (1.0 - conf) * sim_v
+
+        overexposed_frac = compute_overexposed_fraction(crop, mask, cpf_cfg.overexposure_clip_threshold)
+        hue_conf = hue_confidence_from_overexposure(overexposed_frac, cpf_cfg.overexposure_ramp_frac)
+        effective_sim = hue_conf * effective_sim + (1.0 - hue_conf) * 1.0
+        effective_sim = color_sig.ref_agreement * effective_sim + (1.0 - color_sig.ref_agreement) * 1.0
+
+        # is_high_vis agreement (SS3.2/SS4 point 4/SS8.1) -- EVIDENCE, not a
+        # confidence/abstain gate like the two above: a genuine mismatch
+        # here (ref IS a safety color, candidate ISN'T, or vice versa) is
+        # real information that can REJECT a candidate, not just lower
+        # confidence in the comparison. Multiplicative, not blended toward
+        # 1.0 -- a perfect match (agreement=1) leaves effective_sim
+        # unchanged; a total mismatch (agreement=0) zeroes it.
+        if cpf_cfg.is_high_vis_gating_enabled:
+            cand_high_vis = compute_is_high_vis(
+                crop, mask, cpf_cfg.is_high_vis_percentile, cpf_cfg.is_high_vis_hue_max, cpf_cfg.is_high_vis_min_value,
+            )
+            hivis_agreement = 1.0 - abs(color_sig.is_high_vis - cand_high_vis)
+            effective_sim = effective_sim * hivis_agreement
+
         if stats_out is not None:
-            stats_out.append((sim_hs, sim_v, effective_sim))
+            stats_out.append((sim_hs, sim_v, effective_sim, overexposed_frac))
         if effective_sim < cpf_cfg.min_similarity:
             continue
         kept.append(Box(box.x1, box.y1, box.x2, box.y2, score=box.score * effective_sim) if cpf_cfg.reweight else box)
@@ -796,7 +955,10 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             dyn_proto_tracker = GeCo2DynamicPrototypeTracker(cfg, detector, prototype, work_dir, sample_id)
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
-    color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
+    color_sig = (
+        build_color_signature(cfg, sample_id, work_dir, cpf_cfg, cfg.stage123_geco2.segmentation)
+        if cpf_cfg.enabled else None
+    )
 
     # ---- Locate video ----
     data_root = Path(cfg.data.data_root)
@@ -931,17 +1093,19 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 color_stats = color_stats_pass2
 
     if color_stats:
-        arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim
+        arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim, overexposed_fraction
         log.info(
             "[Stage123-GeCo2] %s: color_postfilter similarity stats over %d candidates "
             "(min_similarity=%.2f) -- sim_hs p10/p50/p90=%.3f/%.3f/%.3f, "
             "sim_v p10/p50/p90=%.3f/%.3f/%.3f, effective_sim p10/p50/p90=%.3f/%.3f/%.3f, "
-            "%% below min_similarity=%.1f%%",
+            "%% below min_similarity=%.1f%%, %% overexposed(>=%.0f%% clipped)=%.1f%%",
             sample_id, len(color_stats), cpf_cfg.min_similarity,
             *np.percentile(arr[:, 0], [10, 50, 90]),
             *np.percentile(arr[:, 1], [10, 50, 90]),
             *np.percentile(arr[:, 2], [10, 50, 90]),
             100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
+            cpf_cfg.overexposure_ramp_frac * 100.0,
+            100.0 * float((arr[:, 3] >= cpf_cfg.overexposure_ramp_frac).mean()),
         )
 
     # No single global threshold applies when global_adaptive_threshold is
@@ -1149,7 +1313,10 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
         )
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
-    color_sig = build_color_signature(cfg, sample_id, work_dir) if cpf_cfg.enabled else None
+    color_sig = (
+        build_color_signature(cfg, sample_id, work_dir, cpf_cfg, cfg.stage123_geco2.segmentation)
+        if cpf_cfg.enabled else None
+    )
 
     skip_encoding = cr.skip_candidate_encoding
     extractor = None if skip_encoding else build_feature_extractor(cfg)

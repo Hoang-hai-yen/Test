@@ -16,11 +16,20 @@ Flow:  text prompt (resolve_text_prompt)
        -> detections.json (same schema Stage 3 writes, so Stage 4/5 need
           no changes to consume it)
 
-Reads:  cfg.data video (+ this sample's text prompt)
+Reads:  cfg.data video (+ this sample's text prompt); also cfg.data
+          refs_subdir's reference photos when color_postfilter.enabled OR
+          cosine_rescore/online_fusion.enabled (all opt-in, off by default
+          -- the base text-prompted path never touches them)
 Writes: <work_dir>/<sample_id>/detections.json
         <work_dir>/<sample_id>/cascade_verification.jsonl (one line per
           Pass-1 box, only when stage123_gdino.cascade_verification.enabled
           -- see cascade_verify_boxes's own docstring)
+        <work_dir>/<sample_id>/color_signature_gdino.npz (cached reference
+          color histogram, only when color_postfilter.enabled)
+        <work_dir>/<sample_id>/clip_tiebreak.jsonl (one line per box
+          re-checked by CLIP because its Pass-1 score was tied with
+          another box's, only when clip_tiebreak.enabled -- see
+          clip_tiebreak_boxes's own docstring)
 Viz:    <work_dir>/<sample_id>/viz/stage123_gdino/ (when save_visualizations=true)
         <work_dir>/<sample_id>/viz/stage123_gdino/cascade/ (Pass-1 vs Pass-2
           score per box, green=kept/red=dropped -- only when
@@ -233,6 +242,55 @@ def cascade_verify_boxes(
     return kept
 
 
+def clip_tiebreak_boxes(
+    clip_extractor, text_feat: np.ndarray, frame_bgr, boxes: list, cfg_tie, records: list | None = None,
+) -> list:
+    """stage123_gdino.clip_tiebreak -- when several surviving boxes in a
+    keyframe have Grounding-DINO scores too close together to trust the
+    ranking, re-check just that TIED group against CLIP's own image-text
+    similarity (an independent signal -- see GDinoClipTiebreakConfig's own
+    docstring, aero_eyes/config.py). `text_feat` is the sample's text
+    prompt, ALREADY encoded once via clip_extractor.encode_text (doesn't
+    change across keyframes, so callers should encode it once, not per
+    call). No-op (returns boxes unchanged) when fewer than 2 boxes are
+    "tied" (within cfg_tie.margin of the group's own top score) -- a
+    keyframe with a single clear winner never pays for a CLIP forward
+    pass. Drops a tied candidate whose own CLIP similarity falls more than
+    cfg_tie.drop_margin below the tied group's best CLIP similarity;
+    non-tied candidates are returned untouched regardless of their own
+    CLIP similarity.
+
+    When `records` is given, appends one dict per box IN THE TIED GROUP --
+    {x1,y1,x2,y2,pass1_score,clip_sim,kept} -- so a caller can inspect the
+    tie-break itself. Boxes outside the tied group are not recorded (they
+    were never re-checked)."""
+    if len(boxes) < 2:
+        return boxes
+    top_score = max(b.score for b in boxes)
+    tied = [b for b in boxes if top_score - b.score <= cfg_tie.margin]
+    if len(tied) < 2:
+        return boxes
+
+    from aero_eyes.utils.geometry import crop_with_pad
+
+    crops = [crop_with_pad(frame_bgr, b, cfg_tie.pad_ratio) for b in tied]
+    img_feats = clip_extractor.extract(crops, batch_size=len(crops))
+    clip_sims = img_feats @ text_feat
+    best_sim = float(clip_sims.max())
+
+    dropped_ids = set()
+    for box, sim in zip(tied, clip_sims):
+        keep = float(sim) >= best_sim - cfg_tie.drop_margin
+        if not keep:
+            dropped_ids.add(id(box))
+        if records is not None:
+            records.append({
+                "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
+                "pass1_score": box.score, "clip_sim": float(sim), "kept": keep,
+            })
+    return [b for b in boxes if id(b) not in dropped_ids]
+
+
 def _locate_video(cfg, sample_id: str) -> Path:
     data_root = Path(cfg.data.data_root)
     video_dir = data_root / sample_id
@@ -298,6 +356,8 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
     oat_cfg = cfg.stage123_gdino.online_adaptive_threshold
     fusion_cfg = cfg.stage123_gdino.online_fusion
     cascade_cfg = cfg.stage123_gdino.cascade_verification
+    cpf_cfg = cfg.stage123_gdino.color_postfilter
+    tie_cfg = cfg.stage123_gdino.clip_tiebreak
     online_threshold = GDinoOnlineAdaptiveThreshold(oat_cfg) if oat_cfg.enabled and not fusion_cfg.enabled else None
     if oat_cfg.enabled and fusion_cfg.enabled:
         log.warning(
@@ -320,8 +380,56 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
         cosine_stats = CausalRunningStats(fusion_cfg.window_size, fusion_cfg.min_samples)
         fused_threshold_tracker = GDinoOnlineAdaptiveThreshold(fusion_cfg.threshold)
 
+    # Cheap, pure-OpenCV color check for the same "same-shape/-category,
+    # different-color" blind spot stage123_geco2.color_postfilter already
+    # guards against -- see Stage123GDinoConfig.color_postfilter's own
+    # docstring. Built ONCE (reference photos don't change per keyframe).
+    color_sig = None
+    color_segmenter = None
+    if cpf_cfg.enabled:
+        from aero_eyes.stages.stage123_geco2 import build_color_signature
+
+        color_sig = build_color_signature(
+            cfg, sample_id, work_dir, cpf_cfg, cfg.stage1.segmentation,
+            cache_name="color_signature_gdino.npz", log_prefix="Stage123-GDINO",
+        )
+        # Dense (full-frame-context) segmentation for CANDIDATE crops --
+        # see ColorPostfilterConfig.candidate_segmentation_enabled's own
+        # docstring for the full rationale (docs/attribute_taxonomy_plan.md
+        # SS9.1/SS9.2/SS9.8 -- background contamination was the largest
+        # measured color error source). Reuses stage1.segmentation's own
+        # configured model (same one build_color_signature just used for
+        # the reference photos) -- a SECOND instance, since the reference
+        # one has no per-frame state to share and dense segmentation needs
+        # its own set_frame()/segment_box_cached() call pattern.
+        if cpf_cfg.candidate_segmentation_enabled and cfg.stage1.segmentation.enabled:
+            from aero_eyes.models.segmentation import build_segmenter
+
+            color_segmenter = build_segmenter(cfg.stage1.segmentation, cfg)
+        elif cpf_cfg.candidate_segmentation_enabled:
+            log.warning(
+                "[Stage123-GDINO] %s: color_postfilter.candidate_segmentation_enabled=true but "
+                "stage1.segmentation.enabled=false -- dense candidate segmentation needs a "
+                "segmenter model; falling back to candidate_inset_ratio for every candidate.",
+                sample_id,
+            )
+
+    # CLIP's own image-text similarity, reserved for keyframes where
+    # Grounding DINO's own box scores are too close together to trust the
+    # ranking -- see GDinoClipTiebreakConfig's own docstring. Both the CLIP
+    # instance and the text prompt's own embedding are built ONCE (the
+    # prompt never changes across keyframes).
+    clip_extractor = clip_text_feat = None
+    if tie_cfg.enabled:
+        from aero_eyes.models.features import CLIPFeatureExtractor
+
+        clip_extractor = CLIPFeatureExtractor(variant=tie_cfg.variant, device=cfg.device())
+        clip_text_feat = clip_extractor.encode_text([text_prompt])[0]
+
     detections: dict[int, list[Detection]] = {}
     cascade_records: list[dict] = []
+    color_stats: list[tuple[float, float, float]] = []
+    clip_tiebreak_records: list[dict] = []
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
@@ -347,6 +455,18 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
         else:
             threshold = cfg.stage123_gdino.box_threshold
             boxes = detector.detect_frame(frame_bgr, text_prompt)
+        if color_sig is not None and boxes:
+            from aero_eyes.stages.stage123_geco2 import apply_color_postfilter
+
+            pre_n = len(boxes)
+            boxes = apply_color_postfilter(
+                frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats, segmenter=color_segmenter,
+            )
+            if len(boxes) != pre_n:
+                log.debug(
+                    "[Stage123-GDINO] frame %d: color_postfilter dropped %d/%d box(es)",
+                    frame_idx, pre_n - len(boxes), pre_n,
+                )
         if cascade_cfg.enabled and boxes:
             pre_n = len(boxes)
             frame_cascade_records: list[dict] = []
@@ -365,6 +485,20 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
                 from aero_eyes.utils import viz as vizmod
                 vizmod.save_cascade_verification(
                     frame_bgr, frame_cascade_records, frame_idx, viz_dir / "cascade",
+                )
+        if tie_cfg.enabled and len(boxes) >= 2:
+            pre_n = len(boxes)
+            frame_tie_records: list[dict] = []
+            boxes = clip_tiebreak_boxes(
+                clip_extractor, clip_text_feat, frame_bgr, boxes, tie_cfg, records=frame_tie_records,
+            )
+            for r in frame_tie_records:
+                r["frame_idx"] = frame_idx
+            clip_tiebreak_records.extend(frame_tie_records)
+            if len(boxes) != pre_n:
+                log.debug(
+                    "[Stage123-GDINO] frame %d: clip_tiebreak dropped %d/%d tied box(es)",
+                    frame_idx, pre_n - len(boxes), pre_n,
                 )
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
@@ -395,6 +529,36 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
             float(np.mean(ratios)) if ratios else float("nan"),
             float(np.median(ratios)) if ratios else float("nan"),
             cascade_log_path,
+        )
+
+    if cpf_cfg.enabled and color_stats:
+        arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim, overexposed_fraction
+        log.info(
+            "[Stage123-GDINO] %s: color_postfilter similarity stats over %d candidates "
+            "(min_similarity=%.2f) -- sim_hs p10/p50/p90=%.3f/%.3f/%.3f, "
+            "sim_v p10/p50/p90=%.3f/%.3f/%.3f, effective_sim p10/p50/p90=%.3f/%.3f/%.3f, "
+            "%% below min_similarity=%.1f%%, %% overexposed(>=%.0f%% clipped)=%.1f%%",
+            sample_id, len(color_stats), cpf_cfg.min_similarity,
+            *np.percentile(arr[:, 0], [10, 50, 90]),
+            *np.percentile(arr[:, 1], [10, 50, 90]),
+            *np.percentile(arr[:, 2], [10, 50, 90]),
+            100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
+            cpf_cfg.overexposure_ramp_frac * 100.0,
+            100.0 * float((arr[:, 3] >= cpf_cfg.overexposure_ramp_frac).mean()),
+        )
+
+    if tie_cfg.enabled and clip_tiebreak_records:
+        import json
+
+        tie_log_path = work_dir / "clip_tiebreak.jsonl"
+        with open(tie_log_path, "w", encoding="utf-8") as f:
+            for r in clip_tiebreak_records:
+                f.write(json.dumps(r) + "\n")
+        n_dropped = sum(1 for r in clip_tiebreak_records if not r["kept"])
+        log.info(
+            "[Stage123-GDINO] %s: clip_tiebreak re-checked %d tied box(es) across the run, "
+            "dropped %d -> %s",
+            sample_id, len(clip_tiebreak_records), n_dropped, tie_log_path,
         )
 
     idf_cfg = cfg.stage123_gdino.isolated_detection_filter

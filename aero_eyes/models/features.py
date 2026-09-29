@@ -915,6 +915,29 @@ class CLIPFeatureExtractor:
             out.append(F.normalize(feats, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
 
+    @torch.no_grad()
+    def encode_text(self, texts: list[str]) -> np.ndarray:
+        """L2-normalized CLIP text embeddings, SAME embedding space as
+        extract()'s image embeddings -- lets a caller compute image-TEXT
+        cosine similarity directly (CLIP's own zero-shot mechanism), not
+        just image-image similarity against a reference prototype. Used by
+        stage123_gdino.clip_tiebreak to score a candidate crop against the
+        sample's own text_prompt when Grounding DINO's own box scores are
+        too close together to trust (see GDinoClipTiebreakConfig's own
+        docstring, aero_eyes/config.py). Calls text_model + text_projection
+        directly (mirrors extract()'s own vision_model + visual_projection
+        split) rather than get_text_features(), for the same
+        transformers-version-regression reason documented there."""
+        if not texts:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        pooled = self.model.text_model(
+            input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask"),
+        ).pooler_output
+        feats = self.model.text_projection(pooled)
+        return F.normalize(feats, dim=-1).cpu().numpy().astype(np.float32)
+
     def extract_crops(self, frame_bgr: np.ndarray, boxes: list[Box],
                       pad_ratio: float = 0.10, batch_size: int = 16) -> np.ndarray:
         if not boxes:
