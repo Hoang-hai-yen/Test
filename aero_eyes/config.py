@@ -2280,7 +2280,16 @@ class PipelineConfig(BaseModel):
     #             exemplar + Stage2/3's proposal+matching. Reference images
     #             (data.refs_subdir) are NOT used by this detector -- see
     #             Stage123GDinoConfig for how the text prompt is supplied.
-    detector: Literal["legacy", "geco2", "grounding_dino"] = "legacy"
+    # "pet_dino" = single merged stage (stage123_pet_dino.py) using PET-DINO
+    #             (CVPR 2026, arXiv:2604.00503), a text-prompted detector
+    #             from its OWN separately-cloned MMDetection-based repo, not
+    #             transformers -- see Stage123PetDinoConfig's own docstring
+    #             for the full setup/scope caveats (heavier dependency
+    #             stack, NOT smoke-tested in this environment). Deliberately
+    #             a minimal baseline (no cascade_verification/
+    #             color_postfilter/clip_tiebreak equivalents yet, unlike
+    #             "grounding_dino").
+    detector: Literal["legacy", "geco2", "grounding_dino", "pet_dino"] = "legacy"
 
 
 class ScaleCalibrationConfig(BaseModel):
@@ -3763,17 +3772,59 @@ class Stage123GDinoConfig(BaseModel):
     object. See resolve_text_prompt() (aero_eyes/stages/stage123_gdino.py)
     for how that text is chosen per sample.
 
-    Only "tiny" (Swin-T, IDEA-Research/grounding-dino-tiny) and "base"
-    (Swin-B, IDEA-Research/grounding-dino-base) are wired -- these are the
-    only two checkpoints IDEA-Research has published on the HuggingFace Hub
-    as of this writing. There is no public "Swin-L"/"large" Grounding DINO
-    checkpoint, and Grounding DINO 1.5 Edge is a SEPARATE, mostly closed
-    IDEA-Research product (gated weights/API, its own inference code, not
-    loadable through transformers) -- neither is wired here; deliberately
-    NOT stubbed as a `variant` value so picking it can't look supported.
+    "tiny" (Swin-T, IDEA-Research/grounding-dino-tiny) and "base" (Swin-B,
+    IDEA-Research/grounding-dino-base) are the original IDEA-Research
+    checkpoints -- the only two IDEA-Research has published on the
+    HuggingFace Hub as of this writing. There is no public "Swin-L"/"large"
+    ORIGINAL Grounding DINO checkpoint, and Grounding DINO 1.5 Edge is a
+    SEPARATE, mostly closed IDEA-Research product (gated weights/API, its
+    own inference code, not loadable through transformers) -- neither is
+    wired here; deliberately NOT stubbed as a `variant` value so picking it
+    can't look supported.
+
+    "mm_tiny"/"mm_base"/"mm_large" are MM-Grounding-DINO (Zhao et al.,
+    arXiv:2401.02361, "An Open and Comprehensive Pipeline for Unified
+    Object Grounding and Detection") -- OpenMMLab's own retrain of the SAME
+    Grounding DINO architecture on a much larger/broader mix of grounding
+    data (Objects365 + GoldG + V3Det + GRIT, vs. the original's own smaller
+    training set), merged into `transformers` upstream (August 2025) as
+    MMGroundingDinoForObjectDetection -- loaded through the exact SAME
+    AutoModelForZeroShotObjectDetection/AutoProcessor path as "tiny"/"base"
+    above (grounding_dino_detector.py needed no code changes beyond adding
+    these 3 checkpoint names to _HF_MAP), so this is near-drop-in, not a
+    separate integration. The paper reports meaningfully stronger zero-shot
+    detection than the original Grounding DINO (COCO AP +2.2, LVIS val AP
+    +11.8) -- the motivating reason to try it here: a false positive from
+    Grounding DINO's own text-grounding score confusing a same-CATEGORY
+    confuser is, per that framing, partly a consequence of how narrow the
+    original training grounding data was; broader training data is a
+    plausible (unvalidated) lever on exactly that failure mode, orthogonal
+    to (and stackable with) cascade_verification/color_postfilter/
+    clip_tiebreak above, which all assume Grounding DINO's own score as a
+    given rather than trying to improve it. Unlike the original checkpoints,
+    a "large" size genuinely exists here, hence mm_large being offered.
+    Checkpoints (openmmlab-community org on the HF Hub): mm_tiny ->
+    mm_grounding_dino_tiny_o365v1_goldg_grit_v3det (their strongest tiny),
+    mm_base -> mm_grounding_dino_base_all, mm_large ->
+    mm_grounding_dino_large_all (their strongest of each size tier, "_all"
+    = trained on the full combined data mixture). Requires a transformers
+    release that ships MMGroundingDinoForObjectDetection (added ~August
+    2025) -- verify with `python -c "from transformers import
+    MMGroundingDinoForObjectDetection"` before relying on it; upgrade via
+    `pip install -U transformers` if missing, same as the note above for
+    the original checkpoints. NOT YET VALIDATED end-to-end in THIS
+    pipeline (this environment has no transformers installed to smoke-test
+    against) -- the checkpoint names and Auto-class loading path are
+    confirmed from HF's own MM Grounding DINO docs, but
+    post_process_grounded_object_detection's exact output schema for this
+    specific processor has not been exercised here; _postprocess's own
+    try/except (old vs. new `threshold=`/`box_threshold=` kwarg) already
+    isolates the most likely version-skew point, same as for the original
+    checkpoints.
+
     NOT YET VALIDATED on this project's own footage.
     """
-    variant: Literal["tiny", "base"] = "tiny"
+    variant: Literal["tiny", "base", "mm_tiny", "mm_base", "mm_large"] = "tiny"
     # Passed verbatim as `text=` to the HF processor -- Grounding DINO's own
     # convention is lowercase, each candidate phrase separated by ". " with
     # a trailing period (e.g. "white backpack. black backpack."); the
@@ -3848,6 +3899,89 @@ class Stage123GDinoConfig(BaseModel):
     # project's own footage.
     color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
     clip_tiebreak: GDinoClipTiebreakConfig = GDinoClipTiebreakConfig()
+
+
+# ---------------------------------------------------------------------------
+class Stage123PetDinoConfig(BaseModel):
+    """Only used when pipeline.detector == 'pet_dino'. PET-DINO (Fu et al.,
+    arXiv:2604.00503, CVPR 2026 Highlight) -- "Unifying Visual Cues into
+    Grounding DINO with Prompt-Enriched Training": a universal detector
+    trained to accept EITHER a text prompt OR a visual prompt (bounding box
+    / pre-extracted embedding from a reference image), unlike this
+    project's current split (stage123_gdino = text-only, stage123_geco2 =
+    image-exemplar-only). Motivating reason to try it here, same spirit as
+    Stage123GDinoConfig's own mm_* variants: a plausible (UNVALIDATED)
+    lever on the FP class where Grounding DINO's CATEGORY-level text-
+    grounding score can't reject a same-category, wrong-identity confuser
+    -- PET-DINO's visual-prompt path could potentially do that natively,
+    IF its own accuracy holds up on this project's aerial small-object
+    footage (untested, and the visual-prompt path isn't even wired into
+    the real pipeline yet -- see below).
+
+    UNLIKE stage123_gdino (loaded through `transformers`, no vendored repo
+    needed -- including its own mm_tiny/mm_base/mm_large MM-Grounding-DINO
+    variants), PET-DINO has NOT been merged upstream into transformers --
+    this wraps mmdet.apis.DetInferencer against a SEPARATELY CLONED copy of
+    https://github.com/fuweifuvtoo/PET_DINO (mirrors stage123_geco2.
+    repo_path's own vendored-repo convention), needing PET_DINO's own
+    MMDetection-based dependency stack (mmdet/mmengine/mmcv, NOT part of
+    this project's own requirements.txt by default -- see that file's own
+    "pipeline.detector == 'pet_dino'" block for the full install sequence,
+    including a numpy==1.23 pin from its lvis-api dependency that MAY
+    conflict with this project's own unpinned numpy in the same
+    environment -- a separate virtualenv is the safer default).
+
+    ONLY the base text-prompt path is wired into the real per-keyframe
+    pipeline here (run_stage123_pet_dino, mirroring stage123_gdino.
+    run_stage123_gdino's own BASE path before any of its fusion/adaptive-
+    threshold/cascade_verification/color_postfilter/clip_tiebreak opt-ins)
+    -- deliberately scoped to a first, comparable baseline to test PET-
+    DINO's own raw detection quality against, not a full port of
+    stage123_gdino's whole FP-filtering suite onto an as-yet-unverified new
+    detector. PetDinoDetector.raw_boxes_and_scores (aero_eyes/models/
+    pet_dino_detector.py) exposes the visual-prompt call arguments
+    (prompt_bboxes/prompt_image/prompt_visual_embedding_path) for FUTURE
+    use, but nothing here automatically converts data.refs_subdir's
+    reference photos into a visual prompt yet. Stage 4's own GDino/GeCo2-
+    specific periodic re-detection (stage4.py's use_gdino/use_geco2) does
+    NOT recognize this detector either -- tracking still runs, just
+    without model-based re-verification mid-track.
+
+    CRITICAL: aero_eyes/models/pet_dino_detector.py was written from
+    PET_DINO's own README + scripts/image_demo.py source (fetched and read
+    this session, not guessed) confirming DetInferencer is the right entry
+    point and its core argument names -- but has NOT been smoke-tested
+    against a real checkpoint (this development environment has neither
+    mmdet nor even bare `transformers` installed). See that module's own
+    docstring for exactly which parts are confirmed vs. assumed-standard-
+    MMDetection-convention. NOT YET VALIDATED in any sense beyond "the
+    documented CLI usage pattern maps onto this shape" -- run a real
+    smoke test (one frame, one prompt) before trusting output boxes/scores.
+    """
+    repo_path: str = "./PET_DINO"
+    # Relative to repo_path -- their own example config for the smallest
+    # (Swin-T) checkpoint; swap for a Swin-L config + matching weights_path
+    # if you downloaded that checkpoint instead (see their own HF repo,
+    # https://huggingface.co/fuweifu/PET-DINO, for what's available).
+    config_file: str = "configs/pet_dino/pet_dino_swin-t_8xb4_12e_obj365.py"
+    weights_path: str = "./PET_DINO/checkpoints/pet_dino_swin-t.pth"
+    box_threshold: float = 0.3  # matches their own --pred-score-thr example
+    nms_iou: float = 0.5
+    topk_per_keyframe: int = 5
+    min_box_area_enabled: bool = False
+    min_box_area: int = 24
+    max_box_area_frac_enabled: bool = True
+    max_box_area_frac: float = 0.5
+    keyframe_interval: int = 8
+    # Same 3-way prompt precedence as stage123_gdino.resolve_text_prompt
+    # (prompt.txt file > text_prompts map > default_text_prompt) --
+    # duplicated rather than shared (see stage123_pet_dino.
+    # resolve_text_prompt's own docstring): the two configs are otherwise
+    # fully independent and this precedence logic is short enough that
+    # sharing it isn't worth coupling the two detectors' config schemas.
+    default_text_prompt: str = ""
+    text_prompts: dict[str, str] = {}
+    prompt_file_name: str = "prompt.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -4193,6 +4327,7 @@ class AeroEyesConfig(BaseModel):
     stage5: Stage5Config = Stage5Config()
     stage123_geco2: Stage123Geco2Config = Stage123Geco2Config()
     stage123_gdino: Stage123GDinoConfig = Stage123GDinoConfig()
+    stage123_pet_dino: Stage123PetDinoConfig = Stage123PetDinoConfig()
     accuracy: AccuracyConfig = AccuracyConfig()
     eval: EvalConfig = EvalConfig()
     box_refine: BoxRefineConfig = BoxRefineConfig()

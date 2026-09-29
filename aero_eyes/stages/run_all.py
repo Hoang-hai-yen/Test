@@ -43,6 +43,12 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
                   (stage34.run_stage34) -- same shape/rationale as the geco2
                   cosine_rescore branch above -- see GDinoCosineRescoreConfig
                   in config.py.
+      "pet_dino" -> merged Stage1+2+3 (stage123_pet_dino.py), Stage4, Stage5
+                  -- a MINIMAL text-prompted baseline (no cosine_rescore-
+                  equivalent candidate-generation branch), needing PET-
+                  DINO's own separate MMDetection-based dependency stack --
+                  see Stage123PetDinoConfig's own docstring in config.py
+                  for the full setup/scope caveats.
     Stage numbers in --from-stage always refer to the ORIGINAL 1-5 scheme
     (e.g. --from-stage 4 resumes at tracking either way) so switching
     detector doesn't change what a given --from-stage value means.
@@ -99,6 +105,13 @@ def run_all(cfg, sample_id: str | None = None, from_stage: int = 1, merge: bool 
         from aero_eyes.stages.stage123_gdino import run_stage123_gdino
         # stage_num=1 covers what legacy Stage1-3 do combined.
         stage_fns = [(1, run_stage123_gdino), (4, run_stage4), (5, run_stage5)]
+    elif cfg.pipeline.detector == "pet_dino":
+        from aero_eyes.stages.stage123_pet_dino import run_stage123_pet_dino
+        # stage_num=1 covers what legacy Stage1-3 do combined -- see
+        # Stage123PetDinoConfig's own docstring for why this is a minimal
+        # baseline (no cosine_rescore-equivalent candidate-generation
+        # branch, unlike the geco2/grounding_dino cases above).
+        stage_fns = [(1, run_stage123_pet_dino), (4, run_stage4), (5, run_stage5)]
     else:
         from aero_eyes.stages.stage1 import run_stage1
         from aero_eyes.stages.stage2 import run_stage2

@@ -22,7 +22,12 @@ pipeline:
                       #     -- see the stage123_geco2 section below) |
                       #     "grounding_dino" (single merged stage using an
                       #     open-vocabulary TEXT-prompted detector instead --
-                      #     see the stage123_gdino section below).
+                      #     see the stage123_gdino section below) | "pet_dino"
+                      #     (single merged stage using PET-DINO from its own
+                      #     separately-cloned MMDetection-based repo -- see
+                      #     the stage123_pet_dino section below and
+                      #     Stage123PetDinoConfig's own docstring,
+                      #     aero_eyes/config.py, for setup/scope caveats).
                       # Stage4/Stage5 run unchanged either way.
 
 # ----------------------------------------------------------------------------
@@ -2041,9 +2046,13 @@ stage5:
 # footage -- A/B against geco2/legacy before trusting it.
 # ----------------------------------------------------------------------------
 stage123_gdino:
-  # tiny (Swin-T) | base (Swin-B) -- the only 2 checkpoints IDEA-Research has
-  # published on the HF Hub. No "large"/"edge" -- see the config class
-  # docstring for why those are deliberately not offered here.
+  # tiny | base (original IDEA-Research checkpoints) | mm_tiny | mm_base |
+  # mm_large (MM-Grounding-DINO -- OpenMMLab's retrain on broader grounding
+  # data, near-drop-in via the same transformers Auto-class path, needs a
+  # newer transformers release -- see Stage123GDinoConfig's own docstring,
+  # aero_eyes/config.py, for the full rationale/checkpoint names). No
+  # "large"/"edge" for the ORIGINAL (non-mm) checkpoints specifically --
+  # see that same docstring for why those are deliberately not offered.
   variant: tiny
   # Fallback prompt used when neither a per-sample prompt.txt file nor
   # text_prompts below has an entry for the current sample_id. Grounding
@@ -2413,6 +2422,38 @@ box_refine:
   # candidate across every keyframe, not just topk_per_keyframe winners) --
   # compare against apply_in_stage3-only on your own footage first.
   apply_before_stage3_filtering: false
+
+# ----------------------------------------------------------------------------
+# PET-DINO — only used when pipeline.detector == "pet_dino". A SEPARATE,
+# NOT-merged-into-transformers detector (github.com/fuweifuvtoo/PET_DINO,
+# CVPR 2026, arXiv:2604.00503) supporting both text AND visual prompts --
+# see Stage123PetDinoConfig's own docstring (aero_eyes/config.py) for the
+# full rationale, setup sequence (needs its own MMDetection-based
+# dependency stack, NOT this project's usual requirements.txt), and scope
+# caveats (minimal baseline, no cascade_verification/color_postfilter/
+# clip_tiebreak equivalents yet, NOT smoke-tested in this environment).
+# ----------------------------------------------------------------------------
+stage123_pet_dino:
+  repo_path: ./PET_DINO
+  # Relative to repo_path -- their own example config for the smallest
+  # (Swin-T) checkpoint; swap for a Swin-L config + matching weights_path
+  # if you downloaded that checkpoint instead (see
+  # https://huggingface.co/fuweifu/PET-DINO for what's available).
+  config_file: configs/pet_dino/pet_dino_swin-t_8xb4_12e_obj365.py
+  weights_path: ./PET_DINO/checkpoints/pet_dino_swin-t.pth
+  box_threshold: 0.3   # matches their own --pred-score-thr example
+  nms_iou: 0.5
+  topk_per_keyframe: 5
+  min_box_area_enabled: false
+  min_box_area: 24
+  max_box_area_frac_enabled: true
+  max_box_area_frac: 0.5
+  keyframe_interval: 8
+  # Same 3-way prompt precedence as stage123_gdino's own fields above
+  # (prompt.txt file > text_prompts map > default_text_prompt).
+  default_text_prompt: ""
+  text_prompts: {}
+  prompt_file_name: prompt.txt
 
 # ----------------------------------------------------------------------------
 # ACCURACY MODE — progressively enables domain-gap mitigations.

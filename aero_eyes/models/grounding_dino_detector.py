@@ -8,9 +8,15 @@ project's general preference for the standard transformers path over a
 vendored repo when one exists (see SigLIP2 vs FG-CLIP's own docstring for
 the same tradeoff).
 
-Only "tiny" (Swin-T) and "base" (Swin-B) are wired -- see
-Stage123GDinoConfig's own docstring (aero_eyes/config.py) for why "large"/
-"edge" are deliberately NOT offered as variant values.
+"tiny"/"base" are the original IDEA-Research checkpoints. "mm_tiny"/
+"mm_base"/"mm_large" are MM-Grounding-DINO (OpenMMLab's retrain of the same
+architecture on broader grounding data) -- loaded through the exact SAME
+AutoModelForZeroShotObjectDetection/AutoProcessor path (no code path
+difference here beyond the _HF_MAP entry below), merged into transformers
+upstream as MMGroundingDinoForObjectDetection. See Stage123GDinoConfig's
+own docstring (aero_eyes/config.py) for the full rationale/tradeoffs of
+each variant, and why "large"/"edge" are deliberately NOT offered for the
+ORIGINAL (non-mm) checkpoints specifically.
 
 NOT YET VALIDATED on this project's own footage.
 """
@@ -32,6 +38,13 @@ log = logging.getLogger(__name__)
 _HF_MAP = {
     "tiny": "IDEA-Research/grounding-dino-tiny",   # Swin-T
     "base": "IDEA-Research/grounding-dino-base",   # Swin-B
+    # MM-Grounding-DINO (arXiv:2401.02361) -- same architecture, broader
+    # training data (Objects365+GoldG+V3Det+GRIT vs. the original's own
+    # smaller set). "_all" = trained on the full combined data mixture
+    # (OpenMMLab's own strongest checkpoint per size tier).
+    "mm_tiny": "openmmlab-community/mm_grounding_dino_tiny_o365v1_goldg_grit_v3det",
+    "mm_base": "openmmlab-community/mm_grounding_dino_base_all",
+    "mm_large": "openmmlab-community/mm_grounding_dino_large_all",
 }
 
 
@@ -81,6 +94,23 @@ class GroundingDinoDetector:
                 "run `pip install -U transformers` and retry. See Stage123GDinoConfig's own "
                 "docstring (aero_eyes/config.py)."
             )
+        if self.variant.startswith("mm_"):
+            # MMGroundingDinoForObjectDetection was merged into transformers
+            # later (~August 2025) than the original GroundingDinoForObject
+            # Detection -- an older install may have the base import above
+            # succeed while still not recognizing this checkpoint's
+            # model_type, which otherwise surfaces as an opaque error deep
+            # inside from_pretrained() below. Check explicitly for a clear
+            # message pointing at the actual cause.
+            try:
+                from transformers import MMGroundingDinoForObjectDetection  # noqa: F401
+            except ImportError:
+                raise RuntimeError(
+                    f"stage123_gdino.variant='{self.variant}' needs MM-Grounding-DINO support "
+                    "(MMGroundingDinoForObjectDetection), merged into transformers later than "
+                    "plain Grounding DINO support -- run `pip install -U transformers` and "
+                    "retry. See Stage123GDinoConfig's own docstring (aero_eyes/config.py)."
+                )
         processor = AutoProcessor.from_pretrained(hf_name)
         model = AutoModelForZeroShotObjectDetection.from_pretrained(hf_name)
         model.eval().to(self.device)
