@@ -104,67 +104,6 @@ class DINOv2FeatureExtractor:
             return np.zeros((0, self._dim()), dtype=np.float32)
         return self.extract([crop_with_pad(frame_bgr, b, pad_ratio) for b in boxes], batch_size)
 
-    @torch.no_grad()
-    def extract_dense_grid(self, image_bgr: np.ndarray, target_size: int = 630) -> tuple[np.ndarray, float, float]:
-        """Dense per-patch DINOv2 features for one image/tile, as an
-        L2-normalized [Hp, Wp, dim] grid of patch tokens -- unlike
-        `extract()`, which collapses to a single pooled CLS vector.
-
-        `target_size` is rounded down to a multiple of the ViT patch size
-        (14px) and the image is resized (aspect-distorting, same convention
-        `extract()` already uses) to that square before the forward pass.
-        Callers should pass full-resolution tiles (e.g. SAHI-tile-sized
-        crops), not tiny thumbnails -- a small object vanishes into a
-        handful of patches otherwise.
-
-        Returns (grid, scale_x, scale_y): scale_x/scale_y map a pixel
-        coordinate in the resized square back to image_bgr's own pixel
-        coordinates (i.e. multiply patch-grid-cell * 14 * scale to get an
-        image_bgr-local pixel offset).
-        """
-        patch = 14
-        size = max(patch, (target_size // patch) * patch)
-        h, w = image_bgr.shape[:2]
-        tensor = _preprocess_dino(image_bgr, size).unsqueeze(0).to(self.device).float()
-        grid_hw = size // patch
-        if getattr(self.model, "_hf", False):
-            tokens = self.model(pixel_values=tensor).last_hidden_state[:, 1:]
-        else:
-            tokens = self.model.forward_features(tensor)["x_norm_patchtokens"]
-        tokens = F.normalize(tokens, dim=-1)
-        grid = tokens[0].reshape(grid_hw, grid_hw, -1).cpu().numpy().astype(np.float32)
-        return grid, w / size, h / size
-
-    def extract_pyramid_grid(self, image_bgr: np.ndarray, scales: list[int] | None = None,
-                             target_size: int = 630) -> tuple[np.ndarray, float, float]:
-        """FPN-style multi-scale variant of `extract_dense_grid`: extracts
-        patch-token grids at several input resolutions (coarse -> fine) and
-        fuses them top-down via `aero_eyes.utils.geometry.fuse_feature_pyramid`
-        -- coarser scales carry a larger receptive field per token (more
-        semantically robust, less prone to single-patch noise), the finest
-        scale carries precise localization. Unlike a single-resolution grid,
-        this targets *box precision*, not just recall.
-
-        `scales` defaults to `[224, 420, target_size]` (all multiples of the
-        14px patch size: 16/30/45 patches per side). Returns the same
-        `(grid, scale_x, scale_y)` shape/convention as `extract_dense_grid`
-        (from the finest scale), so callers like `dense_patches_to_boxes`
-        need no changes.
-        """
-        from aero_eyes.utils.geometry import fuse_feature_pyramid
-
-        if scales is None:
-            scales = [224, 420, target_size]
-        scales = sorted({s for s in scales if s <= target_size} | {target_size})
-
-        grids: list[np.ndarray] = []
-        scale_x = scale_y = 1.0
-        for s in scales:
-            grid, scale_x, scale_y = self.extract_dense_grid(image_bgr, target_size=s)
-            grids.append(grid)
-        fused = fuse_feature_pyramid(grids)
-        return fused, scale_x, scale_y
-
     _DIMS = {"vits14": 384, "vitb14": 768, "vitl14": 1024, "vitg14": 1536}
 
     def _dim(self) -> int:
