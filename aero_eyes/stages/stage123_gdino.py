@@ -26,6 +26,10 @@ Writes: <work_dir>/<sample_id>/detections.json
           -- see cascade_verify_boxes's own docstring)
         <work_dir>/<sample_id>/color_signature_gdino.npz (cached reference
           color histogram, only when color_postfilter.enabled)
+        <work_dir>/<sample_id>/color_postfilter.jsonl (one line per box
+          evaluated against the reference color signature, only when
+          color_postfilter.enabled -- see apply_color_postfilter's own
+          `records` argument)
         <work_dir>/<sample_id>/clip_tiebreak.jsonl (one line per box
           re-checked by CLIP because its Pass-1 score was tied with
           another box's, only when clip_tiebreak.enabled -- see
@@ -34,6 +38,9 @@ Viz:    <work_dir>/<sample_id>/viz/stage123_gdino/ (when save_visualizations=tru
         <work_dir>/<sample_id>/viz/stage123_gdino/cascade/ (Pass-1 vs Pass-2
           score per box, green=kept/red=dropped -- only when
           cascade_verification.enabled AND save_visualizations=true)
+        <work_dir>/<sample_id>/viz/stage123_gdino/color/ (Hue+Sat/Value/
+          effective similarity per box, green=kept/red=dropped -- only
+          when color_postfilter.enabled AND save_visualizations=true)
 """
 from __future__ import annotations
 
@@ -429,6 +436,7 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
     detections: dict[int, list[Detection]] = {}
     cascade_records: list[dict] = []
     color_stats: list[tuple[float, float, float]] = []
+    color_records: list[dict] = []
     clip_tiebreak_records: list[dict] = []
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
@@ -459,13 +467,23 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
             from aero_eyes.stages.stage123_geco2 import apply_color_postfilter
 
             pre_n = len(boxes)
+            frame_color_records: list[dict] = []
             boxes = apply_color_postfilter(
                 frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats, segmenter=color_segmenter,
+                records=frame_color_records,
             )
+            for r in frame_color_records:
+                r["frame_idx"] = frame_idx
+            color_records.extend(frame_color_records)
             if len(boxes) != pre_n:
                 log.debug(
                     "[Stage123-GDINO] frame %d: color_postfilter dropped %d/%d box(es)",
                     frame_idx, pre_n - len(boxes), pre_n,
+                )
+            if save_viz:
+                from aero_eyes.utils import viz as vizmod
+                vizmod.save_color_postfilter(
+                    frame_bgr, frame_color_records, frame_idx, viz_dir / "color",
                 )
         if cascade_cfg.enabled and boxes:
             pre_n = len(boxes)
@@ -545,6 +563,18 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
             100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
             cpf_cfg.overexposure_ramp_frac * 100.0,
             100.0 * float((arr[:, 3] >= cpf_cfg.overexposure_ramp_frac).mean()),
+        )
+
+    if cpf_cfg.enabled and color_records:
+        import json
+
+        color_log_path = work_dir / "color_postfilter.jsonl"
+        with open(color_log_path, "w", encoding="utf-8") as f:
+            for r in color_records:
+                f.write(json.dumps(r) + "\n")
+        log.info(
+            "[Stage123-GDINO] %s: color_postfilter per-box records (%d box(es)) -> %s",
+            sample_id, len(color_records), color_log_path,
         )
 
     if tie_cfg.enabled and clip_tiebreak_records:

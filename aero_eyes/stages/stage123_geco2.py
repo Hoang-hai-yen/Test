@@ -718,6 +718,7 @@ def build_color_signature(
 def apply_color_postfilter(
     frame_bgr: np.ndarray, boxes: list[Box], color_sig: ColorSignature, cpf_cfg,
     stats_out: list[tuple[float, float, float, float]] | None = None, segmenter=None,
+    records: list[dict] | None = None,
 ) -> list[Box]:
     """Drop/downweight candidate boxes whose color doesn't match the
     reference object's own color signature (best-of-N-refs match per
@@ -730,24 +731,52 @@ def apply_color_postfilter(
 
     Beyond that base comparison, THREE independent signals from
     docs/attribute_taxonomy_plan.md's color investigation (SS4/SS8/SS9)
-    each further adjust effective_sim, compounding (multiplying) with each
-    other -- two are CONFIDENCE gates (blend effective_sim toward 1.0, i.e.
-    abstain: color alone can never REJECT a candidate through these, only
-    a genuine histogram mismatch can), one is EVIDENCE (can actively push
-    effective_sim toward 0, a real reject signal):
-      1. [confidence gate] Overexposure (SS9.10/SS9.11) -- a clipped color
-         channel reads as a WRONG hue, not just a noisier one. See
-         compute_overexposed_fraction/hue_confidence_from_overexposure and
-         overexposure_ramp_frac.
-      2. [confidence gate] Cross-photo disagreement (SS8.3) --
-         color_sig.ref_agreement; if the 3 ref photos don't even agree on
-         their OWN color, no candidate comparison against them can be
-         trusted regardless of how well it matches any single one.
-      3. [evidence] is_high_vis agreement (SS3.2/SS4 point 4/SS8.1, opt-in
-         via cpf_cfg.is_high_vis_gating_enabled) -- a ref that IS a safety-
-         colored object (LifeJacket/Lifering) but whose candidate ISN'T (or
-         vice versa) is real information the Hue+Sat/Value histograms
-         alone might miss. See compute_is_high_vis's own docstring.
+    further adjust the accept/reject decision -- one is EVIDENCE (acts on
+    the SCORE, effective_sim), two are CONFIDENCE (act on the THRESHOLD,
+    NOT the score -- see the BUG note further down for why that distinction
+    matters):
+      1. [evidence, multiplies effective_sim] is_high_vis agreement
+         (SS3.2/SS4 point 4/SS8.1, opt-in via cpf_cfg.
+         is_high_vis_gating_enabled) -- a ref that IS a safety-colored
+         object (LifeJacket/Lifering) but whose candidate ISN'T (or vice
+         versa) is real information the Hue+Sat/Value histograms alone
+         might miss. A perfect match (agreement=1) leaves effective_sim
+         unchanged; a total mismatch (agreement=0) zeroes it. See
+         compute_is_high_vis's own docstring.
+      2. [confidence, scales down the ACCEPTANCE THRESHOLD] Overexposure
+         (SS9.10/SS9.11) -- a clipped color channel reads as a WRONG hue,
+         not just a noisier one. See compute_overexposed_fraction/
+         hue_confidence_from_overexposure and overexposure_ramp_frac.
+      3. [confidence, scales down the ACCEPTANCE THRESHOLD] Cross-photo
+         disagreement (SS8.3) -- color_sig.ref_agreement; if the 3 ref
+         photos don't even agree on their OWN color, no candidate
+         comparison against them can be trusted regardless of how well it
+         matches any single one.
+    effective_min_similarity = cpf_cfg.min_similarity * hue_conf *
+    color_sig.ref_agreement -- low confidence in EITHER signal lowers how
+    much similarity a candidate needs to clear, instead of raising the
+    candidate's own score. A candidate is kept iff effective_sim >=
+    effective_min_similarity.
+
+    BUG FIXED (confirmed on this project's own real footage, not just
+    theoretical): an EARLIER version of this function blended the two
+    confidence gates INTO effective_sim instead
+    (`effective_sim = conf*effective_sim + (1-conf)*1.0`), which creates a
+    HARD FLOOR of (1-conf) on every single candidate's score -- e.g.
+    ref_agreement=0.57 floored effective_sim at 0.43 UNCONDITIONALLY,
+    which exceeds a stricter min_similarity (e.g. the default 0.30) and
+    makes min_similarity unable to reject ANYTHING at all, no matter how
+    badly a candidate's actual color matches. Observed directly: a plainly
+    wrong-colored candidate (a white box, against a reference whose own 3
+    photos only agreed with each other at ref_agreement=0.57) still scored
+    0.868, and 0 of 1109 real candidates in that run fell below
+    min_similarity=0.30. Scaling the threshold down instead of the score
+    up preserves the same "don't false-reject when the comparison itself
+    is unreliable" intent WITHOUT creating a floor that silently overrides
+    a user's own min_similarity, and WITHOUT collapsing every candidate's
+    score toward 1.0 (which also destroyed the score's own discriminative
+    value for `reweight` and for reading effective_sim back out of
+    stats_out/records).
 
     Also applies shadow-pixel exclusion (SS4 point 2, opt-in via
     cpf_cfg.shadow_filter_enabled -- see lit_pixel_mask's own docstring)
@@ -766,7 +795,24 @@ def apply_color_postfilter(
     picked from a synthetic/clean test image (as this codebase already
     learned the hard way once, with score_threshold_abs) may not reflect
     what real footage produces. See run_stage123_geco2's end-of-run
-    summary log.
+    summary log. Bare tuples (not per-box dicts) -- kept as-is for
+    backward compatibility with existing summary-stat consumers; use
+    `records` below for per-box debugging/viz instead of parallel-parsing
+    this.
+
+    records: if given (a list the caller owns), appends one dict per INPUT
+    box -- {x1,y1,x2,y2,pass1_score,sim_hs,sim_v,effective_sim,
+    overexposed_fraction,min_similarity_used,kept} -- for EVERY box, not
+    just survivors, same "log/viz everything, not just the decision"
+    spirit as aero_eyes.stages.stage123_gdino.cascade_verify_boxes's own
+    `records` argument. `pass1_score` is the box's own detector score
+    (score*effective_sim if cpf_cfg.reweight, else unchanged) BEFORE this
+    filter. `min_similarity_used` is the ACTUAL (confidence-scaled)
+    threshold this candidate was compared against -- see the BUG note
+    above for why this can differ from cpf_cfg.min_similarity itself, and
+    why that distinction is worth logging per-candidate for debugging.
+    Lets a caller feed this into aero_eyes.utils.viz.save_color_postfilter
+    or a JSONL log the same way cascade_verification.jsonl already works.
 
     segmenter: an already-constructed MobileSAM/FastSAM/SAM2Segmenter (see
     aero_eyes.models.segmentation.build_segmenter), or None (default) to
@@ -826,18 +872,14 @@ def apply_color_postfilter(
         sim_v = max(histogram_similarity(v_hist, r, cpf_cfg.metric) for r in color_sig.v_hists)
         effective_sim = conf * sim_hs + (1.0 - conf) * sim_v
 
-        overexposed_frac = compute_overexposed_fraction(crop, mask, cpf_cfg.overexposure_clip_threshold)
-        hue_conf = hue_confidence_from_overexposure(overexposed_frac, cpf_cfg.overexposure_ramp_frac)
-        effective_sim = hue_conf * effective_sim + (1.0 - hue_conf) * 1.0
-        effective_sim = color_sig.ref_agreement * effective_sim + (1.0 - color_sig.ref_agreement) * 1.0
-
-        # is_high_vis agreement (SS3.2/SS4 point 4/SS8.1) -- EVIDENCE, not a
-        # confidence/abstain gate like the two above: a genuine mismatch
-        # here (ref IS a safety color, candidate ISN'T, or vice versa) is
-        # real information that can REJECT a candidate, not just lower
-        # confidence in the comparison. Multiplicative, not blended toward
-        # 1.0 -- a perfect match (agreement=1) leaves effective_sim
-        # unchanged; a total mismatch (agreement=0) zeroes it.
+        # is_high_vis agreement (SS3.2/SS4 point 4/SS8.1) -- EVIDENCE:
+        # a genuine mismatch here (ref IS a safety color, candidate ISN'T,
+        # or vice versa) is real information that can REJECT a candidate.
+        # Multiplicative -- a perfect match (agreement=1) leaves
+        # effective_sim unchanged; a total mismatch (agreement=0) zeroes
+        # it. Safe to apply directly to the score (unlike the two
+        # CONFIDENCE gates below): it can only ever push effective_sim
+        # DOWN, never create a floor that overrides min_similarity.
         if cpf_cfg.is_high_vis_gating_enabled:
             cand_high_vis = compute_is_high_vis(
                 crop, mask, cpf_cfg.is_high_vis_percentile, cpf_cfg.is_high_vis_hue_max, cpf_cfg.is_high_vis_min_value,
@@ -845,9 +887,43 @@ def apply_color_postfilter(
             hivis_agreement = 1.0 - abs(color_sig.is_high_vis - cand_high_vis)
             effective_sim = effective_sim * hivis_agreement
 
+        # Overexposure (SS9.10/SS9.11) and cross-photo disagreement (SS8.3)
+        # are CONFIDENCE gates, not evidence -- they say "don't trust this
+        # comparison," not "this candidate matches." EMPIRICALLY CONFIRMED
+        # BUG in an earlier version of this function: blending them INTO
+        # effective_sim (`effective_sim = conf*effective_sim + (1-conf)`)
+        # creates a HARD FLOOR of (1-conf) on every candidate's score --
+        # e.g. ref_agreement=0.57 floors effective_sim at 0.43 for EVERY
+        # candidate regardless of how badly it actually matches, which
+        # exceeds a stricter min_similarity (e.g. 0.30) and makes
+        # min_similarity unable to reject ANYTHING at all (observed
+        # directly: a plainly wrong-colored candidate -- white box vs. a
+        # near-achromatic-but-only-57%-self-consistent reference -- still
+        # scored 0.868, and 0% of 1109 real candidates fell below
+        # min_similarity=0.30 that run). Fixed by scaling the THRESHOLD
+        # down instead of the score up: low confidence lowers the bar a
+        # candidate needs to clear (fewer false rejects when the
+        # comparison itself is unreliable, same intent as before) WITHOUT
+        # creating a floor that silently overrides min_similarity, and
+        # WITHOUT collapsing every candidate's score toward 1.0
+        # (destroying the score's own discriminative value for `reweight`
+        # or for reading these numbers back out of stats_out/records).
+        overexposed_frac = compute_overexposed_fraction(crop, mask, cpf_cfg.overexposure_clip_threshold)
+        hue_conf = hue_confidence_from_overexposure(overexposed_frac, cpf_cfg.overexposure_ramp_frac)
+        effective_min_similarity = cpf_cfg.min_similarity * hue_conf * color_sig.ref_agreement
+
         if stats_out is not None:
             stats_out.append((sim_hs, sim_v, effective_sim, overexposed_frac))
-        if effective_sim < cpf_cfg.min_similarity:
+        keep = effective_sim >= effective_min_similarity
+        if records is not None:
+            records.append({
+                "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
+                "pass1_score": box.score, "sim_hs": sim_hs, "sim_v": sim_v,
+                "effective_sim": effective_sim, "overexposed_fraction": overexposed_frac,
+                "min_similarity_used": effective_min_similarity,
+                "kept": keep,
+            })
+        if not keep:
             continue
         kept.append(Box(box.x1, box.y1, box.x2, box.y2, score=box.score * effective_sim) if cpf_cfg.reweight else box)
     if cpf_cfg.reweight:

@@ -2662,11 +2662,15 @@ class ColorPostfilterConfig(BaseModel):
     # is information-theoretically unrecoverable, so this doesn't try to
     # fix it -- it detects overexposure via compute_overexposed_fraction
     # (fraction of pixels with ANY BGR channel >= overexposure_clip_
-    # threshold) and blends effective_sim toward 1.0 (i.e. abstain --
-    # never let color alone reject an overexposed candidate) via
-    # hue_confidence_from_overexposure's ramp: effective_sim =
-    # hue_confidence*effective_sim + (1-hue_confidence)*1.0. See
-    # aero_eyes/utils/color.py for both functions' own docstrings.
+    # threshold) and, via hue_confidence_from_overexposure's ramp, scales
+    # DOWN the effective acceptance threshold a candidate must clear
+    # (effective_min_similarity = min_similarity * hue_confidence *
+    # ref_agreement, see apply_color_postfilter's own docstring,
+    # aero_eyes/stages/stage123_geco2.py) -- NOT the candidate's own score.
+    # BUG FIXED (confirmed on real footage, see that docstring's own BUG
+    # note): an earlier version blended this INTO effective_sim instead,
+    # which created a floor on every candidate's score that could exceed
+    # min_similarity itself and silently disable rejection entirely.
     # ramp_frac=0.40 and clip_threshold=250 are calibrated from this
     # project's own measurements (31-34% clipped reliably meant a wrong
     # Hue reading; 4% did not) -- re-check against your own footage before
@@ -2686,13 +2690,13 @@ class ColorPostfilterConfig(BaseModel):
     # 0.665/0.174/0.762 on the SAME scalar, a spread nearly as large as its
     # eventual ref-vs-candidate gap), there is no trustworthy "true" color
     # to compare a candidate against in the first place, regardless of how
-    # well the candidate matches any ONE of them. Blended into effective_sim
-    # the same way overexposure_ramp_frac's gate is (toward 1.0 = abstain
-    # when agreement is low) -- compounds with, doesn't replace, the
-    # overexposure gate above. No separate enable flag (parameter-free
-    # formula, always computed once color_postfilter itself is enabled) --
-    # unlike overexposure's calibrated numeric thresholds, this has no knob
-    # to mistune.
+    # well the candidate matches any ONE of them. Scales down
+    # effective_min_similarity the same way overexposure_ramp_frac's gate
+    # does (see apply_color_postfilter's own docstring and BUG note) --
+    # compounds with, doesn't replace, the overexposure gate above. No
+    # separate enable flag (parameter-free formula, always computed once
+    # color_postfilter itself is enabled) -- unlike overexposure's
+    # calibrated numeric thresholds, this has no knob to mistune.
     #
     # Dense (full-frame-context) segmentation for CANDIDATE crops
     # (docs/attribute_taxonomy_plan.md SS9.1/SS9.2/SS9.8) -- the single

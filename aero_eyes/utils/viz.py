@@ -88,6 +88,29 @@ def save_cascade_verification(frame: np.ndarray, records: list[dict], frame_idx:
     cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_cascade.jpg"), vis)
 
 
+def save_color_postfilter(frame: np.ndarray, records: list[dict], frame_idx: int, out_dir: Path) -> None:
+    """stage123_geco2/stage123_gdino.color_postfilter (debug, gated by
+    runtime.save_visualizations): draws every candidate box labeled with
+    its own Hue+Sat / Value similarity against the reference signature and
+    the blended effective_sim that actually decided accept/reject -- green
+    = kept, red = dropped as a color mismatch -- so a rejection can be
+    inspected visually instead of only from the end-of-run summary log's
+    percentiles. `records` is the list aero_eyes.stages.stage123_geco2.
+    apply_color_postfilter fills via its own `records` argument, one dict
+    per box: {x1,y1,x2,y2,sim_hs,sim_v,effective_sim,
+    overexposed_fraction,kept,...}. No-op (still creates out_dir) if
+    records is empty, e.g. no boxes survived upstream filtering for this
+    keyframe."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis = frame.copy()
+    for r in records:
+        box = Box(x1=r["x1"], y1=r["y1"], x2=r["x2"], y2=r["y2"])
+        color = _COLORS["detect"] if r["kept"] else _COLORS["reject"]
+        label = f"hs={r['sim_hs']:.2f} v={r['sim_v']:.2f} eff={r['effective_sim']:.2f}"
+        draw_box(vis, box, label, color)
+    cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_color.jpg"), vis)
+
+
 def draw_frame_annotation(frame: np.ndarray, box: Box | None, source: str,
                            frame_idx: int) -> np.ndarray:
     vis = frame.copy()

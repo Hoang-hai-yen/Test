@@ -1632,13 +1632,15 @@ stage123_geco2:
     # (dominant channel pegs at ~255 while another keeps climbing), which
     # reads as a WRONG hue (e.g. real orange/red reading as yellow), not
     # just a noisier one -- information-theoretically unrecoverable, so
-    # instead of correcting it, effective_sim is blended toward 1.0 (i.e.
-    # abstain -- color alone can never reject an overexposed candidate)
-    # whenever the fraction of clipped pixels is high. Calibrated from this
-    # project's own measurements: 31-34% clipped reliably meant a wrong Hue
-    # reading, 4% did not. overexposure_ramp_frac<=0 disables this gating
-    # (old, pre-this-field behavior). See ColorPostfilterConfig's own
-    # docstring (aero_eyes/config.py) and aero_eyes/utils/color.py's
+    # instead of correcting it, this scales DOWN the acceptance threshold
+    # a candidate must clear (NOT its score -- an earlier version inflated
+    # the score instead and that created a bug, see apply_color_postfilter's
+    # own BUG note, aero_eyes/stages/stage123_geco2.py) whenever the
+    # fraction of clipped pixels is high. Calibrated from this project's
+    # own measurements: 31-34% clipped reliably meant a wrong Hue reading,
+    # 4% did not. overexposure_ramp_frac<=0 disables this gating (old,
+    # pre-this-field behavior). See ColorPostfilterConfig's own docstring
+    # (aero_eyes/config.py) and aero_eyes/utils/color.py's
     # compute_overexposed_fraction / hue_confidence_from_overexposure.
     overexposure_clip_threshold: 250
     overexposure_ramp_frac: 0.40
