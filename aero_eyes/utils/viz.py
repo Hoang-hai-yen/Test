@@ -81,7 +81,9 @@ def save_cascade_verification(frame: np.ndarray, records: list[dict], frame_idx:
     for r in records:
         box = Box(x1=r["x1"], y1=r["y1"], x2=r["x2"], y2=r["y2"])
         color = _COLORS["detect"] if r["kept"] else _COLORS["reject"]
-        label = f"p1={r['pass1_score']:.2f} p2={r['pass2_score']:.2f}"
+        zoom = r.get("zoom")
+        label = f"p1={r['pass1_score']:.2f} p2={r['pass2_score']:.2f} z={zoom:.1f}x" if zoom else \
+                f"p1={r['pass1_score']:.2f} p2={r['pass2_score']:.2f}"
         draw_box(vis, box, label, color)
     cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_cascade.jpg"), vis)
 

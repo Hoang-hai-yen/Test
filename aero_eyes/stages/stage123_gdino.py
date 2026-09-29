@@ -186,17 +186,31 @@ def cascade_verify_boxes(
     box's own score -- pure accept/reject, so callers keep using each box's
     original Pass-1 score afterward.
 
+    max_zoom caps the crop's effective magnification relative to Pass 1's
+    own full-frame resize -- see GDinoCascadeVerificationConfig's own
+    "IMPORTANT confound" docstring section for why this exists: without it,
+    a tiny box's crop gets magnified far more by the model's fixed-input-
+    size resize than the box was within the full frame, and that extra
+    magnification is mostly interpolation, not genuine detail -- confirmed
+    in practice to inflate FALSE positives' scores rather than collapse
+    them. Implemented via crop_with_pad's own min_side argument: the crop's
+    shorter side is floored at min(frame_h, frame_w) / max_zoom, overriding
+    pad_ratio whenever the two disagree (max_zoom<=0 disables the cap).
+
     When `records` is given (a list the caller owns), appends one dict per
-    INPUT box -- {x1,y1,x2,y2,pass1_score,pass2_score,ratio,kept} -- for
-    EVERY box, not just survivors, so a caller can inspect why a box was
-    kept/dropped (e.g. write it to cascade_verification.jsonl, or feed it to
-    aero_eyes.utils.viz.save_cascade_verification) instead of only seeing
-    the post-filter box count."""
+    INPUT box -- {x1,y1,x2,y2,pass1_score,pass2_score,ratio,zoom,kept} --
+    for EVERY box, not just survivors, so a caller can inspect why a box
+    was kept/dropped (e.g. write it to cascade_verification.jsonl, or feed
+    it to aero_eyes.utils.viz.save_cascade_verification) instead of only
+    seeing the post-filter box count."""
     from aero_eyes.utils.geometry import crop_with_pad
+
+    h, w = frame_bgr.shape[:2]
+    min_side = (min(h, w) / cfg_cascade.max_zoom) if cfg_cascade.max_zoom > 0 else 0.0
 
     kept = []
     for box in boxes:
-        crop = crop_with_pad(frame_bgr, box, cfg_cascade.pad_ratio)
+        crop = crop_with_pad(frame_bgr, box, cfg_cascade.pad_ratio, min_side=min_side)
         _, pass2_scores = detector.raw_boxes_and_scores(
             crop, text_prompt, box_threshold=0.0, text_threshold=detector.text_threshold,
         )
@@ -208,10 +222,12 @@ def cascade_verify_boxes(
         if keep:
             kept.append(box)
         if records is not None:
+            ch, cw = crop.shape[:2]
             records.append({
                 "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
                 "pass1_score": box.score, "pass2_score": pass2_score,
                 "ratio": (pass2_score / box.score) if box.score > 0 else None,
+                "zoom": (min(h, w) / min(ch, cw)) if min(ch, cw) > 0 else None,
                 "kept": keep,
             })
     return kept

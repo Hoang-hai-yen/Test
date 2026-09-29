@@ -3535,6 +3535,22 @@ class GDinoCascadeVerificationConfig(BaseModel):
     cosine_rescore/online_fusion (which check INSTANCE identity via a
     separate embedding model), not a replacement for either.
 
+    IMPORTANT confound (confirmed in practice, not just theoretical): the
+    HF Grounding DINO processor resizes WHATEVER it's given (the full frame
+    in Pass 1, the crop in Pass 2) to the model's own fixed input size. A
+    small box's crop is much smaller than the full frame, so it gets
+    magnified FAR more by that resize than the box was within the
+    full-frame Pass 1 -- e.g. a 40x40px box in a 3840px-wide frame sits at
+    roughly native resolution end-to-end in Pass 1, but a pad_ratio=0.5 crop
+    around it (~80x80px) resized to an ~800px input is magnified ~10x, i.e.
+    mostly INTERPOLATION, not genuine extra detail. That fake magnification
+    can inflate a confuser's score (upsampling smooths noisy/ambiguous
+    texture into something that reads as a more coherent shape) as easily
+    as it can a real target's -- observed on this project's own footage as
+    the OPPOSITE of the intended effect: true positives held their Pass-1
+    score while false positives' scores INCREASED under cascading. max_zoom
+    below exists specifically to cap this.
+
     Disabled by default -- run_stage123_gdino's boxes are used exactly as
     Pass 1 produced them, unchanged. NOT YET VALIDATED on this project's
     own footage.
@@ -3548,6 +3564,21 @@ class GDinoCascadeVerificationConfig(BaseModel):
     # Extra floor on the crop-pass score itself, independent of
     # min_score_ratio -- 0.0 (default) disables this second check.
     min_absolute_score: float = 0.0
+    # Caps the crop's effective magnification relative to Pass 1 -- see the
+    # IMPORTANT confound above. The processor's own fixed input size cancels
+    # out of the ratio (same processor, same target size, both passes), so
+    # the effective zoom reduces to a pure PIXEL-DIMENSION ratio:
+    # min(frame_h, frame_w) / min(crop_h, crop_w). cascade_verify_boxes
+    # grows the crop (via aero_eyes.utils.geometry.crop_with_pad's min_side
+    # argument, overriding pad_ratio whenever the two disagree) so this
+    # ratio never exceeds max_zoom, even for a tiny box that pad_ratio alone
+    # would leave heavily magnified. 0.0 disables the cap (pad_ratio alone
+    # decides crop size, the original -- confound-prone -- behavior). 6.0
+    # (default) is a heuristic starting point, NOT calibrated against this
+    # project's own footage -- tune against your own box-size distribution
+    # (a much larger max_zoom is fine if your boxes are rarely tiny relative
+    # to the frame; a smaller one may still be needed if they are).
+    max_zoom: float = 6.0
 
 
 # ---------------------------------------------------------------------------

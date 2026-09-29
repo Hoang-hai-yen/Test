@@ -160,14 +160,34 @@ def remap_box_from_tile(box: Box, tile: TileRect) -> Box:
 # Crop helper
 # ---------------------------------------------------------------------------
 
-def crop_with_pad(img_bgr, box: Box, pad_ratio: float = 0.1):
-    """Crop a padded region around box from img_bgr; returns BGR uint8 ndarray."""
+def crop_with_pad(img_bgr, box: Box, pad_ratio: float = 0.1, min_side: float = 0.0):
+    """Crop a padded region around box from img_bgr; returns BGR uint8 ndarray.
+    pad_ratio adds a fraction of the box's own width/height to EACH side.
+
+    min_side (optional, default 0.0 = no effect): additionally grows the pad
+    -- symmetrically, box stays centered -- so the crop's SHORTER dimension
+    is at least min_side px, overriding pad_ratio whenever the two disagree.
+    Exists for stage123_gdino.cascade_verification's max_zoom (see
+    GDinoCascadeVerificationConfig's own docstring, aero_eyes/config.py):
+    a pad_ratio-only crop around a tiny box stays tiny, and a downstream
+    model that resizes its input to a fixed size (e.g. Grounding DINO's own
+    HF processor) then magnifies that tiny crop FAR more than it magnified
+    the box within the full, un-cropped frame -- revealing mostly
+    interpolation artifacts, not genuine extra detail, which can inflate a
+    confuser's score as easily as a real target's. min_side lets a caller
+    floor the crop's absolute size to cap that extra magnification,
+    independent of pad_ratio."""
     import numpy as np
     h, w = img_bgr.shape[:2]
     bw = box.x2 - box.x1
     bh = box.y2 - box.y1
     px = bw * pad_ratio
     py = bh * pad_ratio
+    if min_side > 0:
+        deficit = min_side - min(bw + 2 * px, bh + 2 * py)
+        if deficit > 0:
+            px += deficit / 2
+            py += deficit / 2
     x1 = max(0, int(box.x1 - px))
     y1 = max(0, int(box.y1 - py))
     x2 = min(w, int(box.x2 + px))
