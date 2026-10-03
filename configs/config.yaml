@@ -1144,21 +1144,27 @@ stage123_geco2:
     # Replaces the generic score_threshold_abs in cosine_rescore mode.
     candidate_score_threshold_abs: 0.0
     candidate_topk_per_keyframe: 15
-    # Fuse overlapping candidate boxes of a keyframe (opt-in). union = parts of
-    # one object -> enclosing box (linked by containment, not IoU); wbf =
-    # Weighted Boxes Fusion of near-duplicates (iou_thresh must be < nms_iou).
-    # keep_originals=true appends the fused box so Stage 3's cosine can choose.
     # true = do not embed candidate crops here; needs stage3.recompute_candidate_features
     # (which re-embeds them anyway). See Geco2CosineRescoreConfig.skip_candidate_encoding.
     skip_candidate_encoding: false
-    candidate_fusion:
-      enabled: false
-      mode: union              # union | wbf
-      containment_thresh: 0.5  # union: intersection / smaller-box area
-      iou_thresh: 0.3          # wbf
-      min_boxes: 2
-      max_union_area_ratio: 4.0
-      keep_originals: true
+    # (candidate_fusion moved to stage123_geco2.candidate_fusion below -- the
+    # old cosine_rescore.candidate_fusion path is still accepted, with a warning.)
+  # Fuse overlapping boxes of a keyframe (opt-in), WITH OR WITHOUT
+  # cosine_rescore -- applied right after color_postfilter on both paths.
+  # union = parts of one object -> enclosing box (linked by containment, not
+  # IoU); wbf = Weighted Boxes Fusion of near-duplicates (iou_thresh must be
+  # < nms_iou). keep_originals: true = append the fused box (use WITH
+  # cosine_rescore, so Stage 3's cosine can choose); false = replace the parts
+  # with it (use WITHOUT cosine_rescore -- otherwise the fused box only ties
+  # its best member and Stage 4 keeps the original; a warning is logged).
+  candidate_fusion:
+    enabled: false
+    mode: union              # union | wbf
+    containment_thresh: 0.5  # union: intersection / smaller-box area
+    iou_thresh: 0.3          # wbf
+    min_boxes: 2
+    max_union_area_ratio: 4.0
+    keep_originals: true
   # Shrink each ref image before encoding as an exemplar, to narrow the
   # ground-to-aerial domain gap (close-up ref photos are otherwise much
   # crisper/larger-looking than the object as it actually appears in the

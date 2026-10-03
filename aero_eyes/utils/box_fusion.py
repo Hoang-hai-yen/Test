@@ -1,4 +1,4 @@
-"""Fusion of overlapping candidate boxes (cosine_rescore.candidate_fusion).
+"""Fusion of overlapping candidate boxes (stage123_geco2.candidate_fusion).
 
 Two modes, for two different situations:
 

@@ -5,6 +5,7 @@ Supports CLI overrides:  --set stage2.proposal_model=fastsam_s
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -12,6 +13,8 @@ from typing import Any, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, field_validator, model_validator
+
+log = logging.getLogger(__name__)
 
 # Pure infra escape-hatch for a known cuDNN issue seen on some GPU/driver
 # combos ("Unable to find a valid cuDNN algorithm to run convolution" /
@@ -2840,8 +2843,12 @@ class ColorPostfilterConfig(BaseModel):
 
 
 class CandidateFusionConfig(BaseModel):
-    """cosine_rescore.candidate_fusion -- fuse overlapping GeCo2 candidate boxes
-    of one keyframe (opt-in, off by default). See aero_eyes.utils.box_fusion.
+    """stage123_geco2.candidate_fusion -- fuse overlapping GeCo2 boxes of one
+    keyframe (opt-in, off by default). See aero_eyes.utils.box_fusion.
+    Independent of cosine_rescore: applied after the color postfilter in BOTH
+    the default path (run_stage123_geco2 -> detections.json) and the
+    cosine_rescore candidate path (run_stage12_geco2_candidates ->
+    candidates.json). Stage 4's GeCo2 re-detection does not fuse.
 
     mode "union": for an object detected as several PART boxes (a motorbike as
       wheel + handlebar + body boxes). Boxes are linked when the intersection
@@ -2857,11 +2864,17 @@ class CandidateFusionConfig(BaseModel):
       below it or nothing can be linked (a warning is logged).
 
     min_boxes: clusters smaller than this are left alone.
-    keep_originals: true (recommended) keeps the member boxes and APPENDS the
-      fused box (Stage 3's cosine against the reference then picks the best --
-      a whole-object crop should out-score a part crop); false replaces them.
-    Fused boxes are added AFTER candidate_topk_per_keyframe has been applied, so
-    they can push a keyframe above that count. NOT YET VALIDATED.
+    keep_originals: true keeps the member boxes and APPENDS the fused box;
+      false replaces the members with it. Which one to use depends on the path:
+        cosine_rescore path -- true (recommended): Stage 3's cosine against the
+          reference then picks the best (a whole-object crop should out-score
+          a part crop).
+        default path -- false: nothing re-scores the boxes there, and a union
+          box only TIES its best member's score, so with true Stage 4's
+          max-score pick always lands on the original member and fusion has no
+          effect on what gets tracked (a warning is logged).
+    Fused boxes are added AFTER the top-K cut has been applied, so they can push
+    a keyframe above that count. NOT YET VALIDATED.
     """
     enabled: bool = False
     mode: Literal["union", "wbf"] = "union"
@@ -2907,7 +2920,9 @@ class Geco2CosineRescoreConfig(BaseModel):
     # on the frame's BEST score only) and is ignored here.
     candidate_score_threshold_abs: float = 0.0
     candidate_topk_per_keyframe: int = 15
-    # Fuse overlapping candidate boxes (parts of one object -> a whole-object box) -- see CandidateFusionConfig.
+    # DEPRECATED location -- use stage123_geco2.candidate_fusion (applies with
+    # or without cosine_rescore). Still accepted: if this one is enabled and
+    # the new one isn't, Stage123Geco2Config copies it over (with a warning).
     candidate_fusion: CandidateFusionConfig = CandidateFusionConfig()
     # true: this stage does NOT embed the candidate crops (saves the whole
     # per-crop DINO pass and the model load) -- candidates.json is written with
@@ -3530,8 +3545,30 @@ class Stage123Geco2Config(BaseModel):
     #   use_shape_token=false, scale_calibration=true  -- path (2) fixed, path (1) removed
     use_shape_token: bool = True
     color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
+    # Fuse overlapping boxes of a keyframe (parts of one object -> a
+    # whole-object box), with or without cosine_rescore -- see
+    # CandidateFusionConfig.
+    candidate_fusion: CandidateFusionConfig = CandidateFusionConfig()
     cosine_rescore: Geco2CosineRescoreConfig = Geco2CosineRescoreConfig()
     global_adaptive_threshold: GlobalAdaptiveThresholdConfig = GlobalAdaptiveThresholdConfig()
+
+    @model_validator(mode="after")
+    def migrate_candidate_fusion(self) -> "Stage123Geco2Config":
+        """Old configs/CLI overrides set cosine_rescore.candidate_fusion; the
+        code only reads stage123_geco2.candidate_fusion now."""
+        old = self.cosine_rescore.candidate_fusion
+        if old.enabled and not self.candidate_fusion.enabled:
+            self.candidate_fusion = old.model_copy()
+            log.warning(
+                "stage123_geco2.cosine_rescore.candidate_fusion is deprecated -- using it as "
+                "stage123_geco2.candidate_fusion (which now applies with or without cosine_rescore)."
+            )
+        elif old.enabled:
+            log.warning(
+                "both stage123_geco2.candidate_fusion and the deprecated "
+                "stage123_geco2.cosine_rescore.candidate_fusion are enabled -- the latter is ignored."
+            )
+        return self
 
     @model_validator(mode="after")
     def check_scale_calibration(self) -> "Stage123Geco2Config":

@@ -1082,6 +1082,59 @@ def apply_color_postfilter(
     return kept
 
 
+def _check_fusion_cfg(fusion_cfg, nms_iou: float, sample_id: str, log_prefix: str, rescored: bool) -> None:
+    """Warn about stage123_geco2.candidate_fusion settings that can't do
+    anything. rescored: True on the cosine_rescore path (Stage 3's cosine
+    re-ranks the boxes afterwards), False on the default path."""
+    if fusion_cfg is None or not fusion_cfg.enabled:
+        return
+    if fusion_cfg.mode == "wbf" and fusion_cfg.iou_thresh >= nms_iou:
+        log.warning(
+            "[%s] %s: candidate_fusion mode=wbf with iou_thresh=%.2f >= nms_iou=%.2f -- "
+            "boxes have already been NMS'd at nms_iou, so no pair can exceed iou_thresh and "
+            "nothing will be fused. Lower iou_thresh (or raise stage123_geco2.nms_iou).",
+            log_prefix, sample_id, fusion_cfg.iou_thresh, nms_iou,
+        )
+    if not rescored and fusion_cfg.keep_originals:
+        log.warning(
+            "[%s] %s: candidate_fusion.keep_originals=true without cosine_rescore -- the fused "
+            "box only ties its best member's score and nothing re-ranks them, so Stage 4 keeps "
+            "picking the original member. Set candidate_fusion.keep_originals=false here to "
+            "replace the parts with the fused box.", log_prefix, sample_id,
+        )
+
+
+def _fuse_keyframe_boxes(boxes: list[Box], fusion_cfg, stats: dict | None) -> list[Box]:
+    """stage123_geco2.candidate_fusion for one keyframe (no-op when disabled);
+    stats accumulates counts for _log_fusion_summary."""
+    from aero_eyes.utils.box_fusion import fuse_overlapping_boxes
+
+    if fusion_cfg is None or not fusion_cfg.enabled:
+        return boxes
+    out = fuse_overlapping_boxes(boxes, fusion_cfg)
+    if stats is not None:
+        n_new = sum(1 for b in out if getattr(b, "fused", False))
+        stats["boxes_in"] = stats.get("boxes_in", 0) + len(boxes)
+        stats["fused"] = stats.get("fused", 0) + n_new
+        stats["frames_fused"] = stats.get("frames_fused", 0) + (1 if n_new else 0)
+        stats["frames"] = stats.get("frames", 0) + 1
+    return out
+
+
+def _log_fusion_summary(log_prefix: str, sample_id: str, fusion_cfg, stats: dict) -> None:
+    if fusion_cfg is None or not fusion_cfg.enabled:
+        return
+    n_fused = stats.get("fused", 0)
+    log.info(
+        "[%s] %s: candidate_fusion (mode=%s, keep_originals=%s): %d fused box(es) in %d/%d "
+        "keyframe(s), from %d detected box(es)%s",
+        log_prefix, sample_id, fusion_cfg.mode, fusion_cfg.keep_originals, n_fused, stats.get("frames_fused", 0),
+        stats.get("frames", 0), stats.get("boxes_in", 0),
+        "" if n_fused else " -- nothing was linked; see CandidateFusionConfig "
+        "(containment_thresh / max_union_area_ratio / iou_thresh)",
+    )
+
+
 def _finalize_keyframe_detections(
     frame_idx: int,
     frame_bgr: np.ndarray,
@@ -1091,15 +1144,20 @@ def _finalize_keyframe_detections(
     color_stats: list | None,
     viz_dir: Path,
     save_viz: bool,
+    fusion_cfg=None,
+    fusion_stats: dict | None = None,
 ) -> list[Detection]:
-    """Color postfilter + Detection wrapping + viz save -- the per-keyframe
-    tail shared by both the default (per-frame-relative) and
-    global_adaptive_threshold detection paths in run_stage123_geco2, so the
-    two paths can't silently drift apart on this shared bookkeeping."""
+    """Color postfilter + candidate_fusion + Detection wrapping + viz save --
+    the per-keyframe tail shared by both the default (per-frame-relative)
+    and global_adaptive_threshold detection paths in run_stage123_geco2, so
+    the two paths can't silently drift apart on this shared bookkeeping.
+    Same order as the cosine_rescore candidate path: color first, then
+    fusion (so a wrong-color part can't widen a fused box)."""
     from aero_eyes.utils import viz as vizmod
 
     if color_sig is not None:
         boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats)
+    boxes = _fuse_keyframe_boxes(boxes, fusion_cfg, fusion_stats)
     result_dets = [
         Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
         for b in boxes
@@ -1115,6 +1173,7 @@ def _finalize_keyframe_detections(
 def _run_geco2_default_pass(
     detector, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg,
     color_stats: list | None, viz_dir: Path, save_viz: bool, on_result=None,
+    fusion_cfg=None, fusion_stats: dict | None = None,
 ) -> dict[int, list[Detection]]:
     """One full sweep over the video's keyframes, detecting against
     whatever get_prototype() currently returns -- shared by
@@ -1135,6 +1194,7 @@ def _run_geco2_default_pass(
         boxes = detector.detect_frame(frame_bgr, get_prototype())
         result_dets = _finalize_keyframe_detections(
             frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
+            fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
         )
         detections[frame_idx] = result_dets
         log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
@@ -1206,6 +1266,10 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 
     color_stats: list[tuple[float, float, float]] | None = [] if color_sig is not None else None
 
+    fusion_cfg = cfg.stage123_geco2.candidate_fusion
+    _check_fusion_cfg(fusion_cfg, detector.nms_iou, sample_id, "Stage123-GeCo2", rescored=False)
+    fusion_stats: dict = {}
+
     gat_cfg = cfg.stage123_geco2.global_adaptive_threshold
     detections: dict[int, list[Detection]] = {}
     effective_threshold: float | None = None
@@ -1266,6 +1330,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
             )
             result_dets = _finalize_keyframe_detections(
                 frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
+                fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
             )
             detections[frame_idx] = result_dets
             log.debug("[Stage123-GeCo2] frame %d: %d detections", frame_idx, len(result_dets))
@@ -1283,7 +1348,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
         get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
         detections = _run_geco2_default_pass(
             detector, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
-            on_result=_offer_best,
+            on_result=_offer_best, fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
         )
         if dyn_proto_tracker is not None:
             dyn_proto_tracker.log_summary()
@@ -1313,14 +1378,17 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 )
                 frozen_prototype = dyn_proto_tracker.effective_prototype()
                 color_stats_pass2 = [] if color_sig is not None else None
+                fusion_stats = {}
                 detections = _run_geco2_default_pass(
                     detector, video_path, kf_indices, lambda: frozen_prototype,
                     color_sig, cpf_cfg, color_stats_pass2, viz_dir, save_viz,
+                    fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
                 )
                 color_stats = color_stats_pass2
 
     if color_stats:
         log_color_postfilter_stats("Stage123-GeCo2", sample_id, color_stats, cpf_cfg)
+    _log_fusion_summary("Stage123-GeCo2", sample_id, fusion_cfg, fusion_stats)
 
     # No single global threshold applies when global_adaptive_threshold is
     # disabled (GeCo2 thresholds relative to each frame's own max score) --
@@ -1357,6 +1425,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
 def _run_geco2_candidate_pass(
     detector, extractor, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg, cfg,
     on_result=None, viz_dir: Path | None = None, fusion_cfg=None, encode: bool = True,
+    fusion_stats: dict | None = None,
 ) -> dict[int, list[Detection]]:
     """One full sweep over the video's keyframes building candidates.json
     entries -- shared by run_stage12_geco2_candidates's pass 1 (online
@@ -1370,9 +1439,10 @@ def _run_geco2_candidate_pass(
     embedding: extractor may then be None and every candidate carries a 1-d zero
     placeholder feature (stage3.recompute_candidate_features replaces it).
 
-    fusion_cfg (a CandidateFusionConfig, from cosine_rescore.candidate_fusion),
+    fusion_cfg (a CandidateFusionConfig, stage123_geco2.candidate_fusion),
     when given and enabled, fuses each keyframe's overlapping boxes before
-    their features are extracted (see aero_eyes.utils.box_fusion).
+    their features are extracted (see aero_eyes.utils.box_fusion); counts go
+    into fusion_stats for _log_fusion_summary.
 
     viz_dir, when given, saves every keyframe that has at least one candidate
     (after the color postfilter) as viz_dir/frame_XXXXXX.jpg with each box
@@ -1380,11 +1450,9 @@ def _run_geco2_candidate_pass(
     cosine threshold/NMS/top-K (Stage 3 draws its own, filtered frames).
     """
     from aero_eyes.utils import viz as vizmod
-    from aero_eyes.utils.box_fusion import fuse_overlapping_boxes
     from aero_eyes.utils.video import frame_iterator
 
     candidates: dict[int, list[Detection]] = {}
-    n_fused_frames = n_fused_boxes = n_boxes_in = 0
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
@@ -1392,12 +1460,7 @@ def _run_geco2_candidate_pass(
         boxes = detector.detect_frame(frame_bgr, get_prototype())
         if color_sig is not None:
             boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
-        if fusion_cfg is not None and fusion_cfg.enabled:
-            n_boxes_in += len(boxes)
-            boxes = fuse_overlapping_boxes(boxes, fusion_cfg)
-            n_new = sum(1 for b in boxes if getattr(b, "fused", False))
-            n_fused_boxes += n_new
-            n_fused_frames += 1 if n_new else 0
+        boxes = _fuse_keyframe_boxes(boxes, fusion_cfg, fusion_stats)
 
         if not encode:
             feats = np.zeros((len(boxes), 1), dtype=np.float32)
@@ -1421,14 +1484,6 @@ def _run_geco2_candidate_pass(
             vizmod.save_stage2_keyframe(frame_bgr, boxes, None, frame_idx, viz_dir)
         if on_result is not None:
             on_result(frame_idx, frame_bgr, boxes, feats)
-    if fusion_cfg is not None and fusion_cfg.enabled:
-        log.info(
-            "[Stage12-GeCo2] candidate_fusion (mode=%s, keep_originals=%s): %d fused box(es) in %d/%d "
-            "keyframe(s), from %d detected box(es)%s",
-            fusion_cfg.mode, fusion_cfg.keep_originals, n_fused_boxes, n_fused_frames, len(candidates),
-            n_boxes_in, "" if n_fused_boxes else " -- nothing was linked; see CandidateFusionConfig "
-            "(containment_thresh / max_union_area_ratio / iou_thresh)",
-        )
     return candidates
 
 
@@ -1518,13 +1573,8 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
         )
     detector.score_threshold_abs = 0.0
     detector.score_threshold_box_abs = cr.candidate_score_threshold_abs
-    if cr.candidate_fusion.enabled and cr.candidate_fusion.mode == "wbf"             and cr.candidate_fusion.iou_thresh >= detector.nms_iou:
-        log.warning(
-            "[Stage12-GeCo2] %s: candidate_fusion mode=wbf with iou_thresh=%.2f >= nms_iou=%.2f -- "
-            "candidates have already been NMS'd at nms_iou, so no pair can exceed iou_thresh and "
-            "nothing will be fused. Lower iou_thresh (or raise stage123_geco2.nms_iou).",
-            sample_id, cr.candidate_fusion.iou_thresh, detector.nms_iou,
-        )
+    fusion_cfg = cfg.stage123_geco2.candidate_fusion
+    _check_fusion_cfg(fusion_cfg, detector.nms_iou, sample_id, "Stage12-GeCo2", rescored=True)
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
     color_sig = (
@@ -1593,9 +1643,11 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     cand_viz_dir = (
         work_dir / "viz" / "stage123_geco2" / "candidates" if cfg.runtime.save_visualizations else None
     )
+    fusion_stats: dict = {}
     candidates = _run_geco2_candidate_pass(
         detector, extractor, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, cfg,
-        on_result=_offer_best, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion, encode=not skip_encoding,
+        on_result=_offer_best, viz_dir=cand_viz_dir, fusion_cfg=fusion_cfg, encode=not skip_encoding,
+        fusion_stats=fusion_stats,
     )
     if dyn_proto_tracker is not None:
         dyn_proto_tracker.log_summary()
@@ -1625,12 +1677,14 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
                 # pass 2 replaces pass 1's candidates -- drop pass 1's frames so none go stale
                 for old in cand_viz_dir.glob("frame_*.jpg"):
                     old.unlink()
+            fusion_stats = {}
             candidates = _run_geco2_candidate_pass(
                 detector, extractor, video_path, kf_indices, lambda: frozen_prototype,
-                color_sig, cpf_cfg, cfg, viz_dir=cand_viz_dir, fusion_cfg=cr.candidate_fusion,
-                encode=not skip_encoding,
+                color_sig, cpf_cfg, cfg, viz_dir=cand_viz_dir, fusion_cfg=fusion_cfg,
+                encode=not skip_encoding, fusion_stats=fusion_stats,
             )
 
+    _log_fusion_summary("Stage12-GeCo2", sample_id, fusion_cfg, fusion_stats)
     _write_candidates_with_features(candidates, cand_path, placeholder_features=skip_encoding)
     detector.log_peak_contrast_summary(sample_id)
 

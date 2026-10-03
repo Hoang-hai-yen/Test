@@ -20,7 +20,7 @@ _COLORS = {
     "track": (0, 165, 255),  # orange
     "gt": (0, 0, 255),       # red
     "tile": (200, 200, 0),   # cyan-ish
-    "fused": (255, 0, 255),  # magenta -- a box made by cosine_rescore.candidate_fusion
+    "fused": (255, 0, 255),  # magenta -- a box made by stage123_geco2.candidate_fusion
     "reject": (0, 0, 255),   # red -- dropped by stage123_gdino.cascade_verification
 }
 
