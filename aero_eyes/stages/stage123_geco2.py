@@ -120,6 +120,140 @@ def _clip_box_to_canvas(box, canvas_px: int, sample_id: str, ref_idx: int, facto
     return clipped
 
 
+# ImageNet mean in BGR uint8: what GECO2's resize_and_pad zero padding of the
+# NORMALIZED tensor looks like once denormalized (GeCo2Detector._load_and_pad
+# normalizes before padding).
+_IMAGENET_MEAN_BGR = (0.406 * 255, 0.456 * 255, 0.485 * 255)
+
+
+def _video_frame_canvas(frame_bgr: np.ndarray, canvas_px: int) -> tuple[np.ndarray, tuple[int, int]]:
+    """A video frame put through the same geometry resize_and_pad gives every
+    query frame: longer side -> canvas_px (bilinear), top-left aligned, the
+    rest padded. Returns (canvas, (valid_h, valid_w)) -- the real-frame area."""
+    h, w = frame_bgr.shape[:2]
+    scale = canvas_px / float(max(h, w))
+    vw, vh = min(canvas_px, max(1, int(round(w * scale)))), min(canvas_px, max(1, int(round(h * scale))))
+    canvas = np.empty((canvas_px, canvas_px, 3), np.uint8)
+    canvas[:] = np.array(_IMAGENET_MEAN_BGR, np.float64).round().astype(np.uint8)
+    canvas[:vh, :vw] = cv2.resize(frame_bgr, (vw, vh), interpolation=cv2.INTER_LINEAR)
+    return canvas, (vh, vw)
+
+
+def _flattest_window(frame_canvas: np.ndarray, valid_hw: tuple[int, int], win_w: int, win_h: int):
+    """Top-left (x, y) of the win_w x win_h window inside the real-frame area
+    with the lowest mean gradient magnitude (Sobel), via an integral image.
+    Clipped pixels (any channel >= 250) count as maximally busy: blown-out
+    highlights have no gradient, but they are sunlit objects (e.g. white
+    sheets), not empty ground. None if the window does not fit."""
+    vh, vw = valid_hw
+    if win_w > vw or win_h > vh:
+        return None
+    real = frame_canvas[:vh, :vw]
+    gray = cv2.cvtColor(real, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0), cv2.Sobel(gray, cv2.CV_32F, 0, 1))
+    grad[real.max(axis=2) >= 250] = 1000.0
+    ii = cv2.integral(grad, sdepth=cv2.CV_64F)
+    sums = ii[win_h:, win_w:] - ii[:-win_h, win_w:] - ii[win_h:, :-win_w] + ii[:-win_h, :-win_w]
+    y, x = np.unravel_index(int(np.argmin(sums)), sums.shape)
+    return int(x), int(y)
+
+
+def _scaled_object_patch(
+    img: np.ndarray, mask: np.ndarray, tight_box, resize_ratio: float, feather_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The object's tight box from the reference photo scaled by resize_ratio
+    (INTER_AREA when shrinking) plus its mask as a feathered alpha in [0,1]."""
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(np.floor(tight_box[0]))), max(0, int(np.floor(tight_box[1])))
+    x2, y2 = min(w, int(np.ceil(tight_box[2]))), min(h, int(np.ceil(tight_box[3])))
+    crop, crop_mask = img[y1:y2, x1:x2], mask[y1:y2, x1:x2].astype(np.float32)
+    pw = max(1, int(round((x2 - x1) * resize_ratio)))
+    ph = max(1, int(round((y2 - y1) * resize_ratio)))
+    interp = cv2.INTER_AREA if resize_ratio < 1.0 else cv2.INTER_LINEAR
+    patch = cv2.resize(crop, (pw, ph), interpolation=interp)
+    alpha = cv2.resize(crop_mask, (pw, ph), interpolation=cv2.INTER_AREA if resize_ratio < 1.0 else cv2.INTER_LINEAR)
+    if feather_px > 0:
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=feather_px, borderType=cv2.BORDER_CONSTANT)
+    return patch, np.clip(alpha, 0.0, 1.0)
+
+
+def _paste_object_on_frame(
+    frame_canvas: np.ndarray, patch: np.ndarray, alpha: np.ndarray, x: int, y: int, feather_px: float,
+) -> np.ndarray:
+    """Composite `patch` (alpha) onto a copy of frame_canvas at (x, y). The
+    patch's box area of the frame is first swapped for a strongly blurred
+    copy (soft-edged, so it does not draw a rectangle) -- the pixels inside
+    the box but outside the object's mask are pooled by RoI-Align directly,
+    so they must not carry sharp frame structure such as a confuser. Parts
+    of the patch falling outside the canvas are dropped."""
+    out = frame_canvas.astype(np.float32)
+    H, W = out.shape[:2]
+    ph, pw = alpha.shape
+    cx1, cy1, cx2, cy2 = max(0, x), max(0, y), min(W, x + pw), min(H, y + ph)
+    if cx2 <= cx1 or cy2 <= cy1:
+        return frame_canvas.copy()
+    sigma = max(3.0, 0.5 * max(ph, pw))
+    pad = int(np.ceil(3 * sigma))
+    ox1, oy1, ox2, oy2 = max(0, cx1 - pad), max(0, cy1 - pad), min(W, cx2 + pad), min(H, cy2 + pad)
+    region = out[oy1:oy2, ox1:ox2]
+    blurred = cv2.GaussianBlur(region, (0, 0), sigmaX=sigma)
+    box_w = np.zeros(region.shape[:2], np.float32)
+    box_w[cy1 - oy1:cy2 - oy1, cx1 - ox1:cx2 - ox1] = 1.0
+    if feather_px > 0:
+        box_w = cv2.GaussianBlur(box_w, (0, 0), sigmaX=max(feather_px, 1.0))
+    region[:] = box_w[..., None] * blurred + (1.0 - box_w[..., None]) * region
+
+    a = alpha[cy1 - y:cy2 - y, cx1 - x:cx2 - x][..., None]
+    p = patch[cy1 - y:cy2 - y, cx1 - x:cx2 - x].astype(np.float32)
+    out[cy1:cy2, cx1:cx2] = a * p + (1.0 - a) * out[cy1:cy2, cx1:cx2]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _render_on_video_frame(
+    img: np.ndarray, mask: np.ndarray, tight_box, resize_ratio: float,
+    frame_canvas: np.ndarray, valid_hw: tuple[int, int], context_margin: float, feather_px: float,
+    log_ctx: str = "",
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """scale_calibration.background_source=video_frame: paste the object
+    (scaled by resize_ratio, feathered) at the flattest spot of the real
+    frame area; returns (canvas, object box in canvas px)."""
+    patch, alpha = _scaled_object_patch(img, mask, tight_box, resize_ratio, feather_px)
+    ph, pw = alpha.shape
+    win_w = int(round(pw * (1.0 + 2.0 * context_margin)))
+    win_h = int(round(ph * (1.0 + 2.0 * context_margin)))
+    loc = _flattest_window(frame_canvas, valid_hw, win_w, win_h)
+    if loc is None:
+        loc = _flattest_window(frame_canvas, valid_hw, pw, ph)
+        if loc is not None:
+            x, y = loc
+        else:
+            vh, vw = valid_hw
+            x, y = int(round((vw - pw) / 2.0)), int(round((vh - ph) / 2.0))
+            log.warning(
+                "[Stage123-GeCo2] %sscale_calibration video_frame: scaled object (%dx%d) does not fit the "
+                "real frame area (%dx%d) -- centered and clipped. Use a smaller scale.", log_ctx, pw, ph, vw, vh,
+            )
+    else:
+        x, y = loc[0] + (win_w - pw) // 2, loc[1] + (win_h - ph) // 2
+    canvas = _paste_object_on_frame(frame_canvas, patch, alpha, x, y, feather_px)
+    H, W = canvas.shape[:2]
+    box = (float(max(0, x)), float(max(0, y)), float(min(W, x + pw)), float(min(H, y + ph)))
+    return canvas, box
+
+
+def _object_px_resize_ratio(tight_box, expected_object_px, video_longer_dim: int,
+                            context_margin: float, canvas_px: int) -> float:
+    """scale_calibration.mode=object_px: the scale that makes the object (+
+    context_margin) occupy the same fraction of a canvas_px canvas as
+    expected_object_px does of the raw video frame."""
+    x1, y1, x2, y2 = tight_box
+    obj_size = max(x2 - x1, y2 - y1) * (1.0 + context_margin)
+    target_ratio = max(expected_object_px) / float(video_longer_dim)
+    if target_ratio <= 0:
+        raise ValueError("scale_calibration: expected_object_px / video frame size must be > 0")
+    return canvas_px / (obj_size / target_ratio)
+
+
 def _build_scale_calibrated_canvas(
     img: np.ndarray,
     mask: np.ndarray,
@@ -156,13 +290,7 @@ def _build_scale_calibrated_canvas(
     photo's own bounds are filled with the photo's mean color (there is no
     real pixel data out there, regardless of background_mode).
     """
-    x1, y1, x2, y2 = tight_box
-    obj_size = max(x2 - x1, y2 - y1) * (1.0 + context_margin)
-    target_ratio = max(expected_object_px) / float(video_longer_dim)
-    if target_ratio <= 0:
-        raise ValueError("scale_calibration: expected_object_px / video frame size must be > 0")
-    ideal_native_size = obj_size / target_ratio   # conceptual source-crop side, native px (can be huge)
-    resize_ratio = canvas_px / ideal_native_size    # scale applied while rendering into canvas_px
+    resize_ratio = _object_px_resize_ratio(tight_box, expected_object_px, video_longer_dim, context_margin, canvas_px)
     return _render_object_canvas(img, mask, tight_box, resize_ratio, background_mode, blur_sigma, canvas_px)
 
 
@@ -177,21 +305,26 @@ def _locate_video(cfg, sample_id: str) -> Path:
     return video_files[0]
 
 
-def _load_ref_images(cfg, sample_id: str) -> list:
-    data_root = Path(cfg.data.data_root)
-    refs_dir = data_root / sample_id / cfg.data.refs_subdir
+def list_ref_paths(refs_dir: Path, num_references: int) -> list[Path]:
+    """The reference-image files of one sample, in the order every consumer
+    uses (sorted, first num_references) -- shared with
+    scripts/precompute_ref_masks.py so precomputed masks line up by index."""
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     ref_paths = sorted(
         p for p in (refs_dir.iterdir() if refs_dir.is_dir() else [])
         if p.suffix.lower() in exts
     )
-    if len(ref_paths) < cfg.data.num_references:
+    if len(ref_paths) < num_references:
         raise FileNotFoundError(
-            f"Expected {cfg.data.num_references} reference images in {refs_dir}, "
+            f"Expected {num_references} reference images in {refs_dir}, "
             f"found {len(ref_paths)}."
         )
-    ref_paths = ref_paths[: cfg.data.num_references]
-    return [cv2.imread(str(p)) for p in ref_paths]
+    return ref_paths[:num_references]
+
+
+def _load_ref_images(cfg, sample_id: str) -> list:
+    refs_dir = Path(cfg.data.data_root) / sample_id / cfg.data.refs_subdir
+    return [cv2.imread(str(p)) for p in list_ref_paths(refs_dir, cfg.data.num_references)]
 
 
 def _save_mask_box_viz(ref_imgs: list[np.ndarray], raw_boxes: list, out_dir: Path) -> None:
@@ -423,6 +556,18 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                     else sc_cfg.expected_object_px[:1]
                 )
                 variants = [(f"_scale_{i}" if len(scales) > 1 else "", tuple(px)) for i, px in enumerate(scales)]
+            # scale_calibration.background_source=video_frame: paste onto the
+            # sample's video frame (same resize_and_pad geometry as queries)
+            # instead of the photo's own surroundings.
+            frame_canvas = valid_hw = None
+            if sc_cfg.background_source == "video_frame":
+                frame = read_frame(_locate_video(cfg, sample_id), sc_cfg.video_frame_index)
+                if frame is None:
+                    raise ValueError(
+                        f"scale_calibration.background_source=video_frame: could not read frame "
+                        f"{sc_cfg.video_frame_index} of {sample_id}'s video"
+                    )
+                frame_canvas, valid_hw = _video_frame_canvas(frame, g.image_size)
             num_orig_refs = len(ref_imgs)
             canvases, canvas_boxes, canvas_labels = [], [], []
             for ref_idx, (img, m, b) in enumerate(zip(ref_imgs, masks, raw_boxes)):
@@ -435,7 +580,15 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                     canvas_labels.append(f"ref_{ref_idx}")
                     continue
                 for suffix, value in variants:
-                    if sc_cfg.mode == "factor":
+                    if frame_canvas is not None:
+                        ratio = value if sc_cfg.mode == "factor" else _object_px_resize_ratio(
+                            b, value, video_longer_dim, sc_cfg.context_margin, g.image_size,
+                        )
+                        canvas, box_c = _render_on_video_frame(
+                            img, m, b, ratio, frame_canvas, valid_hw, sc_cfg.context_margin, sc_cfg.feather_px,
+                            log_ctx=f"{sample_id}: ref {ref_idx}: ",
+                        )
+                    elif sc_cfg.mode == "factor":
                         canvas, box_c = _render_object_canvas(
                             img, m, b, value, seg_cfg.background_mode, seg_cfg.blur_sigma,
                             canvas_px=g.image_size, antialias=True,
@@ -450,6 +603,14 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                     canvases.append(canvas)
                     canvas_boxes.append(box_c)
                     canvas_labels.append(f"ref_{ref_idx}{suffix}")
+            if frame_canvas is not None:
+                where = [f"{bx[2] - bx[0]:.0f}x{bx[3] - bx[1]:.0f}@({bx[0]:.0f},{bx[1]:.0f})"
+                         for bx in canvas_boxes if bx is not None]
+                log.info(
+                    "[Stage123-GeCo2] %s: scale_calibration background_source=video_frame (frame %d, "
+                    "feather_px=%.1f) -- object pasted at: %s", sample_id, sc_cfg.video_frame_index,
+                    sc_cfg.feather_px, ", ".join(where),
+                )
             if sc_cfg.mode == "factor":
                 sizes = [f"{bx[2] - bx[0]:.0f}x{bx[3] - bx[1]:.0f}" for bx in canvas_boxes if bx is not None]
                 log.info(

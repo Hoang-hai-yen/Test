@@ -1282,6 +1282,17 @@ stage123_geco2:
     #            on the object, NOT re-upscaled -> object = (its px in the ref
     #            photo) x factor. expected_object_px not needed.
     mode: object_px
+    # photo:       object keeps the ref photo's own surroundings (mean color
+    #              beyond the photo's edges) -- original behavior.
+    # video_frame: only the object's mask pixels (edges feathered by
+    #              feather_px) are pasted onto video frame video_frame_index
+    #              (0 = first frame), resized/padded like every query frame,
+    #              at the flattest spot of the frame; inside the box but
+    #              outside the mask the frame is strongly blurred so no
+    #              confuser detail leaks into the exemplar token.
+    background_source: photo
+    video_frame_index: 0
+    feather_px: 2.0
     # Expected apparent size(s) [width, height] in pixels of the object AS
     # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- estimate
     # from flight altitude/GSD, or eyeball it on a sample frame. Required

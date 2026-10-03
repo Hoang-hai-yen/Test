@@ -2342,12 +2342,32 @@ class ScaleCalibrationConfig(BaseModel):
         shot at different resolutions/distances. If the scaled object (+
         context_margin) is larger than the canvas, it is cropped to it and its
         box clipped (a warning is logged).
-    In both modes the rest of the canvas is the photo's own surroundings
-    (mean color beyond the photo's edges), and use_shape_token sees the
-    scaled box.
+    In both modes use_shape_token sees the scaled box.
+
+    background_source picks what surrounds the object on the canvas:
+      "photo" (default): the reference photo's own surroundings, mean color
+        beyond its edges -- the original behavior.
+      "video_frame": the sample video's frame `video_frame_index` (0 = first
+        frame, so still causal), put through the same resize_and_pad
+        geometry as every query frame (longer side -> image_size, padding
+        in ImageNet-mean color, which is what GECO2's zero padding of the
+        NORMALIZED tensor amounts to). Only the object's own pixels (its
+        mask, scaled, edges feathered by feather_px) are pasted, at the
+        flattest spot of the real frame area (lowest mean gradient over a
+        window of the box grown by context_margin on each side -- keeps the
+        paste off whatever objects/confusers the frame shows). Inside the
+        object's box but outside its mask -- pixels RoI-Align pools from
+        directly -- the frame is replaced by a strongly blurred copy (soft
+        edges), so no sharp frame structure leaks into the exemplar token.
+        If the scaled object does not fit the real frame area it is centered
+        and clipped (a warning is logged). Independent of domain_calibration
+        (still opt-in on its own). NOT YET VALIDATED.
     """
     enabled: bool = False
     mode: Literal["object_px", "factor"] = "object_px"
+    background_source: Literal["photo", "video_frame"] = "photo"
+    video_frame_index: int = 0
+    feather_px: float = 2.0
     # Expected apparent size(s) [width, height] in pixels of the object AS
     # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- e.g.
     # estimated from flight altitude/GSD, or eyeballed on a sample frame.
