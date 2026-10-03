@@ -257,6 +257,35 @@ def render_calibrated_ref(
     return canvas, (max(0.0, x1), max(0.0, y1), min(c, x2), min(c, y2))
 
 
+def render_calibrated_on_frame(
+    img: np.ndarray,
+    mask: np.ndarray,
+    box: tuple[float, float, float, float],
+    target_obj_px: float,
+    frame_canvas: np.ndarray,
+    valid_hw: tuple[int, int],
+    sc_cfg,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """--ref-canvas-bg video_frame: render_calibrated_ref's sizing (object's
+    longer side -> target_obj_px), but the object's MASK pixels are pasted
+    onto a video frame canvas instead of drawing the whole photo on its mean
+    color -- via inference's own _render_on_video_frame (flattest spot,
+    feathered alpha, optional blurred box surround), with feather_px /
+    context_margin / blur_box_surround read from the same
+    stage123_geco2.scale_calibration config, so train and inference render
+    exemplars identically. `frame_canvas`/`valid_hw` come from
+    _video_frame_canvas. Returns (canvas_bgr, object box on the canvas)."""
+    from aero_eyes.stages.stage123_geco2 import _render_on_video_frame
+
+    obj_px = max(box[2] - box[0], box[3] - box[1])
+    if obj_px <= 0 or target_obj_px <= 0:
+        raise ValueError(f"render_calibrated_on_frame: need positive sizes, got object {obj_px} target {target_obj_px}")
+    return _render_on_video_frame(
+        img, mask, box, target_obj_px / obj_px, frame_canvas, valid_hw,
+        sc_cfg.context_margin, sc_cfg.feather_px, blur_box_surround=sc_cfg.blur_box_surround,
+    )
+
+
 def apply_brightness_contrast(img: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
     """out = clip(img * contrast + brightness, 0, 255), matching OpenCV's
     own standard brightness/contrast convention. No-op fast path when both
@@ -311,6 +340,45 @@ def convert_gt_box_to_canvas(
     return padded, box_canvas, scale
 
 
+def load_precomputed_ref_masks(path: str | Path) -> tuple[dict, dict[str, np.ndarray]]:
+    """Read scripts/precompute_ref_masks.py output: `path` is its output dir
+    or the ref_masks.json inside it (ref_masks.npz must sit next to it).
+    Returns (index: sample_id -> [entry...], masks: hash -> bool mask)."""
+    import json
+
+    path = Path(path)
+    json_path = path / "ref_masks.json" if path.is_dir() else path
+    index = json.loads(json_path.read_text(encoding="utf-8"))
+    with np.load(json_path.with_suffix(".npz")) as npz:
+        masks = {k: npz[k].astype(bool) for k in npz.files}
+    return index, masks
+
+
+def precomputed_masks_for(
+    precomputed: tuple[dict, dict[str, np.ndarray]], video_id: str, ref_imgs: list[np.ndarray],
+) -> tuple[list[np.ndarray], list[tuple[float, float, float, float] | None]]:
+    """(masks, boxes) for one sample, in ref-image order. Boxes come from the
+    JSON entry (it may carry a --box-override), not the mask's bbox. Raises
+    if the sample is missing, the count differs, or a mask's shape does not
+    match its photo (stale masks / different photos)."""
+    index, masks = precomputed
+    entries = index.get(video_id)
+    if entries is None:
+        raise KeyError(f"precomputed ref masks have no entry for {video_id!r} -- rerun scripts/precompute_ref_masks.py")
+    if len(entries) != len(ref_imgs):
+        raise ValueError(f"{video_id}: {len(entries)} precomputed mask(s) for {len(ref_imgs)} reference image(s)")
+    out_masks, out_boxes = [], []
+    for e, img in zip(entries, ref_imgs):
+        m = masks[e["hash"]]
+        if m.shape != img.shape[:2]:
+            raise ValueError(f"{video_id}/{e['file']}: mask {m.shape} vs photo {img.shape[:2]} -- stale ref masks?")
+        if e.get("status") == "FALLBACK":
+            log.warning("%s/%s: precomputed mask is a whole-image FALLBACK", video_id, e["file"])
+        out_masks.append(m)
+        out_boxes.append(tuple(e["box"]) if e.get("box") is not None else None)
+    return out_masks, out_boxes
+
+
 class RefImageCache:
     """Precomputes, ONCE per video_id (not per training step): the 3
     native-resolution reference BGR images + their MobileSAM tight-box, via
@@ -322,8 +390,14 @@ class RefImageCache:
     does cheap array ops only -- see docs/GECO2_FINETUNE_PLAN.md point 4.
     """
 
-    def __init__(self, cfg, video_ids: list[str]):
+    def __init__(self, cfg, video_ids: list[str], ref_masks_path: str | Path | None = None):
         seg_cfg = cfg.stage123_geco2.segmentation
+        # ref_masks_path (scripts/precompute_ref_masks.py output dir, or its
+        # ref_masks.json): use those precomputed, eye-checked masks + boxes
+        # instead of running MobileSAM -- implies segmentation regardless of
+        # seg_cfg.enabled.
+        precomputed = load_precomputed_ref_masks(ref_masks_path) if ref_masks_path else None
+        use_masks = precomputed is not None or seg_cfg.enabled
         # Only construct MobileSAMSegmenter (which may attempt a weights
         # download) when segmentation is actually enabled -- mirrors
         # stage123_geco2.py::build_exemplar_prototype's own gating.
@@ -335,13 +409,17 @@ class RefImageCache:
             score_ratio_floor=seg_cfg.score_ratio_floor,
             max_border_touch_frac=seg_cfg.max_border_touch_frac,
             use_point_prompt=seg_cfg.use_point_prompt,
-        ) if seg_cfg.enabled else None
+        ) if seg_cfg.enabled and precomputed is None else None
         self._cache: dict[str, tuple[list[np.ndarray], list[tuple | None]]] = {}
+        self._masks: dict[str, list[np.ndarray] | None] = {}
         for video_id in video_ids:
             ref_imgs = _load_ref_images(cfg, video_id)
-            if seg_cfg.enabled:
-                masks = [segmenter.segment(img) for img in ref_imgs]
-                boxes = [mask_bbox(m) for m in masks]
+            if use_masks:
+                if precomputed is not None:
+                    masks, boxes = precomputed_masks_for(precomputed, video_id, ref_imgs)
+                else:
+                    masks = [segmenter.segment(img) for img in ref_imgs]
+                    boxes = [mask_bbox(m) for m in masks]
                 ref_imgs = [
                     apply_background_mode(img, m, seg_cfg.background_mode, seg_cfg.blur_sigma)
                     for img, m in zip(ref_imgs, masks)
@@ -366,10 +444,22 @@ class RefImageCache:
             else:
                 boxes = [None] * len(ref_imgs)
             self._cache[video_id] = (ref_imgs, boxes)
+            # Object masks, aligned with ref_imgs, for pasting onto a video
+            # frame (--ref-canvas-bg video_frame). Not kept under
+            # crop_to_object, whose crop would desync them from the images.
+            self._masks[video_id] = (
+                [np.asarray(m, dtype=bool) for m in masks]
+                if use_masks and not cfg.stage123_geco2.crop_to_object else None
+            )
         log.info("RefImageCache: precomputed %d reference set(s)", len(self._cache))
 
     def get(self, video_id: str) -> tuple[list[np.ndarray], list[tuple[float, float, float, float] | None]]:
         return self._cache[video_id]
+
+    def masks(self, video_id: str) -> list[np.ndarray] | None:
+        """Per-reference object masks (same order as get()), or None when no
+        segmentation/precomputed masks were used."""
+        return self._masks[video_id]
 
 
 @dataclass
@@ -436,6 +526,8 @@ class Geco2FinetuneDataset(Dataset):
         hard_frame_top: int = 50,
         ref_canvas_mode: str = "resize",
         calib_size_jitter: float = 1.0,
+        ref_canvas_bg: str = "photo",
+        bg_frame_index: int | None = None,
     ):
         if not video_ids:
             raise ValueError("video_ids must be non-empty")
@@ -458,6 +550,30 @@ class Geco2FinetuneDataset(Dataset):
         self.ref_canvas_mode = ref_canvas_mode
         self.calib_size_jitter = calib_size_jitter
         self.image_size = int(cfg.stage123_geco2.image_size)
+        # ref_canvas_bg (calibrated mode only):
+        #   "photo" (default): the photo on its own mean color (render_calibrated_ref).
+        #   "video_frame": the object's mask pasted onto a frame of the SAME
+        #     video (render_calibrated_on_frame) -- the training counterpart
+        #     of inference's scale_calibration.background_source=video_frame.
+        #     bg_frame_index None = a random ABSENT frame per step (never the
+        #     query frame; diversity for training); an int = always that frame
+        #     (validation: inference's video_frame_index). Needs object masks
+        #     (--ref-masks or segmentation); brightness/contrast then apply to
+        #     the object only, not the pasted-onto frame.
+        if ref_canvas_bg not in ("photo", "video_frame"):
+            raise ValueError(f"ref_canvas_bg must be 'photo' or 'video_frame', got {ref_canvas_bg!r}")
+        if ref_canvas_bg == "video_frame":
+            if ref_canvas_mode != "calibrated":
+                raise ValueError("ref_canvas_bg='video_frame' requires ref_canvas_mode='calibrated'")
+            missing = [v for v in video_ids if ref_cache.masks(v) is None]
+            if missing:
+                raise ValueError(
+                    f"ref_canvas_bg='video_frame' needs object masks, none for {missing} -- pass --ref-masks "
+                    "(scripts/precompute_ref_masks.py) or enable stage123_geco2.segmentation"
+                )
+        self.ref_canvas_bg = ref_canvas_bg
+        self.bg_frame_index = bg_frame_index
+        self.sc_cfg = cfg.stage123_geco2.scale_calibration
         self.cfg = cfg
         self.video_ids = list(video_ids)
         self.ref_cache = ref_cache
@@ -584,6 +700,25 @@ class Geco2FinetuneDataset(Dataset):
         self.rng keeps advancing and each epoch sees different frames)."""
         self.rng = np.random.default_rng(self.seed)
 
+    def _background_canvas(self, video_id: str, query_frame_idx: int) -> tuple[np.ndarray, tuple[int, int], int]:
+        """Frame to paste the references onto, resized/padded like a query:
+        bg_frame_index if set, else a random absent frame (any other frame if
+        the video has no absent one) that is not the query frame itself.
+        Returns (frame_canvas, valid_hw, frame index)."""
+        from aero_eyes.stages.stage123_geco2 import _video_frame_canvas
+
+        if self.bg_frame_index is not None:
+            idx = int(self.bg_frame_index)
+        else:
+            present, absent, total = self._pools[video_id]
+            pool = [f for f in absent if f != query_frame_idx] or [f for f in range(total) if f != query_frame_idx]
+            idx = int(self.rng.choice(pool))
+        frame = read_frame(self._video_paths[video_id], idx)
+        if frame is None:
+            raise ValueError(f"could not read background frame {idx} of {video_id}")
+        canvas, valid_hw = _video_frame_canvas(frame, self.image_size)
+        return canvas, valid_hw, idx
+
     def _sample_size_jitter(self) -> float:
         """Log-uniform factor in [1/calib_size_jitter, calib_size_jitter] (1.0 = none)."""
         if self.calib_size_jitter <= 1.0:
@@ -629,6 +764,10 @@ class Geco2FinetuneDataset(Dataset):
             self.absent_count += 1
 
         native_imgs, native_boxes = self.ref_cache.get(video_id)
+        ref_masks = self.ref_cache.masks(video_id)
+        bg = None
+        if self.ref_canvas_bg == "video_frame":
+            bg = self._background_canvas(video_id, frame_idx)
         ref_images: list[np.ndarray] = []
         ref_boxes: list[tuple[float, float, float, float] | None] = []
         ref_group_ids: list[int] = []
@@ -639,6 +778,22 @@ class Geco2FinetuneDataset(Dataset):
             for _ in range(self.num_ref_scale_variants):
                 if self.ref_canvas_mode == "calibrated":
                     target = self._canvas_obj_px[video_id] * self._sample_size_jitter()
+                    if bg is not None and box is not None:
+                        # Pasting onto a video frame: re-light only the
+                        # object; the real frame around it stays as the video
+                        # shows it.
+                        brightness, contrast = sample_brightness_contrast(
+                            self.rng, self.brightness_range, self.contrast_range,
+                        )
+                        frame_canvas, valid_hw, _ = bg
+                        lit = apply_brightness_contrast(img, brightness, contrast)
+                        canvas, out_box = render_calibrated_on_frame(
+                            lit, ref_masks[ref_idx], box, target, frame_canvas, valid_hw, self.sc_cfg,
+                        )
+                        ref_images.append(canvas)
+                        ref_boxes.append(out_box)
+                        ref_group_ids.append(ref_idx)
+                        continue
                     downscaled, out_box = render_calibrated_ref(img, box, target, self.image_size)
                 else:
                     factor = sample_ref_downscale_factor(self.rng, self.ref_downscale_lo, self.ref_downscale_hi)

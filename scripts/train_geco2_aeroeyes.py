@@ -133,6 +133,25 @@ def compute_step_loss(
     return main_loss + aux_loss
 
 
+def dump_ref_canvases(ds, n: int, out_dir: Path) -> None:
+    """Save the reference images (as the model will see them, object box in
+    green) of the first n samples of `ds`, then reset its RNG and counters so
+    the run is identical to one without the dump."""
+    import cv2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(min(n, len(ds))):
+        s = ds[i]
+        for j, (img, box) in enumerate(zip(s.ref_images, s.ref_boxes)):
+            vis = img.copy()
+            if box is not None:
+                x1, y1, x2, y2 = (int(round(v)) for v in box)
+                cv2.rectangle(vis, (x1 - 2, y1 - 2), (x2 + 1, y2 + 1), (0, 255, 0), 1)
+            cv2.imwrite(str(out_dir / f"{i:03d}_{s.video_id}_f{s.frame_idx}_ref{j}.jpg"), vis)
+    ds.reset_rng()
+    ds.present_count = ds.absent_count = ds.dynamic_exemplar_count = ds.hard_count = 0
+
+
 def loss_opts_from_args(args) -> LossOptions:
     return LossOptions(
         giou_weight=args.giou_weight, group_norm_ce=args.group_norm_ce, mask_gt_peaks=args.mask_gt_peaks,
@@ -344,9 +363,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "blur only, the object always fills the canvas. calibrated: draw the ref so the object "
                          "is as big on its canvas as the video's median GT object is on the query canvas "
                          "(times --calib-size-jitter), not re-upscaled -- the training counterpart of inference's "
-                         "stage123_geco2.scale_calibration.mode=factor. Reference photos are assumed cropped "
-                         "tight to the object (box = whole photo) unless segmentation is enabled. "
+                         "stage123_geco2.scale_calibration.mode=factor. The object box comes from --ref-masks "
+                         "(or live segmentation); without either the photo must be cropped tight (box = whole "
+                         "photo). "
                          "--ref-downscale-lo/hi and --val-ref-downscale are ignored in this mode.")
+    p.add_argument("--ref-canvas-bg", choices=["photo", "video_frame"], default="photo",
+                    help="calibrated mode only: what surrounds the object on the reference canvas. photo "
+                         "(default): the photo on its own mean color. video_frame: only the object's mask is "
+                         "pasted onto a frame of the same video, exactly as inference's "
+                         "stage123_geco2.scale_calibration.background_source=video_frame (same function; "
+                         "feather_px / blur_box_surround / context_margin from that config section). Train: a "
+                         "random absent frame per step; validation: scale_calibration.video_frame_index like "
+                         "inference. Needs --ref-masks (or segmentation).")
+    p.add_argument("--dump-ref-canvases", type=int, default=0,
+                    help="Before training, save the reference canvases of this many train and val samples "
+                         "(object box drawn in green) to <work_dir>/ref_canvases/ for checking by eye. "
+                         "The dataset RNGs are reset afterwards, so training is unaffected.")
+    p.add_argument("--ref-masks", default=None,
+                    help="Output dir (or ref_masks.json) of scripts/precompute_ref_masks.py: use those "
+                         "precomputed, eye-checked reference masks + tight boxes instead of running MobileSAM "
+                         "(works with stage123_geco2.segmentation.enabled=false). Boxes come from the JSON.")
     p.add_argument("--calib-size-jitter", type=float, default=1.0,
                     help="calibrated mode only: multiply the target object size by a log-uniform factor in "
                          "[1/J, J] per ref per step (e.g. 2.0 = x0.5..x2), so the model tolerates the "
@@ -520,7 +556,7 @@ def main():
         extra_freeze_prefixes=tuple(args.freeze_prefixes),
     )
 
-    ref_cache = RefImageCache(cfg, video_ids)
+    ref_cache = RefImageCache(cfg, video_ids, ref_masks_path=args.ref_masks)
 
     steps_per_epoch = args.dry_run_steps if args.dry_run else args.steps_per_epoch
     train_ds = Geco2FinetuneDataset(
@@ -535,8 +571,9 @@ def main():
         hard_frame_frac=args.hard_frame_frac, hard_frame_top=args.hard_frame_top,
         seed=args.seed,
         ref_canvas_mode=args.ref_canvas_mode, calib_size_jitter=args.calib_size_jitter,
+        ref_canvas_bg=args.ref_canvas_bg,
     )
-    val_steps = args.val_steps if args.val_steps > 0 else max(1, steps_per_epoch // 4)
+    val_steps =args.val_steps if args.val_steps > 0 else max(1, steps_per_epoch // 4)
     if args.val_augment:
         val_aug = dict(
             ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
@@ -554,8 +591,19 @@ def main():
     val_ds = Geco2FinetuneDataset(
         cfg, val_ids, ref_cache, steps_per_epoch=val_steps, p_present=args.p_present,
         num_ref_scale_variants=args.num_ref_scale_variants, seed=args.seed + 1,
-        ref_canvas_mode=args.ref_canvas_mode, **val_aug,
+        ref_canvas_mode=args.ref_canvas_mode, ref_canvas_bg=args.ref_canvas_bg,
+        bg_frame_index=cfg.stage123_geco2.scale_calibration.video_frame_index, **val_aug,
     )
+    if args.ref_canvas_bg == "video_frame":
+        sc = cfg.stage123_geco2.scale_calibration
+        log.info("Reference canvases: object pasted on a video frame (train: random absent frame; val: frame %d) "
+                 "feather_px=%.1f blur_box_surround=%s context_margin=%.2f", sc.video_frame_index,
+                 sc.feather_px, sc.blur_box_surround, sc.context_margin)
+    if args.dump_ref_canvases > 0:
+        out_dir = Path(cfg.project.work_dir) / "ref_canvases"
+        for name, ds in (("train", train_ds), ("val", val_ds)):
+            dump_ref_canvases(ds, args.dump_ref_canvases, out_dir / name)
+        log.info("Saved reference canvases of %d sample(s) per split to %s", args.dump_ref_canvases, out_dir)
     if args.ref_canvas_mode == "calibrated":
         clean_desc = "clean (ref calibrated to each video's median GT size, no other augmentation)"
     else:
