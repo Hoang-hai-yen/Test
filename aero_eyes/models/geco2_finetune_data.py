@@ -224,6 +224,39 @@ def _apply_query_downscale(img: np.ndarray, downscale_factor: float) -> np.ndarr
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+def render_calibrated_ref(
+    img: np.ndarray,
+    box: tuple[float, float, float, float] | None,
+    target_obj_px: float,
+    canvas_px: int,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """--ref-canvas-mode calibrated: the training-side counterpart of
+    inference's stage123_geco2.scale_calibration.mode=factor. Scales the
+    reference photo so the object's longer side is `target_obj_px` and draws
+    it AT THAT SIZE at the center of a `canvas_px` canvas (via the same
+    _render_object_canvas inference uses, antialiased), so resize_and_pad
+    leaves it as is -- unlike _apply_ref_downscale, whose shrink
+    resize_and_pad re-upscales away (blur only, no size change).
+
+    `box` is the object's box in `img`; None = the whole photo (reference
+    photos already cropped tight to the object, no segmentation needed).
+    Returns (canvas_bgr, object box on the canvas, clipped to it)."""
+    from aero_eyes.stages.stage123_geco2 import _render_object_canvas
+
+    h, w = img.shape[:2]
+    if box is None:
+        box = (0.0, 0.0, float(w), float(h))
+    obj_px = max(box[2] - box[0], box[3] - box[1])
+    if obj_px <= 0 or target_obj_px <= 0:
+        raise ValueError(f"render_calibrated_ref: need positive sizes, got object {obj_px} target {target_obj_px}")
+    mask = np.ones((h, w), dtype=bool)  # keep_real ignores it; whole photo stays real pixels
+    canvas, (x1, y1, x2, y2) = _render_object_canvas(
+        img, mask, box, target_obj_px / obj_px, "keep_real", 0.0, canvas_px, antialias=True,
+    )
+    c = float(canvas_px)
+    return canvas, (max(0.0, x1), max(0.0, y1), min(c, x2), min(c, y2))
+
+
 def apply_brightness_contrast(img: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
     """out = clip(img * contrast + brightness, 0, 255), matching OpenCV's
     own standard brightness/contrast convention. No-op fast path when both
@@ -401,11 +434,30 @@ class Geco2FinetuneDataset(Dataset):
         seed: int | None = None,
         hard_frame_frac: float = 0.0,
         hard_frame_top: int = 50,
+        ref_canvas_mode: str = "resize",
+        calib_size_jitter: float = 1.0,
     ):
         if not video_ids:
             raise ValueError("video_ids must be non-empty")
         if num_ref_scale_variants < 1:
             raise ValueError(f"num_ref_scale_variants must be >= 1, got {num_ref_scale_variants}")
+        if ref_canvas_mode not in ("resize", "calibrated"):
+            raise ValueError(f"ref_canvas_mode must be 'resize' or 'calibrated', got {ref_canvas_mode!r}")
+        if calib_size_jitter < 1.0:
+            raise ValueError(f"calib_size_jitter must be >= 1.0, got {calib_size_jitter}")
+        # "resize" (default, old behaviour): ref photo shrunk by a random
+        # ref_downscale_range factor, then re-upscaled by resize_and_pad --
+        # changes blur only, never the object's size on the canvas.
+        # "calibrated": render_calibrated_ref draws the ref so the object
+        # has the same canvas size as this video's (median) GT object on the
+        # query canvas, times a log-uniform factor in [1/jitter, jitter] --
+        # mirrors inference's scale_calibration.mode=factor, where the
+        # factor is chosen per video to match the object's apparent size.
+        # ref_downscale_range is ignored in this mode (the shrink itself is
+        # the detail loss).
+        self.ref_canvas_mode = ref_canvas_mode
+        self.calib_size_jitter = calib_size_jitter
+        self.image_size = int(cfg.stage123_geco2.image_size)
         self.cfg = cfg
         self.video_ids = list(video_ids)
         self.ref_cache = ref_cache
@@ -501,6 +553,20 @@ class Geco2FinetuneDataset(Dataset):
             self._video_paths[video_id] = video_path
             self._pools[video_id] = build_present_absent_pools(video_path, gt)
 
+        # Per video: median GT object size (longer side) on the QUERY canvas,
+        # i.e. after the frame's own resize_and_pad (longer side -> image_size).
+        self._canvas_obj_px: dict[str, float] = {}
+        if ref_canvas_mode == "calibrated":
+            for video_id in self.video_ids:
+                sizes = [max(b.x2 - b.x1, b.y2 - b.y1) for b in self._gt[video_id].values()]
+                if not sizes:
+                    raise ValueError(f"ref_canvas_mode=calibrated: video {video_id} has no GT box to size against")
+                info = video_info(self._video_paths[video_id])
+                longer = max(info["width"], info["height"])
+                self._canvas_obj_px[video_id] = float(np.median(sizes)) * self.image_size / longer
+            log.info("ref_canvas_mode=calibrated, median object px on the %d canvas: %s", self.image_size,
+                     {v: round(s, 1) for v, s in self._canvas_obj_px.items()})
+
         # Realized present/absent step counts -- log these per epoch since
         # steps_per_epoch redefines "epoch" as a fixed step count rather
         # than an exhaustive pass (sampling is video-uniform + Bernoulli,
@@ -517,6 +583,13 @@ class Geco2FinetuneDataset(Dataset):
         pass so val metrics compare epochs on an identical set (otherwise
         self.rng keeps advancing and each epoch sees different frames)."""
         self.rng = np.random.default_rng(self.seed)
+
+    def _sample_size_jitter(self) -> float:
+        """Log-uniform factor in [1/calib_size_jitter, calib_size_jitter] (1.0 = none)."""
+        if self.calib_size_jitter <= 1.0:
+            return 1.0
+        lim = float(np.log(self.calib_size_jitter))
+        return float(np.exp(self.rng.uniform(-lim, lim)))
 
     def record_hardness(self, video_id: str, frame_idx: int, is_present: bool, value: float) -> None:
         """Latest hardness of a frame (higher = harder); only used when hard_frame_frac > 0."""
@@ -564,8 +637,13 @@ class Geco2FinetuneDataset(Dataset):
             # re-sample this SAME ref image's degradation this many times,
             # instead of once -- see __init__'s own docstring for why.
             for _ in range(self.num_ref_scale_variants):
-                factor = sample_ref_downscale_factor(self.rng, self.ref_downscale_lo, self.ref_downscale_hi)
-                downscaled = _apply_ref_downscale(img, factor)
+                if self.ref_canvas_mode == "calibrated":
+                    target = self._canvas_obj_px[video_id] * self._sample_size_jitter()
+                    downscaled, out_box = render_calibrated_ref(img, box, target, self.image_size)
+                else:
+                    factor = sample_ref_downscale_factor(self.rng, self.ref_downscale_lo, self.ref_downscale_hi)
+                    downscaled = _apply_ref_downscale(img, factor)
+                    out_box = tuple(c * factor for c in box) if box is not None else None
                 # Brightness/contrast only changes pixel VALUES, never geometry --
                 # sampled independently per ref image, same as the downscale
                 # factor, but applied after it (order doesn't matter for a
@@ -575,7 +653,7 @@ class Geco2FinetuneDataset(Dataset):
                     self.rng, self.brightness_range, self.contrast_range,
                 )
                 ref_images.append(apply_brightness_contrast(downscaled, brightness, contrast))
-                ref_boxes.append(tuple(c * factor for c in box) if box is not None else None)
+                ref_boxes.append(out_box)
                 ref_group_ids.append(ref_idx)
 
         video_path = self._video_paths[video_id]

@@ -338,6 +338,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-ref-downscale", type=float, default=1.0,
                     help="Fixed reference-image downscale factor for clean validation (match the "
                          "inference stage123_geco2.ref_downscale_factor). Ignored with --val-augment.")
+    p.add_argument("--ref-canvas-mode", choices=["resize", "calibrated"], default="resize",
+                    help="How a reference photo becomes the 1024 canvas. resize (default, old behaviour): "
+                         "shrink by a random --ref-downscale-lo/hi factor, then resize_and_pad re-upscales it -- "
+                         "blur only, the object always fills the canvas. calibrated: draw the ref so the object "
+                         "is as big on its canvas as the video's median GT object is on the query canvas "
+                         "(times --calib-size-jitter), not re-upscaled -- the training counterpart of inference's "
+                         "stage123_geco2.scale_calibration.mode=factor. Reference photos are assumed cropped "
+                         "tight to the object (box = whole photo) unless segmentation is enabled. "
+                         "--ref-downscale-lo/hi and --val-ref-downscale are ignored in this mode.")
+    p.add_argument("--calib-size-jitter", type=float, default=1.0,
+                    help="calibrated mode only: multiply the target object size by a log-uniform factor in "
+                         "[1/J, J] per ref per step (e.g. 2.0 = x0.5..x2), so the model tolerates the "
+                         "inference factor being off. 1.0 = exact median size. Validation never jitters "
+                         "unless --val-augment.")
     p.add_argument("--skip-baseline-eval", action="store_true",
                     help="Skip the epoch-0 validation of the base checkpoint (the reference point that "
                          "tells whether finetuning helped at all).")
@@ -520,6 +534,7 @@ def main():
         num_ref_scale_variants=args.num_ref_scale_variants,
         hard_frame_frac=args.hard_frame_frac, hard_frame_top=args.hard_frame_top,
         seed=args.seed,
+        ref_canvas_mode=args.ref_canvas_mode, calib_size_jitter=args.calib_size_jitter,
     )
     val_steps = args.val_steps if args.val_steps > 0 else max(1, steps_per_epoch // 4)
     if args.val_augment:
@@ -530,16 +545,23 @@ def main():
             query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
             max_dynamic_exemplars=args.max_dynamic_exemplars,
             dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
+            calib_size_jitter=args.calib_size_jitter,
         )
     else:
+        # calibrated: each val video's ref drawn at exactly its median GT
+        # object size (no jitter) -- like a well-chosen inference factor.
         val_aug = dict(ref_downscale_range=(args.val_ref_downscale, args.val_ref_downscale))
     val_ds = Geco2FinetuneDataset(
         cfg, val_ids, ref_cache, steps_per_epoch=val_steps, p_present=args.p_present,
-        num_ref_scale_variants=args.num_ref_scale_variants, seed=args.seed + 1, **val_aug,
+        num_ref_scale_variants=args.num_ref_scale_variants, seed=args.seed + 1,
+        ref_canvas_mode=args.ref_canvas_mode, **val_aug,
     )
+    if args.ref_canvas_mode == "calibrated":
+        clean_desc = "clean (ref calibrated to each video's median GT size, no other augmentation)"
+    else:
+        clean_desc = f"clean (ref_downscale={args.val_ref_downscale}, no other augmentation)"
     log.info("Validation: %d fixed frame(s) per epoch, %s", val_steps,
-             "training augmentations" if args.val_augment else
-             f"clean (ref_downscale={args.val_ref_downscale}, no other augmentation)")
+             "training augmentations" if args.val_augment else clean_desc)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
                                collate_fn=finetune_collate, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
