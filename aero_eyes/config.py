@@ -2328,8 +2328,26 @@ class ScaleCalibrationConfig(BaseModel):
     which builds a synthetic canvas sized so the object occupies the same
     fraction of the canvas as it's expected to occupy in the query video
     frame after ITS OWN resize_and_pad.
+
+    mode picks HOW BIG the object is drawn on that canvas:
+      "object_px" (default): from expected_object_px (object size in the raw
+        video frame) -- the original behavior.
+      "factor": from stage123_geco2.ref_downscale_factor (or one canvas per
+        ref_downscale_levels entry): the reference photo is scaled by that
+        factor and drawn onto the image_size canvas AT THAT SIZE, centered on
+        the object -- NOT re-upscaled by resize_and_pad, which is what makes
+        plain ref_downscale_factor a no-op on size. expected_object_px is not
+        needed. Note the resulting object size is (object px in the reference
+        photo) x factor, so the same factor gives a different size for photos
+        shot at different resolutions/distances. If the scaled object (+
+        context_margin) is larger than the canvas, it is cropped to it and its
+        box clipped (a warning is logged).
+    In both modes the rest of the canvas is the photo's own surroundings
+    (mean color beyond the photo's edges), and use_shape_token sees the
+    scaled box.
     """
     enabled: bool = False
+    mode: Literal["object_px", "factor"] = "object_px"
     # Expected apparent size(s) [width, height] in pixels of the object AS
     # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- e.g.
     # estimated from flight altitude/GSD, or eyeballed on a sample frame.
@@ -2967,6 +2985,55 @@ class GlobalAdaptiveThresholdConfig(BaseModel):
     abs_floor: float = 0.15
 
 
+class Geco2OnlineAdaptiveThresholdConfig(BaseModel):
+    """stage123_geco2.online_adaptive_threshold -- causal, streaming-compatible
+    counterpart of global_adaptive_threshold above, on GeCo2's OWN score:
+    stage3.adaptive_threshold_online's design (running window, same
+    z_score/otsu/gmm dispatch via stage3.compute_adaptive_threshold) applied
+    one stage earlier, so the default geco2 path (no cosine_rescore) can
+    express "target absent this keyframe" without looking at future frames.
+
+    Per keyframe: the threshold is computed from the scores of STRICTLY
+    EARLIER keyframes only (a running window of the last `window` candidate
+    scores); this keyframe's own candidate scores are folded in only AFTER
+    its decision. Candidate scores = GeCo2's boxes after NMS + top-K
+    (topk_per_keyframe) with no score cut -- the same per-keyframe candidate
+    list stage3's online threshold sees, NOT the dense per-location score map
+    global_adaptive_threshold pools (thousands of points per frame would fill
+    any window within a single keyframe). With topk_per_keyframe=5, window=200
+    spans ~40 keyframes.
+
+    Cold start (fewer than min_samples scores observed): threshold = abs_floor.
+    abs_floor is also a floor on every later threshold.
+
+    combine_with_ratio: true (default) keeps the per-frame-relative
+    score_threshold_ratio cut too -- a box must clear BOTH max(online threshold,
+    ratio * frame max). With abs_floor=0 the cold-start keyframes then behave
+    exactly like the default path; afterwards the online threshold can only
+    remove boxes (including emptying a keyframe whose best box is ordinary
+    clutter). false = the online threshold alone decides (no ratio cut).
+    score_threshold_abs, NMS and top-K still apply either way.
+
+    Only the default path (run_stage123_geco2). Mutually exclusive with
+    global_adaptive_threshold (config error if both are enabled); no effect
+    with cosine_rescore (use stage3.adaptive_threshold_online there, on cosine)
+    and not used by Stage 4's GeCo2 re-detection. Compatible with
+    dynamic_prototype (each pass starts a fresh causal window). NOT YET
+    VALIDATED -- compare against the default path on recorded footage.
+    """
+    enabled: bool = False
+    window: int = 200
+    min_samples: int = 20
+    method: Literal["z_score", "otsu", "gmm"] = "z_score"
+    z_score: float = 1.0
+    robust: bool = False  # z_score method: median/MAD instead of mean/std
+    abs_floor: float = 0.0
+    combine_with_ratio: bool = True
+    otsu_bins: int = 256
+    gmm_min_separation_std: float = 1.5
+    gmm_fallback_percentile: float = 20.0
+
+
 class Geco2DynamicPrototypeTopKFusionConfig(BaseModel):
     """stage123_geco2.dynamic_prototype.topk_fusion -- ONLY wired into
     run_stage12_geco2_candidates (stage123_geco2.cosine_rescore.enabled=true)
@@ -3496,6 +3563,10 @@ class Stage123Geco2Config(BaseModel):
     # Applies whether or not segmentation.enabled -- with it off, shrinks
     # the RAW (unmasked) reference image instead of the masked/background-
     # filled/cropped one.
+    # Exception: with scale_calibration.enabled and scale_calibration.mode=
+    # "factor", this factor IS the scale the photo is drawn onto the canvas
+    # at (no re-upscale) -- see ScaleCalibrationConfig. It is ignored by
+    # scale_calibration.mode="object_px".
     ref_downscale_factor: float = 1.0
     # Multi-blur appearance-token ensemble (opt-in, config toggle since we
     # don't yet know if it helps): when set (non-empty), OVERRIDES
@@ -3509,8 +3580,8 @@ class Stage123Geco2Config(BaseModel):
     # matches a given query object's own apparent scale, instead of a
     # single hand-picked ref_downscale_factor that may only suit one
     # altitude/distance. null (default) = old single-factor behavior,
-    # unchanged. Combines with scale_calibration.multi_scale_mode="all" if
-    # both are enabled (their entries stack).
+    # unchanged. Under scale_calibration.mode="factor", one canvas per level
+    # (each drawn at that level's scale); ignored by mode="object_px".
     ref_downscale_levels: Optional[list[float]] = None
     # Crop each reference image to its MobileSAM tight mask box (expanded by
     # crop_context_margin) BEFORE resize_and_pad -- keeps 100% real pixels,
@@ -3551,6 +3622,16 @@ class Stage123Geco2Config(BaseModel):
     candidate_fusion: CandidateFusionConfig = CandidateFusionConfig()
     cosine_rescore: Geco2CosineRescoreConfig = Geco2CosineRescoreConfig()
     global_adaptive_threshold: GlobalAdaptiveThresholdConfig = GlobalAdaptiveThresholdConfig()
+    online_adaptive_threshold: Geco2OnlineAdaptiveThresholdConfig = Geco2OnlineAdaptiveThresholdConfig()
+
+    @model_validator(mode="after")
+    def check_adaptive_threshold_exclusive(self) -> "Stage123Geco2Config":
+        if self.online_adaptive_threshold.enabled and self.global_adaptive_threshold.enabled:
+            raise ValueError(
+                "stage123_geco2.online_adaptive_threshold and stage123_geco2.global_adaptive_threshold "
+                "are mutually exclusive (causal per-keyframe window vs. whole-video 2-pass) -- enable one."
+            )
+        return self
 
     @model_validator(mode="after")
     def migrate_candidate_fusion(self) -> "Stage123Geco2Config":
@@ -3573,12 +3654,17 @@ class Stage123Geco2Config(BaseModel):
     @model_validator(mode="after")
     def check_scale_calibration(self) -> "Stage123Geco2Config":
         if self.scale_calibration.enabled:
-            if not self.scale_calibration.expected_object_px:
+            if self.scale_calibration.mode == "object_px" and not self.scale_calibration.expected_object_px:
                 raise ValueError(
-                    "stage123_geco2.scale_calibration.enabled=true requires "
+                    "stage123_geco2.scale_calibration.enabled=true (mode=object_px) requires "
                     "stage123_geco2.scale_calibration.expected_object_px=[w,h] "
-                    "(estimated object size in the RAW video frame, pixels)."
+                    "(estimated object size in the RAW video frame, pixels) -- or use "
+                    "scale_calibration.mode=factor with stage123_geco2.ref_downscale_factor."
                 )
+            if self.scale_calibration.mode == "factor":
+                factors = self.ref_downscale_levels or [self.ref_downscale_factor]
+                if any(f <= 0 for f in factors):
+                    raise ValueError("scale_calibration.mode=factor needs ref_downscale_factor/levels > 0")
             if not self.segmentation.enabled:
                 raise ValueError(
                     "stage123_geco2.scale_calibration.enabled=true requires "

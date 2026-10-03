@@ -744,6 +744,40 @@ class GeCo2Detector:
             ref_points=ref_points, centerness=centerness,
         )
 
+    @torch.no_grad()
+    def detect_frame_online(
+        self, frame_bgr: np.ndarray, prototype: dict[str, torch.Tensor],
+        online_threshold: float, combine_with_ratio: bool = True,
+    ) -> tuple[list[Box], np.ndarray]:
+        """stage123_geco2.online_adaptive_threshold's per-keyframe step: ONE
+        forward pass that returns both (a) the boxes kept under
+        online_threshold (combined with score_threshold_ratio x frame max
+        when combine_with_ratio) and (b) the scores of this keyframe's full
+        candidate list -- NMS + top-K with no score cut -- for the caller to
+        feed into its running window AFTER deciding.
+
+        Thresholding after NMS/top-K keeps exactly the boxes thresholding
+        before it would: NMS only ever suppresses a box in favour of a
+        higher-scoring one, and the top-K of the whole candidate list
+        restricted to scores above a cut is the top-K of the scores above that
+        cut. score_threshold_abs (floor on the frame's max) still empties the
+        frame, but its candidates are still returned for the window."""
+        pred_boxes, box_v, scale, _, centerness, ref_points = self._forward_scores(frame_bgr, prototype)
+        if pred_boxes.numel() == 0:
+            return [], np.zeros(0, dtype=np.float32)
+        candidates = self.filter_boxes_by_threshold(
+            pred_boxes, box_v, scale, frame_bgr, float("-inf"),
+            ref_points=ref_points, centerness=centerness,
+        )
+        observed = np.array([b.score for b in candidates], dtype=np.float32)
+        max_score = float(box_v.max())
+        if max_score < self.score_threshold_abs:
+            return [], observed
+        threshold = float(online_threshold)
+        if combine_with_ratio:
+            threshold = max(threshold, max_score * self.score_threshold_ratio)
+        return [b for b in candidates if b.score > threshold], observed
+
     # ------------------------------------------------------------------
     # box_refine.method == "sam2_dense": GeCo2-native SAM2 mask refinement
     # ------------------------------------------------------------------

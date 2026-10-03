@@ -59,6 +59,67 @@ def _apply_ref_downscale(img, downscale_factor: float):
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
+def _render_object_canvas(
+    img: np.ndarray,
+    mask: np.ndarray,
+    tight_box: tuple[float, float, float, float],
+    resize_ratio: float,
+    background_mode: str,
+    blur_sigma: float,
+    canvas_px: int,
+    antialias: bool = False,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Draw the reference photo scaled by `resize_ratio` onto a `canvas_px`
+    x `canvas_px` canvas, with the object's box center at the canvas center
+    -- the canvas is already image_size, so GeCo2's resize_and_pad leaves it
+    as is. Pixels beyond the photo's own bounds get the photo's mean color.
+    antialias: shrink with INTER_AREA first (like _apply_ref_downscale) and
+    then only translate, instead of letting warpAffine's bilinear sampling
+    skip pixels on a strong shrink. Returns (canvas_bgr, object box in
+    canvas px -- may extend past the canvas if the scaled object is larger)."""
+    x1, y1, x2, y2 = tight_box
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    processed = apply_background_mode(img, mask, background_mode, blur_sigma)
+    bg_color = img.reshape(-1, 3).mean(axis=0)
+
+    sx = sy = float(resize_ratio)
+    affine_scale = float(resize_ratio)
+    if antialias and resize_ratio < 1.0:
+        h, w = processed.shape[:2]
+        nw, nh = max(1, int(round(w * resize_ratio))), max(1, int(round(h * resize_ratio)))
+        processed = cv2.resize(processed, (nw, nh), interpolation=cv2.INTER_AREA)
+        sx, sy = nw / w, nh / h
+        affine_scale = 1.0
+    half = canvas_px / 2.0
+    affine = np.array([
+        [affine_scale, 0.0, half - cx * sx],
+        [0.0, affine_scale, half - cy * sy],
+    ], dtype=np.float32)
+    canvas = cv2.warpAffine(
+        processed, affine, (canvas_px, canvas_px),
+        borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(float(c) for c in bg_color),
+    )
+    box_in_canvas = (
+        (x1 - cx) * sx + half, (y1 - cy) * sy + half,
+        (x2 - cx) * sx + half, (y2 - cy) * sy + half,
+    )
+    return canvas, box_in_canvas
+
+
+def _clip_box_to_canvas(box, canvas_px: int, sample_id: str, ref_idx: int, factor: float):
+    """scale_calibration.mode=factor: an object scaled larger than the canvas
+    only partly fits on it -- clip its RoI-Align box to the canvas and say so."""
+    x1, y1, x2, y2 = box
+    clipped = (max(0.0, x1), max(0.0, y1), min(float(canvas_px), x2), min(float(canvas_px), y2))
+    if clipped != (x1, y1, x2, y2):
+        log.warning(
+            "[Stage123-GeCo2] %s: scale_calibration mode=factor, ref %d at factor %g -- the scaled object "
+            "(%.0fx%.0f px) does not fit the %dpx canvas; its box was clipped. Use a smaller factor.",
+            sample_id, ref_idx, factor, x2 - x1, y2 - y1, canvas_px,
+        )
+    return clipped
+
+
 def _build_scale_calibrated_canvas(
     img: np.ndarray,
     mask: np.ndarray,
@@ -102,26 +163,7 @@ def _build_scale_calibrated_canvas(
         raise ValueError("scale_calibration: expected_object_px / video frame size must be > 0")
     ideal_native_size = obj_size / target_ratio   # conceptual source-crop side, native px (can be huge)
     resize_ratio = canvas_px / ideal_native_size    # scale applied while rendering into canvas_px
-
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    src_x1, src_y1 = cx - ideal_native_size / 2.0, cy - ideal_native_size / 2.0
-
-    processed = apply_background_mode(img, mask, background_mode, blur_sigma)
-    bg_color = img.reshape(-1, 3).mean(axis=0)
-    affine = np.array([
-        [resize_ratio, 0.0, -src_x1 * resize_ratio],
-        [0.0, resize_ratio, -src_y1 * resize_ratio],
-    ], dtype=np.float32)
-    canvas = cv2.warpAffine(
-        processed, affine, (canvas_px, canvas_px),
-        borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(float(c) for c in bg_color),
-    )
-
-    box_in_canvas = (
-        (x1 - src_x1) * resize_ratio, (y1 - src_y1) * resize_ratio,
-        (x2 - src_x1) * resize_ratio, (y2 - src_y1) * resize_ratio,
-    )
-    return canvas, box_in_canvas
+    return _render_object_canvas(img, mask, tight_box, resize_ratio, background_mode, blur_sigma, canvas_px)
 
 
 def _locate_video(cfg, sample_id: str) -> Path:
@@ -365,13 +407,22 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
             # its own appearance token AND, when use_shape_token, its own
             # shape token derived from that scale's own box size) -- see
             # ScaleCalibrationConfig.multi_scale_mode docstring.
-            video_path = _locate_video(cfg, sample_id)
-            info = video_info(video_path)
-            video_longer_dim = max(info["width"], info["height"])
-            scales = (
-                sc_cfg.expected_object_px if sc_cfg.multi_scale_mode == "all"
-                else sc_cfg.expected_object_px[:1]
-            )
+            # scale_calibration.mode picks the scale(s) each ref photo is
+            # drawn onto the canvas at -- see ScaleCalibrationConfig:
+            #   object_px: from expected_object_px (object size in the video)
+            #   factor:    ref_downscale_factor / ref_downscale_levels, as is
+            if sc_cfg.mode == "factor":
+                factors = list(g.ref_downscale_levels) if g.ref_downscale_levels else [g.ref_downscale_factor]
+                variants = [(f"_down_{f:g}" if len(factors) > 1 else "", f) for f in factors]
+            else:
+                video_path = _locate_video(cfg, sample_id)
+                info = video_info(video_path)
+                video_longer_dim = max(info["width"], info["height"])
+                scales = (
+                    sc_cfg.expected_object_px if sc_cfg.multi_scale_mode == "all"
+                    else sc_cfg.expected_object_px[:1]
+                )
+                variants = [(f"_scale_{i}" if len(scales) > 1 else "", tuple(px)) for i, px in enumerate(scales)]
             num_orig_refs = len(ref_imgs)
             canvases, canvas_boxes, canvas_labels = [], [], []
             for ref_idx, (img, m, b) in enumerate(zip(ref_imgs, masks, raw_boxes)):
@@ -383,21 +434,35 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                     canvas_boxes.append(None)
                     canvas_labels.append(f"ref_{ref_idx}")
                     continue
-                for scale_idx, expected_px in enumerate(scales):
-                    canvas, box_c = _build_scale_calibrated_canvas(
-                        img, m, b, tuple(expected_px), video_longer_dim,
-                        sc_cfg.context_margin, seg_cfg.background_mode, seg_cfg.blur_sigma,
-                        canvas_px=g.image_size,
-                    )
+                for suffix, value in variants:
+                    if sc_cfg.mode == "factor":
+                        canvas, box_c = _render_object_canvas(
+                            img, m, b, value, seg_cfg.background_mode, seg_cfg.blur_sigma,
+                            canvas_px=g.image_size, antialias=True,
+                        )
+                        box_c = _clip_box_to_canvas(box_c, g.image_size, sample_id, ref_idx, value)
+                    else:
+                        canvas, box_c = _build_scale_calibrated_canvas(
+                            img, m, b, value, video_longer_dim,
+                            sc_cfg.context_margin, seg_cfg.background_mode, seg_cfg.blur_sigma,
+                            canvas_px=g.image_size,
+                        )
                     canvases.append(canvas)
                     canvas_boxes.append(box_c)
-                    label = f"ref_{ref_idx}" if len(scales) == 1 else f"ref_{ref_idx}_scale_{scale_idx}"
-                    canvas_labels.append(label)
-            if len(scales) > 1:
+                    canvas_labels.append(f"ref_{ref_idx}{suffix}")
+            if sc_cfg.mode == "factor":
+                sizes = [f"{bx[2] - bx[0]:.0f}x{bx[3] - bx[1]:.0f}" for bx in canvas_boxes if bx is not None]
+                log.info(
+                    "[Stage123-GeCo2] %s: scale_calibration mode=factor -- %d ref image(s) x %d factor(s) %s "
+                    "= %d exemplar entries; object box on the %dpx canvas: %s",
+                    sample_id, num_orig_refs, len(variants), [v for _, v in variants], len(canvases),
+                    g.image_size, ", ".join(sizes),
+                )
+            elif len(variants) > 1:
                 log.info(
                     "[Stage123-GeCo2] %s: scale_calibration multi_scale_mode=all -- "
                     "%d ref image(s) x %d scale(s) = %d exemplar entries",
-                    sample_id, num_orig_refs, len(scales), len(canvases),
+                    sample_id, num_orig_refs, len(variants), len(canvases),
                 )
             if cfg.runtime.save_visualizations:
                 out_dir = work_dir / "viz" / "stage123_geco2" / "refs_scale_calibrated"
@@ -1082,6 +1147,78 @@ def apply_color_postfilter(
     return kept
 
 
+class Geco2OnlineAdaptiveThreshold:
+    """stage123_geco2.online_adaptive_threshold (see
+    Geco2OnlineAdaptiveThresholdConfig): stage3.OnlineAdaptiveThreshold's
+    contract on GeCo2's own score. threshold_for_next_frame() uses only the
+    scores observe()d at STRICTLY EARLIER keyframes; observe() is called with
+    a keyframe's candidate scores AFTER its own decision. The statistic itself
+    is stage3.compute_adaptive_threshold (z_score/otsu/gmm), fed this
+    detector's window through an adapter with stage3's field names."""
+
+    def __init__(self, oat_cfg):
+        from collections import deque
+        from types import SimpleNamespace
+
+        self.cfg = oat_cfg
+        self.history: deque = deque(maxlen=oat_cfg.window)
+        self._s3_view = SimpleNamespace(
+            adaptive_threshold_anchor_to_original_refs=False,
+            adaptive_threshold_method=oat_cfg.method,
+            adaptive_threshold_min_samples=oat_cfg.min_samples,
+            adaptive_threshold_robust=oat_cfg.robust,
+            adaptive_z_score=oat_cfg.z_score,
+            adaptive_min_floor=oat_cfg.abs_floor,
+            adaptive_otsu_bins=oat_cfg.otsu_bins,
+            adaptive_gmm_min_separation_std=oat_cfg.gmm_min_separation_std,
+            adaptive_gmm_fallback_percentile=oat_cfg.gmm_fallback_percentile,
+        )
+
+    def threshold_for_next_frame(self) -> tuple[float, str]:
+        if len(self.history) < self.cfg.min_samples:
+            return self.cfg.abs_floor, "online_cold_start"
+        from aero_eyes.stages.stage3 import compute_adaptive_threshold
+
+        scores = np.array(self.history, dtype=np.float64)
+        # "cosine" only selects compute_adaptive_threshold's floor branch:
+        # max(adaptive_min_floor (= abs_floor), raw threshold).
+        threshold, _, _, stat_label = compute_adaptive_threshold(scores, scores, "cosine", self._s3_view)
+        return threshold, f"online_{stat_label}"
+
+    def observe(self, frame_scores) -> None:
+        self.history.extend(np.atleast_1d(frame_scores).tolist())
+
+
+def _detect_keyframe(detector, frame_bgr, prototype, online, online_stats: dict | None) -> list[Box]:
+    """detector.detect_frame, or -- when stage123_geco2.online_adaptive_threshold
+    is on -- decide against the running window, then feed it this keyframe's
+    candidate scores."""
+    if online is None:
+        return detector.detect_frame(frame_bgr, prototype)
+    threshold, label = online.threshold_for_next_frame()
+    boxes, observed = detector.detect_frame_online(frame_bgr, prototype, threshold, online.cfg.combine_with_ratio)
+    online.observe(observed)
+    if online_stats is not None:
+        online_stats["frames"] = online_stats.get("frames", 0) + 1
+        online_stats["cold_start"] = online_stats.get("cold_start", 0) + (label == "online_cold_start")
+        online_stats["empty"] = online_stats.get("empty", 0) + (len(observed) > 0 and not boxes)
+        online_stats["last"] = (threshold, label)
+    return boxes
+
+
+def _log_online_threshold_summary(sample_id: str, oat_cfg, stats: dict) -> None:
+    if not stats:
+        return
+    thr, label = stats.get("last", (float("nan"), "n/a"))
+    log.info(
+        "[Stage123-GeCo2] %s: online_adaptive_threshold (method=%s, window=%d, min_samples=%d, "
+        "combine_with_ratio=%s) -- %d keyframe(s), %d in cold start, %d left EMPTY by the threshold; "
+        "final threshold=%.4f (%s)",
+        sample_id, oat_cfg.method, oat_cfg.window, oat_cfg.min_samples, oat_cfg.combine_with_ratio,
+        stats.get("frames", 0), stats.get("cold_start", 0), stats.get("empty", 0), thr, label,
+    )
+
+
 def _check_fusion_cfg(fusion_cfg, nms_iou: float, sample_id: str, log_prefix: str, rescored: bool) -> None:
     """Warn about stage123_geco2.candidate_fusion settings that can't do
     anything. rescored: True on the cosine_rescore path (Stage 3's cosine
@@ -1174,6 +1311,7 @@ def _run_geco2_default_pass(
     detector, video_path: Path, kf_indices: set, get_prototype, color_sig, cpf_cfg,
     color_stats: list | None, viz_dir: Path, save_viz: bool, on_result=None,
     fusion_cfg=None, fusion_stats: dict | None = None,
+    online_threshold: Geco2OnlineAdaptiveThreshold | None = None, online_stats: dict | None = None,
 ) -> dict[int, list[Detection]]:
     """One full sweep over the video's keyframes, detecting against
     whatever get_prototype() currently returns -- shared by
@@ -1191,7 +1329,7 @@ def _run_geco2_default_pass(
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
-        boxes = detector.detect_frame(frame_bgr, get_prototype())
+        boxes = _detect_keyframe(detector, frame_bgr, get_prototype(), online_threshold, online_stats)
         result_dets = _finalize_keyframe_detections(
             frame_idx, frame_bgr, boxes, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
             fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
@@ -1345,10 +1483,19 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 # frame's best (see its own NMS/top-K ordering).
                 dyn_proto_tracker.offer(frame_bgr, result_dets[0].box, frame_idx=frame_idx)
 
+        # stage123_geco2.online_adaptive_threshold (opt-in): causal running
+        # window on GeCo2's own score -- a fresh window per pass.
+        oat_cfg = cfg.stage123_geco2.online_adaptive_threshold
+        online_stats: dict = {}
+
+        def _new_online():
+            return Geco2OnlineAdaptiveThreshold(oat_cfg) if oat_cfg.enabled else None
+
         get_prototype = dyn_proto_tracker.effective_prototype if dyn_proto_tracker is not None else (lambda: prototype)
         detections = _run_geco2_default_pass(
             detector, video_path, kf_indices, get_prototype, color_sig, cpf_cfg, color_stats, viz_dir, save_viz,
             on_result=_offer_best, fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
+            online_threshold=_new_online(), online_stats=online_stats,
         )
         if dyn_proto_tracker is not None:
             dyn_proto_tracker.log_summary()
@@ -1379,12 +1526,16 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 frozen_prototype = dyn_proto_tracker.effective_prototype()
                 color_stats_pass2 = [] if color_sig is not None else None
                 fusion_stats = {}
+                online_stats = {}
                 detections = _run_geco2_default_pass(
                     detector, video_path, kf_indices, lambda: frozen_prototype,
                     color_sig, cpf_cfg, color_stats_pass2, viz_dir, save_viz,
                     fusion_cfg=fusion_cfg, fusion_stats=fusion_stats,
+                    online_threshold=_new_online(), online_stats=online_stats,
                 )
                 color_stats = color_stats_pass2
+        if oat_cfg.enabled:
+            _log_online_threshold_summary(sample_id, oat_cfg, online_stats)
 
     if color_stats:
         log_color_postfilter_stats("Stage123-GeCo2", sample_id, color_stats, cpf_cfg)
@@ -1575,6 +1726,12 @@ def run_stage12_geco2_candidates(cfg, sample_id: str) -> Path:
     detector.score_threshold_box_abs = cr.candidate_score_threshold_abs
     fusion_cfg = cfg.stage123_geco2.candidate_fusion
     _check_fusion_cfg(fusion_cfg, detector.nms_iou, sample_id, "Stage12-GeCo2", rescored=True)
+    if cfg.stage123_geco2.online_adaptive_threshold.enabled:
+        log.warning(
+            "[Stage12-GeCo2] %s: stage123_geco2.online_adaptive_threshold has no effect with "
+            "cosine_rescore (candidates are cut by Stage 3's cosine instead) -- use "
+            "stage3.adaptive_threshold_online for a causal threshold on this path.", sample_id,
+        )
 
     cpf_cfg = cfg.stage123_geco2.color_postfilter
     color_sig = (

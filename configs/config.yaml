@@ -1118,6 +1118,29 @@ stage123_geco2:
     abs_floor: 0.15
 
   # --------------------------------------------------------------------
+  # Causal (online) counterpart of global_adaptive_threshold, on GeCo2's own
+  # score -- stage3.adaptive_threshold_online's design one stage earlier.
+  # Keyframe N's threshold comes ONLY from the candidate scores of earlier
+  # keyframes (running window of the last `window` scores; each keyframe adds
+  # its NMS'd top-K candidate scores AFTER its own decision). Cold start
+  # (< min_samples scores) = abs_floor. combine_with_ratio: a box must clear
+  # max(online threshold, score_threshold_ratio * frame max) -- with
+  # abs_floor 0 the first keyframes behave like the default path, after that
+  # the threshold can also EMPTY a keyframe whose best box is ordinary
+  # clutter. Mutually exclusive with global_adaptive_threshold; default path
+  # only (no effect with cosine_rescore). NOT YET VALIDATED.
+  # --------------------------------------------------------------------
+  online_adaptive_threshold:
+    enabled: false
+    window: 200               # scores, not keyframes (~40 keyframes at topk_per_keyframe=5)
+    min_samples: 20
+    method: z_score           # z_score | otsu | gmm (stage3.compute_adaptive_threshold)
+    z_score: 1.0
+    robust: false             # z_score: median/MAD instead of mean/std
+    abs_floor: 0.0
+    combine_with_ratio: true
+
+  # --------------------------------------------------------------------
   # Optional extra matching pass inserted between GeCo2 detection and
   # Stage 4 tracking. When enabled, GeCo2 no longer decides detections.json
   # alone: it first produces a WIDER per-keyframe candidate set (using
@@ -1176,6 +1199,8 @@ stage123_geco2:
   # resize_and_pad always re-normalizes the whole image's longer side back
   # to image_size regardless of any uniform pre-shrink, so this only affects
   # blur/detail. Use scale_calibration below to fix apparent-size mismatch.
+  # Exception: with scale_calibration.mode=factor this IS the scale the photo
+  # is drawn onto the canvas at (no re-upscale) -- see scale_calibration.
   ref_downscale_factor: 1.0   # e.g. 0.125 = resize down to 1/8 size
   # Multi-blur appearance-token ensemble (opt-in -- config toggle since we
   # don't yet know if it helps): when set, OVERRIDES ref_downscale_factor
@@ -1251,6 +1276,12 @@ stage123_geco2:
   # --------------------------------------------------------------------
   scale_calibration:
     enabled: false
+    # object_px: object drawn at expected_object_px below (default).
+    # factor:    photo drawn at ref_downscale_factor (or one canvas per
+    #            ref_downscale_levels entry) onto the image_size canvas, centered
+    #            on the object, NOT re-upscaled -> object = (its px in the ref
+    #            photo) x factor. expected_object_px not needed.
+    mode: object_px
     # Expected apparent size(s) [width, height] in pixels of the object AS
     # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- estimate
     # from flight altitude/GSD, or eyeball it on a sample frame. Required
