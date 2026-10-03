@@ -1677,6 +1677,16 @@ stage123_geco2:
     is_high_vis_percentile: 80.0
     is_high_vis_hue_max: 35.0
     is_high_vis_min_value: 140.0
+    # histogram (everything above) | classifier (learned 4-group color
+    # classifier; replaces the histogram comparison -- see
+    # ColorPostfilterConfig.method in aero_eyes/config.py and
+    # docs/color_classifier_postfilter.md)
+    method: histogram
+    classifier_weights_path: runs/color_classifier/mnv4s_color4_beige_os8.pt
+    classifier_min_prob: 0.2
+    classifier_min_ref_confidence: 0.6
+    classifier_inset_ratio: 0.0
+    classifier_device: auto
 
 # ----------------------------------------------------------------------------
 # DAVE VERIFICATION -- infrastructure for DAVE's (arXiv:2404.16622) OWN
@@ -2254,6 +2264,12 @@ stage123_gdino:
     is_high_vis_percentile: 80.0
     is_high_vis_hue_max: 35.0
     is_high_vis_min_value: 140.0
+    method: classifier   # histogram | classifier -- see stage123_geco2.color_postfilter
+    classifier_weights_path: runs/color_classifier/mnv4s_color4_beige_os8.pt
+    classifier_min_prob: 0.2
+    classifier_min_ref_confidence: 0.6
+    classifier_inset_ratio: 0.0
+    classifier_device: auto
 
   # A SEPARATE, independent check reserved for keyframes where Grounding
   # DINO's own box scores are too close together to trust the ranking:
@@ -2277,6 +2293,74 @@ stage123_gdino:
     margin: 0.05
     pad_ratio: 0.1
     drop_margin: 0.05
+
+  # A SEPARATE color check from color_postfilter above (pure HSV
+  # histograms): zero-shot CLIP classification of each candidate against a
+  # small color-NAME vocabulary, compared to a MAJORITY-VOTE consensus
+  # built from the reference photos (not a single best-of-N match, and not
+  # raw image-image CLIP similarity -- both tried and rejected first, see
+  # GDinoClipColorConsensusConfig's own docstring, aero_eyes/config.py).
+  #
+  # EMPIRICALLY VALIDATED end-to-end on BlackBox_0's own real footage
+  # (1109 real candidate boxes across 534 keyframes from an actual run,
+  # scored against real GT): the 3 ref photos individually read
+  # black/orange/gray (one photo's orange carry handle briefly outscored
+  # its own black body), but top_k_per_ref=2 + min_votes=2 consensus
+  # correctly recovered {black, gray} and dropped orange (1/3 votes). At
+  # the resulting z_score=0.0 default below, this removed 60.6% of real
+  # false positives while losing only 5.3% of true positives (a loss
+  # expected to be recovered by Stage 4's own tracker on a briefly-dropped
+  # true target, not a bar to using this).
+  #
+  # Two things tried and REJECTED on this SAME real footage before landing
+  # on this design (kept as a record, don't re-try either without
+  # re-validating against real footage the same way):
+  #   - Gaussian blur / downscale-then-upscale preprocessing (motivated by
+  #     "lose small distracting detail, e.g. the orange handle"): never
+  #     actually fixed the ref photo's own orange misread even at heavy
+  #     blur, and ACTIVELY HARMED already-small (~75-85px) TP video crops
+  #     (surrounding grass color bled in through the blur kernel, flipping
+  #     correct "black" reads to "green"/"blue").
+  #   - A single fixed, hand-picked similarity threshold (e.g. bluntly
+  #     "0.24" from eyeballing a sweep table against this SAME run's own
+  #     GT): reproduces similar numbers to z_score=0.0 below by
+  #     COINCIDENCE for BlackBox_0 specifically, but has no principled
+  #     reason to transfer to a different reference object/color -- CLIP's
+  #     own per-color-word baseline varies across objects. Replaced by a
+  #     CAUSAL z-score against THIS VIDEO's own observed candidate-score
+  #     distribution (no GT needed, computable at real deployment time) --
+  #     see GDinoClipColorConsensusConfig's own "Online/causal" section.
+  #
+  # NOT YET VALIDATED on any sample OTHER than BlackBox_0. false (default)
+  # = disabled.
+  clip_color_consensus:
+    enabled: false
+    variant: vit-b/32   # vit-b/32 | vit-l/14
+    color_vocabulary:
+      - "a black object."
+      - "a white object."
+      - "a gray object."
+      - "a red object."
+      - "an orange object."
+      - "a yellow object."
+      - "a green object."
+      - "a blue object."
+      - "a purple object."
+      - "a brown object."
+    # Per ref photo, its own top_k_per_ref highest-scoring color labels
+    # are counted as votes; a label reaching min_votes (out of
+    # data.num_references photos) joins the consensus set. top_k_per_ref=1
+    # found ZERO consensus at all on BlackBox_0 (each ref's own top-1 pick
+    # was a different label) -- must be >1 for majority voting to work.
+    top_k_per_ref: 2
+    min_votes: 2
+    pad_ratio: 0.10
+    # Causal z-score threshold against this video's own observed candidate
+    # distribution -- NOT a fixed absolute similarity number (see the
+    # rejected-alternatives note above).
+    z_score: 0.0
+    window_size: 200
+    min_samples: 20
 
 # ----------------------------------------------------------------------------
 # IMPORTANT (measured on this project's 6 labeled samples, not just
@@ -2456,6 +2540,19 @@ stage123_pet_dino:
   default_text_prompt: ""
   text_prompts: {}
   prompt_file_name: prompt.txt
+  # Color post-filter on PET-DINO keyframe boxes AND Stage 4's PET-DINO
+  # re-detection. Same fields as stage123_geco2.color_postfilter (omitted
+  # histogram fields keep their defaults). Reference photos are segmented
+  # with stage1.segmentation. See docs/color_classifier_postfilter.md.
+  color_postfilter:
+    enabled: false
+    method: classifier   # histogram | classifier
+    classifier_weights_path: runs/color_classifier/mnv4s_color4_beige_os8.pt
+    classifier_min_prob: 0.2
+    classifier_min_ref_confidence: 0.6
+    classifier_inset_ratio: 0.0   # whole box -- measured best for the classifier
+    classifier_device: auto
+    reweight: false
 
 # ----------------------------------------------------------------------------
 # ACCURACY MODE — progressively enables domain-gap mitigations.

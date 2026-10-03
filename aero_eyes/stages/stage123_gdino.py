@@ -18,8 +18,9 @@ Flow:  text prompt (resolve_text_prompt)
 
 Reads:  cfg.data video (+ this sample's text prompt); also cfg.data
           refs_subdir's reference photos when color_postfilter.enabled OR
-          cosine_rescore/online_fusion.enabled (all opt-in, off by default
-          -- the base text-prompted path never touches them)
+          clip_color_consensus.enabled OR cosine_rescore/online_fusion.
+          enabled (all opt-in, off by default -- the base text-prompted
+          path never touches them)
 Writes: <work_dir>/<sample_id>/detections.json
         <work_dir>/<sample_id>/cascade_verification.jsonl (one line per
           Pass-1 box, only when stage123_gdino.cascade_verification.enabled
@@ -34,6 +35,10 @@ Writes: <work_dir>/<sample_id>/detections.json
           re-checked by CLIP because its Pass-1 score was tied with
           another box's, only when clip_tiebreak.enabled -- see
           clip_tiebreak_boxes's own docstring)
+        <work_dir>/<sample_id>/clip_color_consensus.jsonl (one line per
+          box scored against the ref photos' majority-vote CLIP color
+          consensus, only when clip_color_consensus.enabled -- see
+          clip_color_consensus_filter's own docstring)
 Viz:    <work_dir>/<sample_id>/viz/stage123_gdino/ (when save_visualizations=true)
         <work_dir>/<sample_id>/viz/stage123_gdino/cascade/ (Pass-1 vs Pass-2
           score per box, green=kept/red=dropped -- only when
@@ -41,6 +46,10 @@ Viz:    <work_dir>/<sample_id>/viz/stage123_gdino/ (when save_visualizations=tru
         <work_dir>/<sample_id>/viz/stage123_gdino/color/ (Hue+Sat/Value/
           effective similarity per box, green=kept/red=dropped -- only
           when color_postfilter.enabled AND save_visualizations=true)
+        <work_dir>/<sample_id>/viz/stage123_gdino/clip_color/ (CLIP color-
+          consensus similarity + causal z-score per box, green=kept/
+          red=dropped -- only when clip_color_consensus.enabled AND
+          save_visualizations=true)
 """
 from __future__ import annotations
 
@@ -298,6 +307,104 @@ def clip_tiebreak_boxes(
     return [b for b in boxes if id(b) not in dropped_ids]
 
 
+def build_clip_color_consensus(
+    clip_extractor, ref_imgs: list, cfg_color,
+) -> tuple[list[int], dict[int, int], list[list[str]]]:
+    """stage123_gdino.clip_color_consensus -- majority-vote color consensus
+    across the sample's reference photos, see GDinoClipColorConsensusConfig
+    's own docstring (aero_eyes/config.py) for the full empirical
+    rationale (why a majority vote across refs, not a single best-of-N
+    match or a raw image-image CLIP score).
+
+    For each ref photo, scores it against cfg_color.color_vocabulary via
+    CLIP zero-shot classification and takes its own top cfg_color.
+    top_k_per_ref labels as that photo's "votes." A label reaching
+    cfg_color.min_votes across the ref set becomes part of the returned
+    consensus (as indices into cfg_color.color_vocabulary) -- e.g. an
+    accent color only ONE reference photo's own CLIP reading happened to
+    lead with (confirmed in practice: a black object's orange carry
+    handle) gets outvoted by the other photos' correct black/gray reads,
+    instead of contaminating a single best-of-N match the way it would
+    have without this step.
+
+    Returns (consensus_idx, votes, per_ref_top_labels) -- votes is
+    {vocabulary_idx: vote_count} for every label that got at least one
+    vote (not just the ones that made consensus), and per_ref_top_labels
+    is each ref photo's own top_k_per_ref label STRINGS in order, purely
+    for logging/debugging (which photo voted for what)."""
+    vocab = cfg_color.color_vocabulary
+    text_feats = clip_extractor.encode_text(vocab)  # [V, D], L2-normalized
+    img_feats = clip_extractor.extract(ref_imgs, batch_size=len(ref_imgs))  # [R, D]
+    sims = img_feats @ text_feats.T  # [R, V]
+
+    votes: dict[int, int] = {}
+    per_ref_top: list[list[str]] = []
+    for row in sims:
+        order = np.argsort(row)[::-1][: cfg_color.top_k_per_ref]
+        per_ref_top.append([vocab[i] for i in order])
+        for i in order:
+            votes[int(i)] = votes.get(int(i), 0) + 1
+    consensus_idx = sorted(i for i, v in votes.items() if v >= cfg_color.min_votes)
+    return consensus_idx, votes, per_ref_top
+
+
+def clip_color_consensus_filter(
+    clip_extractor, text_feats: np.ndarray, consensus_idx: list[int], running_stats,
+    frame_bgr, boxes: list, cfg_color, records: list | None = None,
+) -> list:
+    """stage123_gdino.clip_color_consensus -- drops a candidate box whose
+    own best CLIP similarity against the CONSENSUS color set (see
+    build_clip_color_consensus) is a statistical outlier LOW relative to
+    this video's own observed candidate-score distribution so far. See
+    GDinoClipColorConsensusConfig's own docstring for the full empirical
+    validation (on BlackBox_0's real footage: 60.6% of real false
+    positives removed, 5.3% of true positives lost, at this function's
+    own default z_score=0.0) and for why the threshold is a CAUSAL
+    z-score against the video's own observed candidates, not a fixed
+    absolute similarity number (which does not generalize across
+    different reference objects/colors).
+
+    `text_feats` is cfg_color.color_vocabulary ALREADY encoded once via
+    clip_extractor.encode_text (doesn't change across keyframes -- callers
+    should encode it once, not per call, same convention as clip_tiebreak_
+    boxes's own `text_feat` argument). `running_stats` is a
+    CausalRunningStats the CALLER owns and reuses across keyframes (this
+    function only calls .z_score()/.observe() on it, in that order --
+    causality contract: THIS keyframe's own scores are folded in only
+    AFTER its own decision, so they can never influence their own
+    threshold, matching every other online-adaptive mechanism in this
+    project).
+
+    When `records` is given, appends one dict per INPUT box -- {x1,y1,x2,
+    y2,pass1_score,clip_consensus_score,z_score,kept} -- for EVERY box,
+    same "log/viz everything" convention as cascade_verify_boxes's own
+    `records` argument."""
+    from aero_eyes.utils.geometry import crop_with_pad
+
+    kept = []
+    raw_scores = []
+    for box in boxes:
+        crop = crop_with_pad(frame_bgr, box, cfg_color.pad_ratio)
+        img_feat = clip_extractor.extract([crop], batch_size=1)[0]
+        sims = img_feat @ text_feats.T
+        consensus_score = float(max(sims[i] for i in consensus_idx)) if consensus_idx else 0.0
+        raw_scores.append(consensus_score)
+
+        z = running_stats.z_score(consensus_score)
+        keep = z >= cfg_color.z_score
+        if keep:
+            kept.append(box)
+        if records is not None:
+            records.append({
+                "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
+                "pass1_score": box.score, "clip_consensus_score": consensus_score,
+                "z_score": z, "kept": keep,
+            })
+    if raw_scores:
+        running_stats.observe(raw_scores)  # AFTER every decision this keyframe -- causality
+    return kept
+
+
 def _locate_video(cfg, sample_id: str) -> Path:
     data_root = Path(cfg.data.data_root)
     video_dir = data_root / sample_id
@@ -365,6 +472,7 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
     cascade_cfg = cfg.stage123_gdino.cascade_verification
     cpf_cfg = cfg.stage123_gdino.color_postfilter
     tie_cfg = cfg.stage123_gdino.clip_tiebreak
+    ccc_cfg = cfg.stage123_gdino.clip_color_consensus
     online_threshold = GDinoOnlineAdaptiveThreshold(oat_cfg) if oat_cfg.enabled and not fusion_cfg.enabled else None
     if oat_cfg.enabled and fusion_cfg.enabled:
         log.warning(
@@ -433,11 +541,51 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
         clip_extractor = CLIPFeatureExtractor(variant=tie_cfg.variant, device=cfg.device())
         clip_text_feat = clip_extractor.encode_text([text_prompt])[0]
 
+    # Majority-vote CLIP color consensus (see GDinoClipColorConsensusConfig
+    # 's own docstring for the full empirical validation) -- reuses
+    # clip_tiebreak's own CLIP instance if it's already loaded with a
+    # matching variant, avoiding loading the model twice when both are
+    # enabled together.
+    ccc_extractor = ccc_text_feats = ccc_consensus_idx = ccc_running_stats = None
+    if ccc_cfg.enabled:
+        from aero_eyes.models.features import CLIPFeatureExtractor
+
+        if clip_extractor is not None and tie_cfg.variant == ccc_cfg.variant:
+            ccc_extractor = clip_extractor
+        else:
+            ccc_extractor = CLIPFeatureExtractor(variant=ccc_cfg.variant, device=cfg.device())
+        ccc_text_feats = ccc_extractor.encode_text(ccc_cfg.color_vocabulary)
+
+        import cv2
+
+        ref_paths = sorted(
+            p for p in (Path(cfg.data.data_root) / sample_id / cfg.data.refs_subdir).glob("*")
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        )[: cfg.data.num_references]
+        ref_imgs = [cv2.imread(str(p)) for p in ref_paths]
+        ccc_consensus_idx, ccc_votes, ccc_per_ref_top = build_clip_color_consensus(ccc_extractor, ref_imgs, ccc_cfg)
+        log.info(
+            "[Stage123-GDINO] %s: clip_color_consensus per-ref top-%d labels: %s -- votes: %s -- "
+            "consensus (>=%d votes): %s",
+            sample_id, ccc_cfg.top_k_per_ref, ccc_per_ref_top,
+            {ccc_cfg.color_vocabulary[i]: v for i, v in ccc_votes.items()}, ccc_cfg.min_votes,
+            [ccc_cfg.color_vocabulary[i] for i in ccc_consensus_idx],
+        )
+        if not ccc_consensus_idx:
+            log.warning(
+                "[Stage123-GDINO] %s: clip_color_consensus found NO consensus color (no label reached "
+                "min_votes=%d across %d ref photos) -- this gate will reject every candidate outright "
+                "until you lower min_votes or check the reference photos themselves.",
+                sample_id, ccc_cfg.min_votes, len(ref_imgs),
+            )
+        ccc_running_stats = CausalRunningStats(ccc_cfg.window_size, ccc_cfg.min_samples)
+
     detections: dict[int, list[Detection]] = {}
     cascade_records: list[dict] = []
     color_stats: list[tuple[float, float, float]] = []
     color_records: list[dict] = []
     clip_tiebreak_records: list[dict] = []
+    clip_color_records: list[dict] = []
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
@@ -484,6 +632,26 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
                 from aero_eyes.utils import viz as vizmod
                 vizmod.save_color_postfilter(
                     frame_bgr, frame_color_records, frame_idx, viz_dir / "color",
+                )
+        if ccc_cfg.enabled and boxes:
+            pre_n = len(boxes)
+            frame_ccc_records: list[dict] = []
+            boxes = clip_color_consensus_filter(
+                ccc_extractor, ccc_text_feats, ccc_consensus_idx, ccc_running_stats,
+                frame_bgr, boxes, ccc_cfg, records=frame_ccc_records,
+            )
+            for r in frame_ccc_records:
+                r["frame_idx"] = frame_idx
+            clip_color_records.extend(frame_ccc_records)
+            if len(boxes) != pre_n:
+                log.debug(
+                    "[Stage123-GDINO] frame %d: clip_color_consensus dropped %d/%d box(es)",
+                    frame_idx, pre_n - len(boxes), pre_n,
+                )
+            if save_viz:
+                from aero_eyes.utils import viz as vizmod
+                vizmod.save_clip_color_consensus(
+                    frame_bgr, frame_ccc_records, frame_idx, viz_dir / "clip_color",
                 )
         if cascade_cfg.enabled and boxes:
             pre_n = len(boxes)
@@ -550,20 +718,9 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
         )
 
     if cpf_cfg.enabled and color_stats:
-        arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim, overexposed_fraction
-        log.info(
-            "[Stage123-GDINO] %s: color_postfilter similarity stats over %d candidates "
-            "(min_similarity=%.2f) -- sim_hs p10/p50/p90=%.3f/%.3f/%.3f, "
-            "sim_v p10/p50/p90=%.3f/%.3f/%.3f, effective_sim p10/p50/p90=%.3f/%.3f/%.3f, "
-            "%% below min_similarity=%.1f%%, %% overexposed(>=%.0f%% clipped)=%.1f%%",
-            sample_id, len(color_stats), cpf_cfg.min_similarity,
-            *np.percentile(arr[:, 0], [10, 50, 90]),
-            *np.percentile(arr[:, 1], [10, 50, 90]),
-            *np.percentile(arr[:, 2], [10, 50, 90]),
-            100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
-            cpf_cfg.overexposure_ramp_frac * 100.0,
-            100.0 * float((arr[:, 3] >= cpf_cfg.overexposure_ramp_frac).mean()),
-        )
+        from aero_eyes.stages.stage123_geco2 import log_color_postfilter_stats
+
+        log_color_postfilter_stats("Stage123-GDINO", sample_id, color_stats, cpf_cfg)
 
     if cpf_cfg.enabled and color_records:
         import json
@@ -589,6 +746,19 @@ def run_stage123_gdino(cfg, sample_id: str) -> Path:
             "[Stage123-GDINO] %s: clip_tiebreak re-checked %d tied box(es) across the run, "
             "dropped %d -> %s",
             sample_id, len(clip_tiebreak_records), n_dropped, tie_log_path,
+        )
+
+    if ccc_cfg.enabled and clip_color_records:
+        import json
+
+        ccc_log_path = work_dir / "clip_color_consensus.jsonl"
+        with open(ccc_log_path, "w", encoding="utf-8") as f:
+            for r in clip_color_records:
+                f.write(json.dumps(r) + "\n")
+        n_dropped = sum(1 for r in clip_color_records if not r["kept"])
+        log.info(
+            "[Stage123-GDINO] %s: clip_color_consensus dropped %d/%d box(es) total -> %s",
+            sample_id, n_dropped, len(clip_color_records), ccc_log_path,
         )
 
     idf_cfg = cfg.stage123_gdino.isolated_detection_filter

@@ -573,6 +573,144 @@ class ColorSignature:
         self.is_high_vis = is_high_vis
 
 
+class ClassifierColorSignature:
+    """color_postfilter.method == "classifier": the reference object's color
+    GROUP according to a learned classifier (aero_eyes.models.
+    color_classifier), plus the classifier itself so apply_color_postfilter
+    can score candidates with the same model. `active` is False when the
+    reference's own group is too uncertain to filter against (see
+    ColorPostfilterConfig.classifier_min_ref_confidence) -- every candidate
+    is then kept."""
+
+    def __init__(self, classifier, ref_probs: np.ndarray, active: bool):
+        self.classifier = classifier
+        self.ref_probs = ref_probs
+        self.ref_group = int(ref_probs.argmax())
+        self.ref_group_name = classifier.group_names[self.ref_group]
+        self.ref_confidence = float(ref_probs.max())
+        self.active = active
+
+
+def _build_classifier_signature(cfg, sample_id: str, cpf, seg_cfg, log_prefix: str) -> ClassifierColorSignature:
+    """Classify each reference photo cropped to its segmentation mask's bbox
+    (+10% pad), then average the softmax over the photos. The background
+    inside that crop is kept as-is, NOT blacked out: black fill would pull
+    every reference toward the dark group, and the classifier was trained on
+    whole photos with natural backgrounds. Not cached to disk -- a few
+    MobileSAM + classifier passes over 3 photos are cheap."""
+    from aero_eyes.models.color_classifier import load_color_classifier
+
+    if not cpf.classifier_weights_path:
+        raise ValueError("color_postfilter.method='classifier' needs color_postfilter.classifier_weights_path")
+    clf = load_color_classifier(cpf.classifier_weights_path, cpf.classifier_device)
+
+    ref_imgs = _load_ref_images(cfg, sample_id)
+    crops = ref_imgs
+    if seg_cfg.enabled:
+        from aero_eyes.models.segmentation import build_segmenter
+        segmenter = build_segmenter(seg_cfg, cfg)
+        crops = []
+        for img in ref_imgs:
+            mask = segmenter.segment(img)
+            if mask is not None and mask.any():
+                ys, xs = np.nonzero(mask)
+                x1, x2, y1, y2 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+                px, py = int((x2 - x1) * 0.1), int((y2 - y1) * 0.1)
+                img = img[max(0, y1 - py):y2 + py, max(0, x1 - px):x2 + px]
+            crops.append(img)
+    else:
+        log.warning(
+            "[%s] %s: color_postfilter (classifier) with segmentation.enabled=false -- "
+            "classifying the WHOLE reference photos, background included.", log_prefix, sample_id,
+        )
+
+    per_ref = clf.predict_proba(crops, batch_size=cpf.classifier_batch_size)
+    ref_probs = per_ref.mean(axis=0)
+    sig = ClassifierColorSignature(clf, ref_probs, active=float(ref_probs.max()) >= cpf.classifier_min_ref_confidence)
+    log.info(
+        "[%s] %s: color_postfilter (classifier) reference group = %s (p=%.2f) [%s]; per photo: %s",
+        log_prefix, sample_id, sig.ref_group_name, sig.ref_confidence,
+        ", ".join(f"{g} {v:.2f}" for g, v in zip(clf.group_names, ref_probs)),
+        ", ".join(clf.group_names[i] for i in per_ref.argmax(axis=1)),
+    )
+    if not sig.active:
+        log.warning(
+            "[%s] %s: color_postfilter (classifier) reference group is ambiguous (p=%.2f < "
+            "classifier_min_ref_confidence=%.2f) -- keeping ALL candidates for this sample.",
+            log_prefix, sample_id, sig.ref_confidence, cpf.classifier_min_ref_confidence,
+        )
+    return sig
+
+
+def _apply_classifier_postfilter(
+    frame_bgr: np.ndarray, boxes: list[Box], color_sig: ClassifierColorSignature, cpf_cfg,
+    stats_out: list | None, records: list[dict] | None,
+) -> list[Box]:
+    """Keep a box iff P(box crop, inset by classifier_inset_ratio, is in the reference's group) >=
+    classifier_min_prob (every box when color_sig.active is False). All of
+    a keyframe's boxes are classified in one batch. stats_out gets
+    (nan, nan, p, nan) per box so it stays column-compatible with the
+    histogram path's (sim_hs, sim_v, effective_sim, overexposed_fraction)
+    -- see log_color_postfilter_stats."""
+    from aero_eyes.utils.geometry import crop_with_pad, inset_box
+
+    if not boxes:
+        return []
+    crops = [crop_with_pad(frame_bgr, inset_box(b, cpf_cfg.classifier_inset_ratio), pad_ratio=0.0) for b in boxes]
+    probs = color_sig.classifier.predict_proba(crops, batch_size=cpf_cfg.classifier_batch_size)
+    threshold = cpf_cfg.classifier_min_prob if color_sig.active else 0.0
+    names = color_sig.classifier.group_names
+    kept: list[Box] = []
+    for box, pr in zip(boxes, probs):
+        p = float(pr[color_sig.ref_group])
+        keep = p >= threshold
+        if stats_out is not None:
+            stats_out.append((float("nan"), float("nan"), p, float("nan")))
+        if records is not None:
+            records.append({
+                "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
+                "pass1_score": box.score, "method": "classifier",
+                "ref_group": color_sig.ref_group_name, "p_ref_group": p,
+                "pred_group": names[int(pr.argmax())], "probs": [round(float(v), 4) for v in pr],
+                "min_prob_used": threshold, "kept": keep,
+            })
+        if keep:
+            kept.append(Box(box.x1, box.y1, box.x2, box.y2, score=box.score * p) if cpf_cfg.reweight else box)
+    if cpf_cfg.reweight:
+        kept.sort(key=lambda b: b.score, reverse=True)
+    return kept
+
+
+def log_color_postfilter_stats(log_prefix: str, sample_id: str, color_stats: list, cpf_cfg) -> None:
+    """End-of-run summary of every candidate apply_color_postfilter scored
+    (stats_out tuples), for either method -- shared by the GeCo2, GDINO and
+    PET-DINO stages."""
+    if not color_stats:
+        return
+    arr = np.array(color_stats, dtype=float)  # sim_hs, sim_v, effective_sim (or p), overexposed_fraction
+    if cpf_cfg.method == "classifier":
+        log.info(
+            "[%s] %s: color_postfilter (classifier) over %d candidates -- p(ref group) "
+            "p10/p50/p90=%.3f/%.3f/%.3f, %% below classifier_min_prob=%.2f: %.1f%%",
+            log_prefix, sample_id, len(arr), *np.percentile(arr[:, 2], [10, 50, 90]),
+            cpf_cfg.classifier_min_prob, 100.0 * float((arr[:, 2] < cpf_cfg.classifier_min_prob).mean()),
+        )
+        return
+    log.info(
+        "[%s] %s: color_postfilter similarity stats over %d candidates "
+        "(min_similarity=%.2f) -- sim_hs p10/p50/p90=%.3f/%.3f/%.3f, "
+        "sim_v p10/p50/p90=%.3f/%.3f/%.3f, effective_sim p10/p50/p90=%.3f/%.3f/%.3f, "
+        "%% below min_similarity=%.1f%%, %% overexposed(>=%.0f%% clipped)=%.1f%%",
+        log_prefix, sample_id, len(arr), cpf_cfg.min_similarity,
+        *np.percentile(arr[:, 0], [10, 50, 90]),
+        *np.percentile(arr[:, 1], [10, 50, 90]),
+        *np.percentile(arr[:, 2], [10, 50, 90]),
+        100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
+        cpf_cfg.overexposure_ramp_frac * 100.0,
+        100.0 * float((arr[:, 3] >= cpf_cfg.overexposure_ramp_frac).mean()),
+    )
+
+
 def build_color_signature(
     cfg, sample_id: str, work_dir: Path, cpf_cfg, seg_cfg,
     cache_name: str = "color_signature.npz", log_prefix: str = "Stage123-GeCo2",
@@ -605,7 +743,13 @@ def build_color_signature(
     path without computing masks at all this run. Kept decoupled for
     simplicity; MobileSAM (ViT-tiny) is cheap relative to either detector's
     own backbone.
+
+    cpf_cfg.method == "classifier" returns a ClassifierColorSignature
+    instead (see _build_classifier_signature); cache_name is unused then.
     """
+    if cpf_cfg.method == "classifier":
+        return _build_classifier_signature(cfg, sample_id, cpf_cfg, seg_cfg, log_prefix)
+
     from aero_eyes.utils.color import (
         compute_hs_histogram, compute_is_high_vis, compute_mean_saturation, compute_mean_value,
         compute_value_histogram, histogram_similarity, lit_pixel_mask, saturation_value_confidence,
@@ -823,7 +967,14 @@ def apply_color_postfilter(
     called once per keyframe), reusing it via segment_box_cached() for
     every box -- same "encode once, reuse per box" pattern box_refine's
     own dense methods use.
+
+    cpf_cfg.method == "classifier" (color_sig is then a
+    ClassifierColorSignature) dispatches to _apply_classifier_postfilter;
+    `segmenter` is unused there.
     """
+    if cpf_cfg.method == "classifier":
+        return _apply_classifier_postfilter(frame_bgr, boxes, color_sig, cpf_cfg, stats_out, records)
+
     from aero_eyes.utils.color import (
         compute_hs_histogram, compute_is_high_vis, compute_overexposed_fraction, compute_value_histogram,
         histogram_similarity, hue_confidence_from_overexposure, lit_pixel_mask,
@@ -1169,20 +1320,7 @@ def run_stage123_geco2(cfg, sample_id: str) -> Path:
                 color_stats = color_stats_pass2
 
     if color_stats:
-        arr = np.array(color_stats)  # columns: sim_hs, sim_v, effective_sim, overexposed_fraction
-        log.info(
-            "[Stage123-GeCo2] %s: color_postfilter similarity stats over %d candidates "
-            "(min_similarity=%.2f) -- sim_hs p10/p50/p90=%.3f/%.3f/%.3f, "
-            "sim_v p10/p50/p90=%.3f/%.3f/%.3f, effective_sim p10/p50/p90=%.3f/%.3f/%.3f, "
-            "%% below min_similarity=%.1f%%, %% overexposed(>=%.0f%% clipped)=%.1f%%",
-            sample_id, len(color_stats), cpf_cfg.min_similarity,
-            *np.percentile(arr[:, 0], [10, 50, 90]),
-            *np.percentile(arr[:, 1], [10, 50, 90]),
-            *np.percentile(arr[:, 2], [10, 50, 90]),
-            100.0 * float((arr[:, 2] < cpf_cfg.min_similarity).mean()),
-            cpf_cfg.overexposure_ramp_frac * 100.0,
-            100.0 * float((arr[:, 3] >= cpf_cfg.overexposure_ramp_frac).mean()),
-        )
+        log_color_postfilter_stats("Stage123-GeCo2", sample_id, color_stats, cpf_cfg)
 
     # No single global threshold applies when global_adaptive_threshold is
     # disabled (GeCo2 thresholds relative to each frame's own max score) --

@@ -106,9 +106,35 @@ def save_color_postfilter(frame: np.ndarray, records: list[dict], frame_idx: int
     for r in records:
         box = Box(x1=r["x1"], y1=r["y1"], x2=r["x2"], y2=r["y2"])
         color = _COLORS["detect"] if r["kept"] else _COLORS["reject"]
-        label = f"hs={r['sim_hs']:.2f} v={r['sim_v']:.2f} eff={r['effective_sim']:.2f}"
+        if r.get("method") == "classifier":  # see stage123_geco2._apply_classifier_postfilter
+            label = f"{r['pred_group']} p({r['ref_group']})={r['p_ref_group']:.2f}"
+        else:
+            label = f"hs={r['sim_hs']:.2f} v={r['sim_v']:.2f} eff={r['effective_sim']:.2f}"
         draw_box(vis, box, label, color)
     cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_color.jpg"), vis)
+
+
+def save_clip_color_consensus(frame: np.ndarray, records: list[dict], frame_idx: int, out_dir: Path) -> None:
+    """stage123_gdino.clip_color_consensus (debug, gated by runtime.
+    save_visualizations): draws every candidate box labeled with its own
+    CLIP similarity against the reference photos' majority-vote color
+    consensus and the causal z-score that decided accept/reject -- green =
+    kept, red = dropped as a color outlier relative to this video's own
+    observed candidates so far -- so a rejection can be inspected visually
+    instead of only from clip_color_consensus.jsonl's raw numbers.
+    `records` is the list aero_eyes.stages.stage123_gdino.
+    clip_color_consensus_filter fills via its own `records` argument, one
+    dict per box: {x1,y1,x2,y2,pass1_score,clip_consensus_score,z_score,
+    kept}. No-op (still creates out_dir) if records is empty, e.g. no
+    boxes survived upstream filtering for this keyframe."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis = frame.copy()
+    for r in records:
+        box = Box(x1=r["x1"], y1=r["y1"], x2=r["x2"], y2=r["y2"])
+        color = _COLORS["detect"] if r["kept"] else _COLORS["reject"]
+        label = f"clip={r['clip_consensus_score']:.2f} z={r['z_score']:.2f}"
+        draw_box(vis, box, label, color)
+    cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}_clipcolor.jpg"), vis)
 
 
 def draw_frame_annotation(frame: np.ndarray, box: Box | None, source: str,

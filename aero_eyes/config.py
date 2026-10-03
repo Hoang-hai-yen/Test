@@ -2002,19 +2002,38 @@ class DetectionConfirmationConfig(BaseModel):
     # detection -- consecutive keyframes are keyframe_interval frames apart,
     # so a fast-moving object can fail the detection-vs-detection IoU even
     # though it is the same object. Agrees (IoU >= tracker_iou_threshold) ->
-    # accept + re-anchor at once, no second hit needed. Disagrees ->
-    # on_mismatch: "conf_compare" (higher stage-3 similarity between the
-    # track's anchoring detection and the new one wins; a tie keeps the
-    # track) or "hits" (keep tracking until required_hits consecutive
-    # keyframes disagree, then re-init from the latest). With no active
-    # track (first lock / after loss) the tracker is initialized straight
-    # from the keyframe detection -- no confirmation at all; the following
-    # keyframes then judge it by the rules above. Also fixes: with this
-    # off, a keyframe detection that is not yet confirmed deactivates the
-    # active track for that keyframe.
+    # accept and keep tracking AS-IS, no re-anchor (the tracker is already
+    # where it should be; re-running tracker.init() here would only risk a
+    # small discontinuity for no benefit). Disagrees -> on_mismatch decides:
+    #   "conf_compare": higher stage-3 similarity between the track's
+    #       anchoring detection and the new one wins; a tie keeps the track.
+    #   "hits": keep tracking until required_hits consecutive keyframes
+    #       disagree, then re-init from the latest.
+    #   "confirm_new_track": unconditional -- stop the old track (its
+    #       already-written history is left untouched either way) and start
+    #       a new one from this detection, since a single mismatch alone
+    #       can't say whether the new detection is the real target or a
+    #       confuser. That new track is itself UNCONFIRMED until it
+    #       survives its own next keyframe check (agrees there -> promoted,
+    #       same as any track that reaches "accept" above); if instead it
+    #       loses lock for ANY reason first -- another mismatch, a keyframe
+    #       with no detection, or plain confidence/age/re-verification
+    #       failure -- every frame written under it since its own init is
+    #       retroactively wiped back to absent, since nothing ever
+    #       independently corroborated it. Every OTHER kind of track start
+    #       (the very first lock, or any re-detect after full track loss)
+    #       is unconfirmed the exact same way under this mode too -- with
+    #       no active track to compare against yet there's nothing to trust
+    #       it over, so it is initialized straight from the detection like
+    #       the other two modes, but then must earn confirmation at its own
+    #       next keyframe just the same, and gets retroactively wiped the
+    #       same way if it doesn't. "conf_compare"/"hits" have no such
+    #       probation: the initial lock is trusted permanently with no
+    #       possibility of retroactive wipe, and subsequent mismatches never
+    #       erase history, only decide keep-vs-replace going forward.
     compare_with_tracker: bool = False
     tracker_iou_threshold: float = 0.3
-    on_mismatch: Literal["conf_compare", "hits"] = "conf_compare"
+    on_mismatch: Literal["conf_compare", "hits", "confirm_new_track"] = "conf_compare"
 
 
 class AbsenceCheckConfig(BaseModel):
@@ -2779,6 +2798,45 @@ class ColorPostfilterConfig(BaseModel):
     is_high_vis_percentile: float = 80.0
     is_high_vis_hue_max: float = 35.0
     is_high_vis_min_value: float = 140.0
+
+    # "histogram" (default): everything above. "classifier": a learned
+    # 4-group color classifier (aero_eyes/models/color_classifier.py,
+    # trained by scripts/train_color_classifier.py) REPLACES the histogram
+    # comparison -- the reference photos (cropped to their segmentation
+    # mask's bbox) give the reference's color group, and a candidate is
+    # kept iff P(candidate in that group) >= classifier_min_prob. In this
+    # mode every histogram knob above is ignored (bins, saturation/value
+    # ramps, overexposure, shadow filter, is_high_vis,
+    # candidate_segmentation, candidate_inset_ratio -- see
+    # classifier_inset_ratio); reweight still applies. Picked on
+    # public+private crops (scripts/eval_color_classifier_threshold.py):
+    # with mnv4s_color4_beige_os8.pt and classifier_inset_ratio=0,
+    # classifier_min_prob=0.2 kept 98.1% of GT crops (worst sample 92.7%)
+    # and dropped 16.7% of a PET-DINO run's non-GT boxes; 0.3 -> 97.5% /
+    # 90.0% / 21.9% -- crop-level numbers only, not yet validated by
+    # end-to-end ST-IoU.
+    method: Literal["histogram", "classifier"] = "histogram"
+    # Checkpoint written by scripts/train_color_classifier.py (relative
+    # paths resolve against the working directory). Required when
+    # method == "classifier".
+    classifier_weights_path: str | None = None
+    classifier_min_prob: float = 0.2
+    # Reference gate: if the reference photos' mean probability for their
+    # own top group is below this, the reference color is ambiguous (e.g. a
+    # multi-colored or out-of-palette object) and the filter keeps every
+    # candidate for this sample instead of filtering against a guess. All
+    # 16 public/private references scored >= 0.80 with
+    # mnv4s_color4_beige_os8.pt. 0.0 = always filter.
+    classifier_min_ref_confidence: float = 0.6
+    # Classifier-mode counterpart of candidate_inset_ratio (same meaning:
+    # fraction cut off EACH side of the box). 0.0 (whole box) measured best:
+    # unlike the histogram, the classifier was trained on whole photos with
+    # context and gets WORSE on tighter crops -- at classifier_min_prob=0.2
+    # the worst sample kept 92.7% of GT at 0.0 vs 88.0% at 0.15
+    # (CardboardBox_0).
+    classifier_inset_ratio: float = 0.0
+    classifier_device: str = "auto"  # auto | cuda | cpu
+    classifier_batch_size: int = 64
 
 
 class CandidateFusionConfig(BaseModel):
@@ -3761,6 +3819,119 @@ class GDinoClipTiebreakConfig(BaseModel):
     drop_margin: float = 0.05
 
 
+class GDinoClipColorConsensusConfig(BaseModel):
+    """stage123_gdino.clip_color_consensus -- a SEPARATE color check from
+    color_postfilter above (pure HSV histograms): zero-shot CLIP
+    classification of each candidate crop against a small color-NAME
+    vocabulary, compared to a MAJORITY-VOTE color consensus built from the
+    reference photos, instead of either (a) raw image-image CLIP cosine
+    similarity (rejected first -- CLIP's image embedding mixes shape/
+    texture/semantics/color, an image-image score isn't isolating color at
+    all) or (b) a single best-of-N-refs match (rejected second -- one
+    reference photo's own accent color, e.g. a black case's orange carry
+    handle, can dominate that ONE photo's own CLIP reading even though the
+    object is overwhelmingly black; matching against any single ref lets
+    that one bad reading pass a candidate a majority of refs would
+    reject). Building a CONSENSUS across all reference photos first
+    (which color labels get independently confirmed by >=min_votes of
+    them) filters out exactly that kind of single-photo accent-color
+    noise before ever looking at a candidate.
+
+    EMPIRICALLY VALIDATED end-to-end (not just each piece in isolation):
+    tested on BlackBox_0's own real footage (1109 real candidate boxes
+    across 534 keyframes from an actual run, scored against real GT) --
+    the 3 ref photos individually read black/orange/gray respectively
+    (one photo's orange handle briefly outscored its own black body), but
+    top_k_per_ref=2 + min_votes=2 consensus correctly recovered
+    {black, gray} and dropped orange (1/3 votes). At the resulting
+    z_score=0.0 default (see below), this removed 60.6% of the run's real
+    false positives while losing only 5.3% of true positives -- a loss
+    this option's own tracker recovery assumption (Stage 4 re-acquires a
+    briefly-dropped true target) is expected to absorb, not a bar to using
+    this at all. Higher z_score trades more TP loss for more FP removal
+    (z=1.0 in the same run: 88.9% FP removed, 16.7% TP lost) -- see
+    aero_eyes.stages.stage123_gdino.clip_color_consensus_filter's own
+    docstring for the exact swept numbers this default is based on.
+
+    Two REJECTED alternatives, kept here as a record of why (both explored
+    and ruled out on this SAME real footage before landing on the design
+    above, not just theoretical concerns):
+      - Gaussian blur / downscale-then-upscale preprocessing (motivated by
+        "lose small distracting detail, e.g. the orange handle, so CLIP
+        reads the dominant color"): tested at multiple strengths on both
+        the ref photos AND real video crops. Blur never actually fixed the
+        ref photo's own orange misread (orange still led even at very
+        heavy blur), and ACTIVELY HARMED already-small (~75-85px) TP video
+        crops -- surrounding grass color bled into the object through the
+        blur kernel, flipping several correct "black" reads to "green"/
+        "blue". Downscaling was gentler but inconsistent (helped at one
+        specific reduction factor, degraded further at a slightly more
+        aggressive one) -- not a reliable, generalizable lever. NOT wired
+        in anywhere; do not re-add blur/downscale preprocessing here
+        without re-validating on real footage the same way.
+      - A single fixed, hand-picked similarity threshold (e.g. bluntly
+        "0.24" from eyeballing a sweep table against this SAME run's own
+        GT): reproduces similar numbers to z_score=0.0 below BY
+        COINCIDENCE for BlackBox_0 specifically, but does not generalize
+        -- CLIP's own per-color-word baseline "attractiveness" varies
+        across different reference objects/colors (the same reason
+        SS11.8's person-bias calibration exists for the round/box case),
+        so a raw absolute number tuned on one sample's own GT has no
+        principled reason to transfer to a different sample. z_score
+        against THIS VIDEO's own observed candidate-score distribution
+        (no GT needed, computable at real deployment time) is the
+        adopted, generalizable replacement.
+
+    Online/causal, NOT a batch pass (matches GDinoOnlineAdaptiveThreshold's
+    own philosophy, live-feed compatible): the acceptance threshold is
+    mean(observed candidate clip_color_consensus scores so far this video)
+    + z_score*std(...), using aero_eyes.stages.stage123_gdino.
+    CausalRunningStats -- a keyframe's own scores are folded in only AFTER
+    its own decision (same causality contract as every other online-
+    adaptive mechanism in this project). Works even though most raw
+    candidates observed are themselves false positives (977/1109 in the
+    validation run, 88%) -- the RAW population mean already approximates a
+    background/FP-score estimate well enough without needing to know which
+    observed candidate was which, since FPs dominate the population by
+    sheer count in practice.
+
+    NOT YET VALIDATED on any sample OTHER than BlackBox_0 -- see this
+    class's own EMPIRICALLY VALIDATED note above for exactly what has and
+    hasn't been confirmed. z_score=0.0 (the mean itself, no margin) is a
+    conservative starting point; raise it if BlackBox_0's own FP-removal
+    rate undershoots what your other samples need, but re-validate rather
+    than assuming this exact number.
+    """
+    enabled: bool = False
+    variant: Literal["vit-b/32", "vit-l/14"] = "vit-b/32"
+    # One phrase per candidate color -- same lowercase-plus-trailing-period
+    # convention GroundingDinoDetector._normalize_prompt uses, passed
+    # directly to CLIP's own text tower (no normalization applied here).
+    color_vocabulary: list[str] = [
+        "a black object.", "a white object.", "a gray object.",
+        "a red object.", "an orange object.", "a yellow object.",
+        "a green object.", "a blue object.", "a purple object.", "a brown object.",
+    ]
+    # Per reference photo, its own top_k_per_ref highest-scoring color
+    # labels are counted as that photo's "votes." A label reaching
+    # min_votes (out of data.num_references photos, default 3) becomes
+    # part of the consensus set a candidate is compared against. Defaults
+    # (2, 2) are the exact values validated on BlackBox_0 -- top_k_per_ref=1
+    # (plain top-1 vote) found ZERO consensus at all on that sample (each
+    # of the 3 ref photos' own top-1 pick was a DIFFERENT label), so
+    # top_k_per_ref must be >1 for the majority-vote mechanism to have any
+    # chance of finding agreement.
+    top_k_per_ref: int = 2
+    min_votes: int = 2
+    pad_ratio: float = 0.10
+    # Causal z-score threshold against this video's own observed candidate
+    # score distribution (see this class's own "Online/causal" section
+    # above) -- NOT compared against a fixed absolute similarity number.
+    z_score: float = 0.0
+    window_size: int = 200
+    min_samples: int = 20
+
+
 # ---------------------------------------------------------------------------
 class Stage123GDinoConfig(BaseModel):
     """Only used when pipeline.detector == 'grounding_dino'. Requires
@@ -3938,9 +4109,99 @@ class Stage123GDinoConfig(BaseModel):
     # project's own footage.
     color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
     clip_tiebreak: GDinoClipTiebreakConfig = GDinoClipTiebreakConfig()
+    clip_color_consensus: GDinoClipColorConsensusConfig = GDinoClipColorConsensusConfig()
 
 
 # ---------------------------------------------------------------------------
+class Stage123PetDinoCalibrationConfig(BaseModel):
+    """stage123_pet_dino.dynamic_prototype.calibration -- how
+    calibrate_and_extract_pet_dino_base_embedding (aero_eyes/models/
+    pet_dino_detector.py) degrades this sample's own data.refs_subdir
+    reference photos before extracting the STARTING Visual-route
+    embedding. See that function's own docstring for the full rationale
+    (PET-DINO's Visual route measured notably weaker than Text on this
+    project's aerial footage, traced to a reference-photo-vs-video domain
+    gap) and _calibrated_blur_ksize's own docstring for exactly how blur
+    is derived from scale_factor.
+
+    scale_factor per reference image = sample_reference_size (this
+    sample's own median keyframe-detection box size, already computed by
+    stage4.py for box_refine.adaptive_context_margin) / that reference
+    image's own object size (from stage1.segmentation), clamped to
+    [min_scale_factor, max_scale_factor].
+    """
+    min_scale_factor: float = 0.02
+    max_scale_factor: float = 1.0
+    # Blur kernel (odd px) at max_scale_factor (barely shrunk) and at
+    # min_scale_factor (shrunk the most) respectively -- interpolated
+    # linearly for scale factors in between. 0 = no blur. Lowered from an
+    # earlier 7 after a visual inspection this session (LifeJacket_1):
+    # at the ~40-60px calibrated size scale_factor~0.02-0.04 produces,
+    # ksize=7 (~15-18% of the image's own dimension) smeared away nearly
+    # all internal structure (straps, buttons, collar outline), leaving
+    # only a soft color blob -- plausibly LESS discriminative against a
+    # same-colored confuser, not more. 3 keeps noticeably more shape.
+    blur_min_ksize: int = 0
+    blur_max_ksize: int = 3
+
+
+class Stage123PetDinoDynamicPrototypeConfig(BaseModel):
+    """stage123_pet_dino.dynamic_prototype -- PET-DINO's own online/
+    incremental visual-prototype adaptation. See
+    PetDinoDynamicPrototypeTracker's own docstring (aero_eyes/models/
+    pet_dino_detector.py) for the full design: why it reuses stage4's own
+    confirm_new_track "accept" event instead of a second consecutive-hit
+    gate, why the cross-check is cosine against the CURRENT effective
+    mean rather than a separate model, and why PET-DINO's own single-
+    mean-vector inference contract means this can't concatenate exemplar
+    tokens the way GeCo2DynamicPrototypeTracker's own equivalent does.
+
+    Motivating case here is stronger than GeCo2's own equivalent: this
+    session's own experiments found PET-DINO's Visual route notably
+    weaker than its Text route on this project's aerial footage
+    specifically because of a domain gap (studio/ground-level reference
+    photos vs. compressed aerial video) -- every accepted token is a REAL
+    crop from this exact video/domain, so growing the bank should close
+    some of that gap over the course of a video, not just guard against
+    noise the way GeCo2's own version primarily does.
+
+    STATUS: wired into a live decision as of this session. stage4.py's
+    confirm_new_track "accept" transition (Text-route detection spatially
+    agrees with the active tracker) now treats PetDinoDynamicPrototypeTracker
+    .offer()'s own verdict as a SECOND, independent gate: cosine >=
+    cross_check_cosine_floor against the current effective embedding ->
+    accept as before; cosine < floor -> veto the detection as a visual
+    false positive (same wipe-if-unconfirmed path confirm_new_track's own
+    mismatch case already uses, plus a forced tracker_active=False so the
+    next keyframe starts a clean re-detect rather than re-trusting the
+    just-rejected box). Text-route detection on its own only checks
+    spatial/motion agreement with the tracker, never appearance -- this
+    is the first point anything checks whether the crop actually LOOKS
+    like the target. stage123_pet_dino's own per-keyframe detections.json
+    build and stage4's re-detect-after-loss fallback both stay Text-only
+    (unaffected by this).
+
+    Only takes effect when pipeline.detector == "pet_dino" AND stage4
+    manages to build a starting embedding via
+    calibrate_and_extract_pet_dino_base_embedding (needs at least one
+    reference image under data.refs_subdir and at least one successful
+    extraction) -- silently disabled (logged once) otherwise, same
+    "missing prerequisite degrades gracefully" convention this project's
+    other optional dynamic-prototype-style features (verify_interval,
+    stage123_geco2.dynamic_prototype) already use.
+    """
+    enabled: bool = False
+    label_id: int = 1
+    # Raised from an earlier 16: the bank saturates (FIFO-rotates) well
+    # before a typical sample's keyframe count exhausts, so the effective
+    # "memory" only ever covers a short recent window -- more slots let
+    # it retain a wider spread of the video's own appearance variation
+    # (viewing angle, lighting) instead of just the last ~16 accepts.
+    max_tokens: int = 24
+    cross_check_cosine_floor: float = 0.5
+    calibration: Stage123PetDinoCalibrationConfig = Stage123PetDinoCalibrationConfig()
+
+
 class Stage123PetDinoConfig(BaseModel):
     """Only used when pipeline.detector == 'pet_dino'. PET-DINO (Fu et al.,
     arXiv:2604.00503, CVPR 2026 Highlight) -- "Unifying Visual Cues into
@@ -3964,11 +4225,35 @@ class Stage123PetDinoConfig(BaseModel):
     https://github.com/fuweifuvtoo/PET_DINO (mirrors stage123_geco2.
     repo_path's own vendored-repo convention), needing PET_DINO's own
     MMDetection-based dependency stack (mmdet/mmengine/mmcv, NOT part of
-    this project's own requirements.txt by default -- see that file's own
-    "pipeline.detector == 'pet_dino'" block for the full install sequence,
-    including a numpy==1.23 pin from its lvis-api dependency that MAY
-    conflict with this project's own unpinned numpy in the same
-    environment -- a separate virtualenv is the safer default).
+    this project's own requirements.txt by default).
+
+    CONFIRMED (hands-on session, real checkpoint, real video frames --
+    not just doc-reading) this dependency stack is a HARD environment
+    conflict, not just "an extra pip install": mmcv only ships prebuilt
+    wheels for Python<=3.11 and torch<=2.4, while this project's own
+    requirements.txt pins a far newer torch -- the two cannot coexist in
+    one interpreter. The working setup used to validate everything below
+    was a SEPARATE venv (.venv-petdino, Python 3.10, torch 2.1.0+cu121,
+    mmcv 2.1.0, mmdet 3.3.0, transformers 4.49.0 -- transformers>=5
+    itself requires torch>=2.5 and silently disables its own PyTorch
+    backend otherwise) alongside a full PET_DINO clone + the Swin-T
+    checkpoint from https://huggingface.co/fuweifu/PET-DINO. `backend`
+    below picks how aero_eyes reaches that environment:
+      "subprocess" (default, and the only one actually exercised so far):
+          aero_eyes.models.pet_dino_detector spawns PET_DINO/scripts/
+          detector_worker.py as a persistent child process using
+          subprocess_python (that OTHER venv's interpreter), loads the
+          model ONCE there, then exchanges one JSON line per keyframe
+          over its stdin/stdout for the rest of the run -- a subprocess-
+          per-frame design would re-pay PET-DINO's multi-second model
+          load on every single keyframe. See that worker script's own
+          docstring for the exact line protocol.
+      "inprocess": direct `from mmdet.apis import DetInferencer` in
+          aero_eyes' own process -- only viable if mmdet/mmcv/mmengine
+          are ALSO importable in aero_eyes' own environment (not true
+          today, per the hard conflict above; kept for if that ever
+          changes -- a future aero_eyes torch downgrade, or mmcv shipping
+          wheels for newer torch).
 
     ONLY the base text-prompt path is wired into the real per-keyframe
     pipeline here (run_stage123_pet_dino, mirroring stage123_gdino.
@@ -3977,25 +4262,30 @@ class Stage123PetDinoConfig(BaseModel):
     -- deliberately scoped to a first, comparable baseline to test PET-
     DINO's own raw detection quality against, not a full port of
     stage123_gdino's whole FP-filtering suite onto an as-yet-unverified new
-    detector. PetDinoDetector.raw_boxes_and_scores (aero_eyes/models/
-    pet_dino_detector.py) exposes the visual-prompt call arguments
-    (prompt_bboxes/prompt_image/prompt_visual_embedding_path) for FUTURE
+    detector. PetDinoDetector.raw_boxes_and_scores_visual (aero_eyes/
+    models/pet_dino_detector.py) exposes the visual-prompt call for FUTURE
     use, but nothing here automatically converts data.refs_subdir's
-    reference photos into a visual prompt yet. Stage 4's own GDino/GeCo2-
-    specific periodic re-detection (stage4.py's use_gdino/use_geco2) does
-    NOT recognize this detector either -- tracking still runs, just
-    without model-based re-verification mid-track.
+    reference photos into a visual prompt yet (the "subprocess" backend's
+    worker protocol currently only carries prompt_visual_embedding_path --
+    a path to an already-extracted .pt file readable by the worker's OWN
+    process/filesystem -- not raw prompt_bboxes/prompt_image for on-the-
+    fly extraction; "inprocess" supports the full call either way). Stage
+    4's own GDino/GeCo2-specific periodic re-detection (stage4.py's
+    use_gdino/use_geco2) does NOT recognize this detector either --
+    tracking still runs, just without model-based re-verification
+    mid-track.
 
-    CRITICAL: aero_eyes/models/pet_dino_detector.py was written from
-    PET_DINO's own README + scripts/image_demo.py source (fetched and read
-    this session, not guessed) confirming DetInferencer is the right entry
-    point and its core argument names -- but has NOT been smoke-tested
-    against a real checkpoint (this development environment has neither
-    mmdet nor even bare `transformers` installed). See that module's own
-    docstring for exactly which parts are confirmed vs. assumed-standard-
-    MMDetection-convention. NOT YET VALIDATED in any sense beyond "the
-    documented CLI usage pattern maps onto this shape" -- run a real
-    smoke test (one frame, one prompt) before trusting output boxes/scores.
+    CONFIRMED against a real checkpoint + real video frames this session
+    (superseding an earlier doc-only draft of this wrapper, which had two
+    concrete bugs from guessing DetInferencer's return shape without
+    running it -- both fixed, see pet_dino_detector.py's own docstring):
+    DetInferencer(model=<config path>, weights=<checkpoint path>,
+    device=...) is the right entry point; __call__ needs
+    custom_entities=True for a literal category-name prompt like "black
+    box" (otherwise it's NLTK-tokenized as a natural-language sentence
+    instead) and align_trex_format=True to get scores/boxes/labels back
+    as a plain returned list (the default call instead returns None and
+    writes to disk, which the old draft did not account for).
     """
     repo_path: str = "./PET_DINO"
     # Relative to repo_path -- their own example config for the smallest
@@ -4004,13 +4294,45 @@ class Stage123PetDinoConfig(BaseModel):
     # https://huggingface.co/fuweifu/PET-DINO, for what's available).
     config_file: str = "configs/pet_dino/pet_dino_swin-t_8xb4_12e_obj365.py"
     weights_path: str = "./PET_DINO/checkpoints/pet_dino_swin-t.pth"
+    backend: Literal["subprocess", "inprocess"] = "subprocess"
+    # subprocess backend only. Path to the OTHER venv's Python interpreter
+    # (Windows: .../Scripts/python.exe; Linux/Mac: .../bin/python) that has
+    # PET-DINO's own mmdet/mmcv/mmengine stack installed -- see this
+    # class's own docstring. The worker script itself is always read from
+    # <repo_path>/scripts/detector_worker.py (copied there alongside the
+    # PET_DINO clone, not a separate configurable path).
+    subprocess_python: str = "./.venv-petdino/Scripts/python.exe"
+    # Generous: PET-DINO's own model load (checkpoint + BERT) took several
+    # seconds to a couple minutes in practice depending on disk/download
+    # cache state -- see this class's own docstring for the exact stack
+    # this was measured against.
+    worker_startup_timeout: float = 180.0
+    # subprocess backend only. Bounds every ORDINARY request after startup
+    # (detect / extract_embedding / save_embedding) -- distinct from
+    # worker_startup_timeout above, which only guards the initial ready
+    # handshake. Confirmed necessary this session: a stage4 run using
+    # dynamic_prototype (which calls extract_embedding via this backend on
+    # every accepted keyframe) silently hung for 20+ minutes with no
+    # progress and no error, then the process vanished with no traceback --
+    # root cause was _read_line() being called with no timeout for
+    # ordinary requests, so a stalled/crashed worker blocks the caller
+    # forever instead of surfacing an error with the worker's own stderr.
+    worker_request_timeout: float = 60.0
     box_threshold: float = 0.3  # matches their own --pred-score-thr example
     nms_iou: float = 0.5
     topk_per_keyframe: int = 5
     min_box_area_enabled: bool = False
     min_box_area: int = 24
     max_box_area_frac_enabled: bool = True
-    max_box_area_frac: float = 0.5
+    # Box guard: drops any box covering more than this fraction of the
+    # frame -- a tiny aerial object (this project's whole premise) should
+    # never legitimately produce a near-full-frame or ~1/3-of-frame box;
+    # when PET-DINO does return one, it's reliably a confused/degenerate
+    # match (background texture, lighting gradient, or sky/ground split)
+    # rather than the real target. Lowered from an earlier 0.5 to ~1/3
+    # after a confuser investigation on LifeJacket_1 (see
+    # negative_text_prompt below for the other half of that fix).
+    max_box_area_frac: float = 0.3334
     keyframe_interval: int = 8
     # Same 3-way prompt precedence as stage123_gdino.resolve_text_prompt
     # (prompt.txt file > text_prompts map > default_text_prompt) --
@@ -4021,6 +4343,30 @@ class Stage123PetDinoConfig(BaseModel):
     default_text_prompt: str = ""
     text_prompts: dict[str, str] = {}
     prompt_file_name: str = "prompt.txt"
+    # Optional. A second, "what this ISN'T" category list (same period-
+    # separated Grounding-DINO syntax as default_text_prompt/text_prompts,
+    # e.g. "yellow lane marking . road marking .") appended to the
+    # positive prompt in ONE combined detection call. Confuser-driven
+    # false positives (e.g. LifeJacket_1's yellow road-marking stripes
+    # matching an "orange object" prompt almost as well as the real
+    # life jacket) can't be fixed by raising box_threshold alone -- the
+    # confuser's score is often comparable to the real object's, not
+    # lower. Giving the model an explicit negative category lets its own
+    # open-vocab matching separate them directly: any positive-category
+    # box that overlaps (IoU >= negative_suppress_iou) a negative-
+    # category box from the SAME call is dropped before NMS/top-K, on
+    # the theory that a region the model itself flags as matching the
+    # negative description better explains that box than genuine
+    # ambiguity about the positive one. "" (default) = disabled, single-
+    # prompt detect_frame exactly as before.
+    negative_text_prompt: str = ""
+    negative_suppress_iou: float = 0.3
+    dynamic_prototype: Stage123PetDinoDynamicPrototypeConfig = Stage123PetDinoDynamicPrototypeConfig()
+    # Same filter as stage123_geco2/stage123_gdino.color_postfilter, applied
+    # to each keyframe's PET-DINO boxes and to Stage 4's PET-DINO
+    # re-detection. Reference photos are segmented with stage1.segmentation
+    # (same as stage123_gdino). See ColorPostfilterConfig.
+    color_postfilter: ColorPostfilterConfig = ColorPostfilterConfig()
 
 
 # ---------------------------------------------------------------------------

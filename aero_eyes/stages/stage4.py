@@ -106,6 +106,66 @@ def run_stage4(cfg, sample_id: str) -> Path:
     s4 = cfg.stage4
     use_geco2 = cfg.pipeline.detector == "geco2"
     use_gdino = cfg.pipeline.detector == "grounding_dino"
+    use_petdino = cfg.pipeline.detector == "pet_dino"
+    if use_petdino:
+        from aero_eyes.models.pet_dino_detector import (
+            PetDinoDetector, PetDinoDynamicPrototypeTracker,
+            calibrate_and_extract_pet_dino_base_embedding,
+        )
+
+    # PET-DINO: ONE detector/worker instance serves BOTH this stage's own
+    # re-detection (_detect_on_frame_petdino below, mirroring the
+    # geco2/gdino equivalents) AND stage123_pet_dino.dynamic_prototype (if
+    # enabled) -- built unconditionally whenever use_petdino, not only
+    # when dynamic_prototype is on. Building a SECOND, separate
+    # PetDinoDetector (a second subprocess worker, a second checkpoint
+    # load) for one or the other would double GPU memory/load time for no
+    # reason; the two features already need the exact same thing (a
+    # PET-DINO Text-route call), so they share it.
+    petdino_detector = PetDinoDetector(cfg) if use_petdino else None
+    petdino_text_prompt = None
+    petdino_color_sig = None
+    if use_petdino:
+        from aero_eyes.stages.stage123_pet_dino import resolve_text_prompt as _petdino_resolve_text_prompt
+        petdino_text_prompt = _petdino_resolve_text_prompt(cfg, sample_id)
+        # Same color filter as the PET-DINO keyframe stage -- re-detection is
+        # exactly where a same-shape, different-color confuser can hijack
+        # the track (see _load_geco2's docstring for the GeCo2 equivalent).
+        if cfg.stage123_pet_dino.color_postfilter.enabled:
+            from aero_eyes.stages.stage123_geco2 import build_color_signature
+            petdino_color_sig = build_color_signature(
+                cfg, sample_id, work_dir, cfg.stage123_pet_dino.color_postfilter, cfg.stage1.segmentation,
+                cache_name="color_signature_pet_dino.npz", log_prefix="Stage4-PETDINO",
+            )
+
+    # stage123_pet_dino.dynamic_prototype (opt-in): builds a calibrated
+    # starting Visual-route embedding from this sample's own reference
+    # photos (degraded to look more like THIS video -- see
+    # calibrate_and_extract_pet_dino_base_embedding's own docstring), then
+    # grows it from every track confirm_new_track confirms (offer() call
+    # further below, at the "accept" transition). Only builds/grows the
+    # bank for now -- see PetDinoDynamicPrototypeTracker's own docstring
+    # for why this isn't wired into any actual detection decision yet.
+    # None whenever disabled or its prerequisites (a reference-photo
+    # folder, a successful calibration extraction) aren't met -- every
+    # call site below is a no-op in that case.
+    petdino_dynamic_tracker = None
+    if use_petdino and cfg.stage123_pet_dino.dynamic_prototype.enabled:
+        dp_cfg = cfg.stage123_pet_dino.dynamic_prototype
+        base_embedding_path = calibrate_and_extract_pet_dino_base_embedding(
+            cfg, sample_id, work_dir, petdino_detector,
+            dp_cfg.label_id, sample_reference_size,
+        )
+        if base_embedding_path is not None:
+            petdino_dynamic_tracker = PetDinoDynamicPrototypeTracker(
+                cfg, petdino_detector, base_embedding_path,
+                dp_cfg.label_id, work_dir, sample_id,
+            )
+        else:
+            log.warning(
+                "[Stage4] %s: stage123_pet_dino.dynamic_prototype.enabled but no starting "
+                "embedding could be built -- disabled for this run.", sample_id,
+            )
 
     # ---- stage4.backward_tracking: separate tracker instance + rolling
     # frame buffer, built only when the feature is actually used (a second
@@ -169,6 +229,8 @@ def run_stage4(cfg, sample_id: str) -> Path:
             geco2_detector, geco2_prototype, geco2_color_sig = _load_geco2(cfg, sample_id, work_dir)
         elif use_gdino:
             gdino_detector, gdino_text_prompt = _load_gdino(cfg, sample_id)
+        elif use_petdino:
+            pass  # petdino_detector/petdino_text_prompt already built above, shared with dynamic_prototype
         else:
             from aero_eyes.models.features import build_feature_extractor
             from aero_eyes.models.proposals import build_proposal_model
@@ -377,6 +439,17 @@ def run_stage4(cfg, sample_id: str) -> Path:
         )
         if confirm_cfg.enabled and confirm_cfg.compare_with_tracker else None
     )
+    # confirm_detections.compare_with_tracker + on_mismatch=="confirm_new_track"
+    # only: frame indices written to tracks[] under the CURRENT track since
+    # its last (re-)init, for as long as agreement_gate.track_confirmed is
+    # still False (i.e. it hasn't yet survived one of its own keyframe
+    # checks). Appended to at the same spot tracks[frame_idx] itself is
+    # written, below. Retroactively wiped (set back to None in tracks[]) the
+    # moment this track loses a keyframe agreement check while still
+    # unconfirmed -- see the "confirm_new_track" branch further down and
+    # TrackerAgreementGate's own docstring for the full rationale. Left
+    # unused (stays empty) for every other on_mismatch value.
+    pending_window_frames: list[int] = []
 
     # frame_idx of the first frame in an ONGOING keep_tracking_on_missed_keyframe
     # segment still awaiting validation (None = no pending segment). Set the
@@ -391,6 +464,29 @@ def run_stage4(cfg, sample_id: str) -> Path:
     # wherever kept_segment_start is reset to None (both helpers below), so
     # it always reflects only the CURRENT segment's miss count.
     consecutive_missed_keyframes = 0
+
+    def _wipe_pending_window(frame_idx: int, reason: str) -> None:
+        """confirm_new_track only -- the current track is dying (any cause:
+        keyframe IoU mismatch, a keyframe with no detection at all, or
+        outright tracker confidence/age failure) while STILL unconfirmed
+        (agreement_gate.track_confirmed is False, checked by every call
+        site before calling this). Nothing ever independently corroborated
+        it, so its whole probation window (every frame written since its
+        own last (re-)init, tracked in pending_window_frames) is
+        retroactively set back to None in tracks[] instead of being kept on
+        the strength of a single, never-confirmed detection. No-op (besides
+        the reset) when the window is already empty."""
+        nonlocal pending_window_frames
+        if pending_window_frames:
+            log.info(
+                "[Stage4] %s: frame %d: unconfirmed track dropped (%s) -- "
+                "wiping %d buffered frame(s) [%d, %d]",
+                sample_id, frame_idx, reason, len(pending_window_frames),
+                pending_window_frames[0], pending_window_frames[-1],
+            )
+            for _idx in pending_window_frames:
+                tracks[_idx] = None
+        pending_window_frames = []
 
     def _clear_pending_kept_segment() -> None:
         """No independent box available to validate a pending segment
@@ -626,6 +722,12 @@ def run_stage4(cfg, sample_id: str) -> Path:
 
     try:
         for frame_idx, frame_bgr in frame_iterator(video_path):
+            if frame_idx % 500 == 0:
+                log.info(
+                    "[Stage4] %s: progress frame %d/%d (%.1f%%) elapsed=%.1fs",
+                    sample_id, frame_idx, total_frames,
+                    100.0 * frame_idx / max(total_frames, 1), time.time() - t0,
+                )
             box_out: Box | None = None
             source = "none"
 
@@ -650,6 +752,11 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         cosine_prototype=prototype if s4.gdino_redetect_cosine_filter else None,
                         per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
                     )
+                elif use_petdino:
+                    raw_box, source = _detect_on_frame_petdino(
+                        frame_bgr, petdino_detector, petdino_text_prompt,
+                        petdino_color_sig, cfg.stage123_pet_dino.color_postfilter,
+                    )
                 else:
                     raw_box, source = _detect_on_frame(
                         frame_bgr, frame_idx, proposal_model, extractor,
@@ -669,6 +776,14 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 best_det = max(dets, key=lambda d: d.similarity) if dets else None
                 if agreement_gate is not None and is_keyframe and not dets:
                     agreement_gate.reset_streak()  # a gap breaks "consecutive" mismatches
+                    # confirm_new_track only: this keyframe was THIS
+                    # unconfirmed track's one chance to get corroborated --
+                    # nothing to compare it against, so it's dropped the
+                    # same as an outright IoU mismatch would be.
+                    if (tracker_active and confirm_cfg.on_mismatch == "confirm_new_track"
+                            and not agreement_gate.track_confirmed):
+                        _wipe_pending_window(frame_idx, "keyframe had no surviving detection")
+                        tracker_active = False
                 # confirm_detections.compare_with_tracker: with a track already
                 # active, get the tracker's box for THIS frame first and let
                 # TrackerAgreementGate decide (pre_update is then reused by
@@ -676,14 +791,79 @@ def run_stage4(cfg, sample_id: str) -> Path:
                 pre_update = None
                 keep_tracking_this_kf = False
                 agreed_with_tracker = False
+                visual_vetoed_this_kf = False
                 if agreement_gate is not None and best_det is not None and tracker_active:
                     t_box, t_conf = tracker.update(frame_bgr)
                     if t_box is None or t_conf < s4.tracker_conf_threshold:
                         tracker_active = False  # lost lock: same as no track (init below)
+                        if confirm_cfg.on_mismatch == "confirm_new_track" and not agreement_gate.track_confirmed:
+                            _wipe_pending_window(frame_idx, "tracker lost lock before any keyframe check")
                     else:
                         pre_update = (t_box, t_conf)
+                        was_confirmed = agreement_gate.track_confirmed  # read BEFORE judge() can flip it
                         verdict = agreement_gate.judge(t_box, best_det.box, best_det.similarity)
-                        if verdict == "keep_track":
+                        if verdict == "accept":
+                            # stage123_pet_dino.dynamic_prototype (opt-in):
+                            # this "accept" IS the trust signal -- an
+                            # independent keyframe detection just agreed
+                            # with where the tracker already is, regardless
+                            # of which confirm_detections.on_mismatch mode
+                            # produced it. Feed the tracker's OWN box
+                            # (t_box, not best_det.box -- same reasoning as
+                            # box_out above) to offer() BEFORE committing to
+                            # any of this branch's other side effects: Text-
+                            # route confirm_new_track only checks spatial/
+                            # motion agreement, never appearance -- offer()'s
+                            # cosine cross-check against the dynamic bank is
+                            # the first thing that actually looks at whether
+                            # this crop LOOKS like the target, and a veto
+                            # here must unwind this exact same way a
+                            # spatial mismatch below does (wipe-if-
+                            # unconfirmed + force a clean re-detect), not
+                            # just skip the bank update silently.
+                            visual_ok, cos_sim = True, None
+                            if petdino_dynamic_tracker is not None:
+                                visual_ok, cos_sim = petdino_dynamic_tracker.offer(frame_bgr, t_box, frame_idx)
+                            if not visual_ok:
+                                visual_vetoed_this_kf = True
+                                tracker_active = False
+                                if confirm_cfg.on_mismatch == "confirm_new_track" and not agreement_gate.track_confirmed:
+                                    _wipe_pending_window(frame_idx, "visual dynamic_prototype veto (cosine too low)")
+                                log.info(
+                                    "[Stage4] %s: frame %d: detection (sim=%.3f) spatially agreed "
+                                    "with the active track but FAILED the visual dynamic_prototype "
+                                    "check (cosine=%.3f) -- treating as a false positive, dropping lock",
+                                    sample_id, frame_idx, best_det.similarity, cos_sim if cos_sim is not None else -1.0,
+                                )
+                            else:
+                                # Detection corroborates the tracker's own box --
+                                # trust it and move on WITHOUT re-anchoring: the
+                                # tracker is already exactly where it should be,
+                                # so re-running tracker.init() here would only
+                                # risk a small discontinuity for no benefit.
+                                # Reuses the same "keep going as-is" path as
+                                # "keep_track" below (pre_update carries this
+                                # frame's box/conf forward).
+                                keep_tracking_this_kf = True
+                                # Confirmed as of this frame -- everything
+                                # buffered under it so far (and everything from
+                                # here on, per the append guard below) is final.
+                                # Must clear here, not only at the wipe sites:
+                                # this track may go on to die LONG after this
+                                # (low conf/age, no further mismatch) without
+                                # ever calling _wipe_pending_window (rightly --
+                                # it's confirmed, nothing to wipe) -- if this
+                                # list were left non-empty, the NEXT track
+                                # (whenever one next starts) would silently
+                                # inherit these stale indices and could wipe
+                                # THEM by mistake if IT later fails unconfirmed.
+                                pending_window_frames = []
+                                log.debug(
+                                    "[Stage4] %s: frame %d: detection (sim=%.3f) agrees with the "
+                                    "active track (IoU>=%.2f) -- continuing without reinit",
+                                    sample_id, frame_idx, best_det.similarity, agreement_gate.iou_threshold,
+                                )
+                        elif verdict == "keep_track":
                             keep_tracking_this_kf = True
                             log.info(
                                 "[Stage4] %s: frame %d: detection (sim=%.3f) disagrees with the "
@@ -693,19 +873,27 @@ def run_stage4(cfg, sample_id: str) -> Path:
                             )
                         else:
                             agreed_with_tracker = True
-                            if verdict == "replace":
-                                log.info(
-                                    "[Stage4] %s: frame %d: detection (sim=%.3f) replaces the active "
-                                    "track (anchor sim=%s, on_mismatch=%s)",
-                                    sample_id, frame_idx, best_det.similarity,
-                                    agreement_gate.anchor_sim, confirm_cfg.on_mismatch,
-                                )
+                            if confirm_cfg.on_mismatch == "confirm_new_track" and not was_confirmed:
+                                # The OUTGOING track never survived even one
+                                # of its own keyframe checks -- nothing
+                                # independently corroborated it, so its
+                                # whole (short, <=keyframe_interval-frame)
+                                # probation window is retroactively wiped
+                                # rather than kept just because SOME
+                                # detection turned up nearby afterwards.
+                                _wipe_pending_window(frame_idx, "replaced before ever being corroborated")
+                            log.info(
+                                "[Stage4] %s: frame %d: detection (sim=%.3f) replaces the active "
+                                "track (anchor sim=%s, on_mismatch=%s, was_confirmed=%s)",
+                                sample_id, frame_idx, best_det.similarity,
+                                agreement_gate.anchor_sim, confirm_cfg.on_mismatch, was_confirmed,
+                            )
                 if agreement_gate is not None and best_det is not None and pre_update is None:
                     # No usable track to compare against (never started, or
                     # just lost): init straight from the detection, no
                     # detection-vs-detection confirmation.
                     agreed_with_tracker = True
-                if is_keyframe and dets and not keep_tracking_this_kf:
+                if is_keyframe and dets and not keep_tracking_this_kf and not visual_vetoed_this_kf:
                     # Initialize or re-initialize tracker from detection
                     candidate = best_det.box
                     if agreed_with_tracker:
@@ -713,6 +901,33 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         confirmer.reset()  # any stale pending detection-vs-detection streak
                     else:
                         confirmed = confirmer.offer(candidate) if confirmer is not None else candidate
+
+                    # stage123_pet_dino.dynamic_prototype (opt-in): a fresh
+                    # lock/re-lock has no tracker history to spatially agree
+                    # or disagree with -- confirm_new_track's own agreement
+                    # check (the "accept" branch above) never even runs for
+                    # this case, so without this, a fresh lock onto a
+                    # confuser would NEVER be visually checked at all (only
+                    # a track that goes on to get spatially reconfirmed
+                    # LATER would be). Confirmed necessary this session: on
+                    # BlackBox_1, every observed false-positive lock was
+                    # exactly this case (tracker re-acquiring a static
+                    # white-bag confuser after losing the real target) --
+                    # 0/109 "accept"-path offers were ever rejected because
+                    # none of those false locks ever reached that branch.
+                    # Same veto semantics as there: cosine < floor -> treat
+                    # as a visual false positive, refuse to lock at all.
+                    if confirmed is not None and petdino_dynamic_tracker is not None:
+                        visual_ok, cos_sim = petdino_dynamic_tracker.offer(frame_bgr, confirmed, frame_idx)
+                        if not visual_ok:
+                            log.info(
+                                "[Stage4] %s: frame %d: fresh lock candidate (sim=%.3f) FAILED "
+                                "the visual dynamic_prototype check (cosine=%.3f) -- refusing to lock",
+                                sample_id, frame_idx, best_det.similarity,
+                                cos_sim if cos_sim is not None else -1.0,
+                            )
+                            confirmed = None
+
                     if confirmed is not None:
                         # This IS the independent box a pending
                         # keep_tracking_on_missed_keyframe segment (if any)
@@ -939,6 +1154,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         # giving it a chance to lock onto a confuser and
                         # extend the track past a real departure.
                         tracker_active = False
+                        if agreement_gate is not None and confirm_cfg.on_mismatch == "confirm_new_track" \
+                                and not agreement_gate.track_confirmed:
+                            _wipe_pending_window(frame_idx, "absence_check judged the object gone before any keyframe check")
                         box_out = None
                         source = "none"
                         if confirmer is not None:
@@ -948,6 +1166,9 @@ def run_stage4(cfg, sample_id: str) -> Path:
                         # Confidence too low, track too old, or failed
                         # re-verification — try re-detect
                         tracker_active = False
+                        if agreement_gate is not None and confirm_cfg.on_mismatch == "confirm_new_track" \
+                                and not agreement_gate.track_confirmed:
+                            _wipe_pending_window(frame_idx, "lost lock (conf/age/re-verification) before any keyframe check")
                         if use_geco2:
                             if geco2_detector is None:
                                 geco2_detector, geco2_prototype, geco2_color_sig = _load_geco2(cfg, sample_id, work_dir)
@@ -965,6 +1186,24 @@ def run_stage4(cfg, sample_id: str) -> Path:
                                 cosine_extractor=extractor if s4.gdino_redetect_cosine_filter else None,
                                 cosine_prototype=prototype if s4.gdino_redetect_cosine_filter else None,
                                 per_ref_features=per_ref_features, cfg=cfg, match_threshold=match_threshold,
+                            )
+                        elif use_petdino:
+                            # petdino_detector/petdino_text_prompt already
+                            # built once at the top of run_stage4 (shared
+                            # with stage123_pet_dino.dynamic_prototype) --
+                            # nothing to lazy-init here, unlike the legacy
+                            # branch below. This is the fix for the actual
+                            # gap that existed before: pipeline.detector==
+                            # "pet_dino" used to fall through to the else
+                            # branch, lazily loading YOLO+DINOv2 (the
+                            # LEGACY pipeline's own re-detect stack) for
+                            # NOTHING -- prototype.npz never exists for
+                            # this pipeline, so _detect_on_frame always
+                            # just returned (None, "none") anyway, after
+                            # paying for a needless model load.
+                            raw_box, source = _detect_on_frame_petdino(
+                                frame_bgr, petdino_detector, petdino_text_prompt,
+                                petdino_color_sig, cfg.stage123_pet_dino.color_postfilter,
                             )
                         else:
                             # Lazy-init for re-detect fallback -- guarded
@@ -1063,6 +1302,17 @@ def run_stage4(cfg, sample_id: str) -> Path:
 
             tracks[frame_idx] = box_out
 
+            # confirm_new_track only: remember this frame as part of the
+            # CURRENT track's still-unconfirmed probation window, so it can
+            # be retroactively wiped above if that track is replaced before
+            # ever being corroborated by one of its own keyframe checks.
+            # Stops accumulating the moment track_confirmed flips True (see
+            # TrackerAgreementGate.judge()'s "accept" branch) -- from then
+            # on this track's frames are final, nothing left to protect.
+            if (agreement_gate is not None and confirm_cfg.on_mismatch == "confirm_new_track"
+                    and tracker_active and not agreement_gate.track_confirmed and box_out is not None):
+                pending_window_frames.append(frame_idx)
+
             if writer is not None and box_out is not None:
                 vis = vizmod.draw_frame_annotation(frame_bgr, box_out, source, frame_idx)
                 writer.write(vis)
@@ -1086,6 +1336,10 @@ def run_stage4(cfg, sample_id: str) -> Path:
             "min_iou_with_original=%.2f gate or no plausible mask found)",
             sample_id, br_attempts, br_changed, br_cfg.min_iou_with_original,
         )
+    if petdino_dynamic_tracker is not None:
+        petdino_dynamic_tracker.log_summary()
+    if petdino_detector is not None:
+        petdino_detector.close()
     return tracks_path
 
 
@@ -1285,6 +1539,39 @@ def _detect_on_frame_gdino(
         if not boxes:
             return None, "none"
 
+    best = max(boxes, key=lambda b: b.score)
+    return best, "detect"
+
+
+def _detect_on_frame_petdino(frame_bgr, detector, text_prompt: str | None, color_sig=None, cpf_cfg=None):
+    """PET-DINO equivalent of _detect_on_frame_geco2/_gdino: single best
+    re-detection box on one frame using PET-DINO's own Text route, or
+    (None, "none") if nothing passed threshold/NMS or text_prompt wasn't
+    resolved. `detector` is the ONE PetDinoDetector run_stage4 builds up
+    front (shared with stage123_pet_dino.dynamic_prototype, if enabled) --
+    never None when this is actually called (use_petdino gates every call
+    site), but the check mirrors the other two detectors' own defensive
+    style.
+
+    No cosine cross-check hook (unlike geco2_redetect_cosine_filter/
+    gdino_redetect_cosine_filter): PET-DINO's own pipeline builds no
+    DINOv2 prototype.npz at all (see Stage123PetDinoConfig's own
+    docstring) -- there is no embedding space to check candidates against
+    here. stage123_pet_dino.dynamic_prototype's own bank is a plausible
+    candidate for this role in the future; not wired in here yet (see
+    that config's own docstring for why).
+
+    color_sig/cpf_cfg (stage123_pet_dino.color_postfilter): when given,
+    boxes go through the same apply_color_postfilter as the PET-DINO
+    keyframe stage before the best one is picked."""
+    if detector is None or not text_prompt:
+        return None, "none"
+    boxes = detector.detect_frame(frame_bgr, text_prompt)
+    if color_sig is not None and boxes:
+        from aero_eyes.stages.stage123_geco2 import apply_color_postfilter
+        boxes = apply_color_postfilter(frame_bgr, boxes, color_sig, cpf_cfg)
+    if not boxes:
+        return None, "none"
     best = max(boxes, key=lambda b: b.score)
     return best, "detect"
 

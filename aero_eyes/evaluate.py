@@ -11,6 +11,14 @@ ST-IoU semantics (implemented exactly):
   - Video ST-IoU = mean of per-frame IoU values over the union.
   - Leaderboard score = mean ST-IoU across all evaluation videos.
   - Both tubes empty -> 0.0 (documented assumption).
+
+Optional --iou-threshold T switches the per-frame score from the raw
+spatial IoU to a binary 1.0-if-IoU>=T-else-0.0 ("hit/miss" counting,
+the same convention this project's own ad-hoc "strict precision/recall"
+analysis scripts used this session) -- a looser, more forgiving metric
+than the default (which always penalizes anything short of a perfect
+box, even a correctly-located one). Omitted (default) = the exact
+original raw-IoU behavior, unchanged.
 """
 from __future__ import annotations
 
@@ -25,10 +33,15 @@ from aero_eyes.utils.geometry import box_iou
 log = logging.getLogger(__name__)
 
 
-def st_iou(pred_tube: dict[int, Box], gt_tube: dict[int, Box]) -> float:
+def st_iou(
+    pred_tube: dict[int, Box], gt_tube: dict[int, Box],
+    iou_threshold: float | None = None,
+) -> float:
     """Compute Spatio-Temporal IoU between two per-frame-box dicts.
 
-    Both tubes empty -> 0.0.
+    Both tubes empty -> 0.0. iou_threshold (opt-in, see module docstring):
+    when given, each overlapping frame scores 1.0 if its IoU clears the
+    threshold, 0.0 otherwise, instead of the raw IoU value.
     """
     union_frames = set(pred_tube.keys()) | set(gt_tube.keys())
 
@@ -41,7 +54,10 @@ def st_iou(pred_tube: dict[int, Box], gt_tube: dict[int, Box]) -> float:
         in_pred = fi in pred_tube
         in_gt = fi in gt_tube
         if in_pred and in_gt:
-            total += box_iou(pred_tube[fi], gt_tube[fi])
+            iou = box_iou(pred_tube[fi], gt_tube[fi])
+            if iou_threshold is not None:
+                iou = 1.0 if iou >= iou_threshold else 0.0
+            total += iou
         else:
             total += 0.0  # only one tube has this frame
 
@@ -76,8 +92,10 @@ def evaluate_dataset(
     pred_path: str | Path,
     gt_path: str | Path,
     cfg=None,
+    iou_threshold: float | None = None,
 ) -> dict:
-    """Compute per-video and mean ST-IoU.
+    """Compute per-video and mean ST-IoU. iou_threshold: see st_iou's own
+    docstring.
 
     Returns {'per_video': {video_id: float}, 'mean_st_iou': float}.
     """
@@ -88,7 +106,7 @@ def evaluate_dataset(
     for vid in gt_all:
         pred_tube = pred_all.get(vid, {})
         gt_tube = gt_all[vid]
-        score = st_iou(pred_tube, gt_tube)
+        score = st_iou(pred_tube, gt_tube, iou_threshold=iou_threshold)
         per_video[vid] = score
         log.info("  %-30s ST-IoU = %.4f", vid, score)
 
@@ -102,6 +120,12 @@ def main():
     p.add_argument("--pred", required=True, help="Submission JSON file")
     p.add_argument("--gt", required=True, help="Ground-truth annotations JSON file")
     p.add_argument("--config", default=None, help="Config YAML (optional)")
+    p.add_argument(
+        "--iou-threshold", type=float, default=None,
+        help="Binary hit/miss mode: score 1.0 per overlapping frame if its IoU "
+             ">= this value, 0.0 otherwise, instead of the raw IoU. Omit for the "
+             "original raw-IoU ST-IoU.",
+    )
     args = p.parse_args()
 
     cfg = None
@@ -109,8 +133,9 @@ def main():
         from aero_eyes.config import load_config
         cfg = load_config(args.config)
 
-    result = evaluate_dataset(args.pred, args.gt, cfg=cfg)
-    print(f"\nMean ST-IoU: {result['mean_st_iou']:.4f}")
+    result = evaluate_dataset(args.pred, args.gt, cfg=cfg, iou_threshold=args.iou_threshold)
+    label = f"ST-IoU (IoU>={args.iou_threshold} hit/miss)" if args.iou_threshold is not None else "Mean ST-IoU"
+    print(f"\n{label}: {result['mean_st_iou']:.4f}")
     print("\nPer-video scores:")
     for vid, score in sorted(result["per_video"].items()):
         print(f"  {vid}: {score:.4f}")

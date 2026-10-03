@@ -9,19 +9,22 @@ been smoke-tested against a real checkpoint in this environment.
 Deliberately scoped to a MINIMAL per-keyframe detection loop, mirroring
 aero_eyes.stages.stage123_gdino.run_stage123_gdino's own BASE path (plain
 box_threshold, no online_adaptive_threshold/online_fusion/
-cascade_verification/color_postfilter/clip_tiebreak equivalents) -- a
-first, comparable baseline to test PET-DINO's own raw detection quality
-against, not a full port of stage123_gdino's whole FP-filtering suite onto
-an as-yet-unverified new detector.
+cascade_verification/clip_tiebreak equivalents) -- a first, comparable
+baseline to test PET-DINO's own raw detection quality against, not a full
+port of stage123_gdino's whole FP-filtering suite onto an as-yet-unverified
+new detector. The one exception is the opt-in color_postfilter
+(stage123_pet_dino.color_postfilter), shared with stage123_gdino/geco2.
 
 Flow:  text prompt (resolve_text_prompt)
        -> per-keyframe PET-DINO forward pass
           -> box_threshold -> NMS -> top-K
+          -> [color_postfilter, if enabled]
        -> detections.json (same schema Stage 3 writes, so Stage 4/5 need
           no changes to consume it)
 
 Reads:  cfg.data video (+ this sample's text prompt)
 Writes: <work_dir>/<sample_id>/detections.json
+        <work_dir>/<sample_id>/color_postfilter.jsonl (if color_postfilter.enabled)
 Viz:    <work_dir>/<sample_id>/viz/stage123_pet_dino/ (when save_visualizations=true)
 """
 from __future__ import annotations
@@ -99,11 +102,37 @@ def run_stage123_pet_dino(cfg, sample_id: str) -> Path:
     viz_dir = work_dir / "viz" / "stage123_pet_dino"
     save_viz = cfg.runtime.save_visualizations
 
+    # Optional color post-filter -- same build_color_signature/
+    # apply_color_postfilter pair stage123_gdino uses (reference photos
+    # segmented with stage1.segmentation, like stage123_gdino).
+    cpf_cfg = cfg.stage123_pet_dino.color_postfilter
+    color_sig = None
+    color_stats: list = []
+    color_records: list[dict] = []
+    if cpf_cfg.enabled:
+        from aero_eyes.stages.stage123_geco2 import apply_color_postfilter, build_color_signature
+
+        color_sig = build_color_signature(
+            cfg, sample_id, work_dir, cpf_cfg, cfg.stage1.segmentation,
+            cache_name="color_signature_pet_dino.npz", log_prefix="Stage123-PETDINO",
+        )
+
     detections: dict[int, list[Detection]] = {}
     for frame_idx, frame_bgr in frame_iterator(video_path):
         if frame_idx not in kf_indices:
             continue
         boxes = detector.detect_frame(frame_bgr, text_prompt)
+        if color_sig is not None and boxes:
+            frame_color_records: list[dict] = []
+            boxes = apply_color_postfilter(
+                frame_bgr, boxes, color_sig, cpf_cfg, stats_out=color_stats, records=frame_color_records,
+            )
+            for r in frame_color_records:
+                r["frame_idx"] = frame_idx
+            color_records.extend(frame_color_records)
+            if save_viz:
+                from aero_eyes.utils import viz as vizmod
+                vizmod.save_color_postfilter(frame_bgr, frame_color_records, frame_idx, viz_dir / "color")
         result_dets = [
             Detection(frame_idx=frame_idx, box=b, similarity=b.score, source="detect")
             for b in boxes
@@ -118,6 +147,19 @@ def run_stage123_pet_dino(cfg, sample_id: str) -> Path:
             )
 
     write_detections(detections, det_path, threshold=cfg.stage123_pet_dino.box_threshold)
+
+    if color_records:
+        import json
+
+        from aero_eyes.stages.stage123_geco2 import log_color_postfilter_stats
+
+        log_color_postfilter_stats("Stage123-PETDINO", sample_id, color_stats, cpf_cfg)
+        color_log_path = work_dir / "color_postfilter.jsonl"
+        with open(color_log_path, "w", encoding="utf-8") as f:
+            for r in color_records:
+                f.write(json.dumps(r) + "\n")
+        log.info("[Stage123-PETDINO] %s: color_postfilter dropped %d/%d box(es), per-box records -> %s",
+                 sample_id, sum(not r["kept"] for r in color_records), len(color_records), color_log_path)
 
     elapsed = time.time() - t0
     log.info("[Stage123-PETDINO] %s done in %.1fs -> %s (%d detection frames)",

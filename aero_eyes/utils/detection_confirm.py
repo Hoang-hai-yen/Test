@@ -67,22 +67,49 @@ class TrackerAgreementGate:
       "hits": keep tracking through the first required_hits-1 consecutive
           mismatching keyframes; the required_hits-th one replaces the track.
           A keyframe with no detection breaks the streak (reset_streak()).
+      "confirm_new_track": unconditional replace on every mismatch (no
+          conf/streak comparison at all) -- but the caller (stage4.py) is
+          expected to first spend `track_confirmed` (read it BEFORE calling
+          judge(), which is the only thing that flips it back to True) to
+          decide whether the track being replaced had itself ever survived
+          one of ITS OWN agreeing keyframes since its last (re-)init. If not
+          (still on probation), the caller retroactively wipes every frame
+          written under it -- an unconfirmed track was never independently
+          corroborated, so extending trust to its whole probation window
+          just because a THIRD, unrelated detection later showed up nearby
+          would be unjustified. If it HAD already been confirmed at some
+          earlier keyframe, its already-written history is left untouched
+          (only this point forward changes) -- that history was already
+          corroborated once and this later mismatch says nothing about it.
+          Either way the replacement track starts its own fresh probation
+          (anchored() resets track_confirmed to False).
     """
 
     def __init__(self, iou_threshold: float, on_mismatch: str, required_hits: int):
-        if on_mismatch not in ("conf_compare", "hits"):
-            raise ValueError(f"Unknown on_mismatch '{on_mismatch}'. Must be 'conf_compare' or 'hits'.")
+        if on_mismatch not in ("conf_compare", "hits", "confirm_new_track"):
+            raise ValueError(
+                f"Unknown on_mismatch '{on_mismatch}'. Must be 'conf_compare', 'hits', "
+                "or 'confirm_new_track'."
+            )
         self.iou_threshold = iou_threshold
         self.on_mismatch = on_mismatch
         self.required_hits = max(1, required_hits)
         self.anchor_sim: float | None = None
         self._streak = 0
+        # confirm_new_track only -- irrelevant (never read) for the other
+        # two modes. True once THIS track (since its last anchored() call)
+        # has had at least one keyframe agree with it. See judge()'s
+        # "accept" branch (the only place this ever becomes True) and
+        # anchored() (the only place it's reset to False).
+        self.track_confirmed = False
 
     def anchored(self, sim: float | None) -> None:
         """The tracker was just (re-)initialized from a detection with
-        stage-3 similarity `sim` (None if unknown, e.g. a re-detect)."""
+        stage-3 similarity `sim` (None if unknown, e.g. a re-detect).
+        Starts a fresh, unconfirmed probation for confirm_new_track mode."""
         self.anchor_sim = sim
         self._streak = 0
+        self.track_confirmed = False
 
     def reset_streak(self) -> None:
         self._streak = 0
@@ -92,8 +119,14 @@ class TrackerAgreementGate:
 
         if box_iou(track_box, det_box) >= self.iou_threshold:
             self._streak = 0
+            self.track_confirmed = True
             return "accept"
         self._streak += 1
+        if self.on_mismatch == "confirm_new_track":
+            # Caller reads self.track_confirmed (still holding its PRE-call
+            # value here) to know whether to wipe the outgoing track's
+            # buffered frames -- nothing more to decide on our end.
+            return "replace"
         if self.on_mismatch == "conf_compare":
             anchor = float("-inf") if self.anchor_sim is None else self.anchor_sim
             keep = anchor >= det_sim

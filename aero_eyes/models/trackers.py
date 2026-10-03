@@ -271,6 +271,18 @@ class LiteTrackTracker(Tracker):
                     "trained checkpoint with LiteTrack/tracking/export_litetrack_onnx.py and set "
                     "stage4.litetrack.onnx_path_z / onnx_path_x in your config."
                 )
+        # Import torch BEFORE onnxruntime, even though nothing here calls
+        # it directly: on Windows, torch's own import registers its
+        # bundled CUDA DLL directory (torch/lib/*.dll, including
+        # cublasLt64_12.dll) via os.add_dll_directory(), which
+        # onnxruntime's CUDAExecutionProvider then finds -- without this,
+        # it fails to load (missing cublasLt64_12.dll) and silently falls
+        # back to CPUExecutionProvider (confirmed this session: a
+        # pipeline.detector="pet_dino" + stage4.tracker="litetrack" run
+        # never imports torch before this constructor runs, since that
+        # combo skips loading the legacy DINOv2 extractor entirely --
+        # LiteTrack silently ran on CPU, much slower, until this fix).
+        import torch  # noqa: F401
         import onnxruntime as ort  # type: ignore
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self._sess_z = ort.InferenceSession(onnx_path_z, providers=providers)
