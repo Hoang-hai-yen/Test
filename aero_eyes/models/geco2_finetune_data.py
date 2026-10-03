@@ -341,16 +341,34 @@ def convert_gt_box_to_canvas(
 
 
 def load_precomputed_ref_masks(path: str | Path) -> tuple[dict, dict[str, np.ndarray]]:
-    """Read scripts/precompute_ref_masks.py output: `path` is its output dir
-    or the ref_masks.json inside it (ref_masks.npz must sit next to it).
+    """Read scripts/precompute_ref_masks.py output: `path` is the
+    ref_masks.json file itself (self-contained: each entry carries its mask
+    as COCO RLE under "rle") or the folder holding it. An older JSON without
+    "rle" entries falls back to the ref_masks.npz next to it.
     Returns (index: sample_id -> [entry...], masks: hash -> bool mask)."""
     import json
+
+    from aero_eyes.utils.rle import decode_coco_rle
 
     path = Path(path)
     json_path = path / "ref_masks.json" if path.is_dir() else path
     index = json.loads(json_path.read_text(encoding="utf-8"))
-    with np.load(json_path.with_suffix(".npz")) as npz:
-        masks = {k: npz[k].astype(bool) for k in npz.files}
+    masks: dict[str, np.ndarray] = {}
+    for entries in index.values():
+        for e in entries:
+            if "rle" in e and e["hash"] not in masks:
+                masks[e["hash"]] = decode_coco_rle(e["rle"]["size"], e["rle"]["counts"])
+    needs_npz = any("rle" not in e for entries in index.values() for e in entries)
+    if needs_npz:
+        npz_path = json_path.with_suffix(".npz")
+        if not npz_path.exists():
+            raise FileNotFoundError(
+                f"{json_path} has entries without an embedded mask ('rle') and no {npz_path.name} next to it "
+                "-- rerun scripts/precompute_ref_masks.py to get a self-contained JSON"
+            )
+        with np.load(npz_path) as npz:
+            for k in npz.files:
+                masks.setdefault(k, npz[k].astype(bool))
     return index, masks
 
 

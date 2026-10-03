@@ -380,7 +380,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "(object box drawn in green) to <work_dir>/ref_canvases/ for checking by eye. "
                          "The dataset RNGs are reset afterwards, so training is unaffected.")
     p.add_argument("--ref-masks", default=None,
-                    help="Output dir (or ref_masks.json) of scripts/precompute_ref_masks.py: use those "
+                    help="ref_masks.json written by scripts/precompute_ref_masks.py (self-contained -- masks "
+                         "are embedded as COCO RLE; the folder holding it also works): use those "
                          "precomputed, eye-checked reference masks + tight boxes instead of running MobileSAM "
                          "(works with stage123_geco2.segmentation.enabled=false). Boxes come from the JSON.")
     p.add_argument("--calib-size-jitter", type=float, default=1.0,
