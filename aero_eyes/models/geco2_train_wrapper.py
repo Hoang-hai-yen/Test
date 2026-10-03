@@ -48,6 +48,33 @@ FINETUNE_PREFIXES = (
     "scale_fusion_gates.",
 )
 
+_HEAD_PREFIXES = (
+    "class_embed.", "class_embed_aux.", "bbox_embed.", "bbox_embed_aux.", "scale_fusion_gates.",
+)
+# Opt-in narrower finetune scopes (--finetune-scope), each a (trainable
+# prefixes, frozen prefixes) pair -- a parameter trains iff its name starts
+# with a trainable prefix and with no frozen prefix. adapt_features (C_base,
+# GECO2/models/query_generator.py) is, in forward order:
+#   prototype_attention{,_l1,_l2}  exemplar <-> image cross-attention (the
+#                                  object-matching part, most prone to
+#                                  overfitting the few training objects)
+#   image_attention{,_l1,_l2}      MSDeformAttn image self-attention
+#   up1/up2/up3/up_aux             upsampling decoder feeding the heads
+# "all" is the original recipe (FINETUNE_PREFIXES, nothing extra frozen).
+FINETUNE_SCOPES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "all": (FINETUNE_PREFIXES, ()),
+    "heads": (_HEAD_PREFIXES, ()),
+    "decoder": (_HEAD_PREFIXES + ("adapt_features.up",), ()),
+    "no-proto-attn": (FINETUNE_PREFIXES, ("adapt_features.prototype_attention",)),
+}
+
+
+def is_trainable_param(name: str, finetune_scope: str = "all", extra_freeze_prefixes: tuple[str, ...] = ()) -> bool:
+    """Whether parameter `name` trains under `finetune_scope` (+ extra frozen prefixes)."""
+    trainable_prefixes, frozen_prefixes = FINETUNE_SCOPES[finetune_scope]
+    frozen_prefixes = tuple(frozen_prefixes) + tuple(extra_freeze_prefixes)
+    return name.startswith(trainable_prefixes) and not (frozen_prefixes and name.startswith(frozen_prefixes))
+
 
 class _GeCo2TrainArgs:
     """Minimal stand-in for the argparse.Namespace GECO2.build_model expects
@@ -68,10 +95,15 @@ class _GeCo2TrainArgs:
 def build_training_model(
     cfg, device: torch.device | str | None = None,
     num_ref_scale_variants: int = 1, scale_gate_hidden_dim: int = 64,
+    finetune_scope: str = "all", extra_freeze_prefixes: tuple[str, ...] = (),
 ) -> torch.nn.Module:
     """Build models/counter.py::CNT(training=True), load the base GeCo2
     checkpoint, and apply the freeze/finetune split. Returns the model on
     `device` (or cfg.device() if not given).
+
+    finetune_scope picks a FINETUNE_SCOPES preset ("all" = original recipe);
+    extra_freeze_prefixes additionally freezes any parameter whose name
+    starts with one of them (e.g. "adapt_features.image_attention_l1").
 
     num_ref_scale_variants > 1 (Track B, opt-in): attaches
     `model.scale_fusion_gates` (aero_eyes.models.geco2_scale_fusion.
@@ -137,8 +169,15 @@ def build_training_model(
                     "grouped by submodule: %s", len(unexpected),
                     sorted({k.split(".")[0] for k in unexpected}))
 
+    if finetune_scope not in FINETUNE_SCOPES:
+        raise ValueError(f"unknown finetune_scope {finetune_scope!r}, choose from {sorted(FINETUNE_SCOPES)}")
     for name, param in model.named_parameters():
-        param.requires_grad = name.startswith(FINETUNE_PREFIXES)
+        param.requires_grad = is_trainable_param(name, finetune_scope, extra_freeze_prefixes)
+    unmatched = [p for p in extra_freeze_prefixes if not any(n.startswith(p) for n, _ in model.named_parameters())]
+    if unmatched:
+        raise ValueError(f"extra_freeze_prefixes matched no parameter: {unmatched}")
+    if not any(p.requires_grad for p in model.parameters()):
+        raise ValueError(f"finetune_scope={finetune_scope!r} + {extra_freeze_prefixes} left nothing trainable")
 
     trainable_frozen = [
         n for n, p in model.named_parameters()
@@ -151,8 +190,15 @@ def build_training_model(
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     log.info("GeCo2 training model built on %s: %d/%d params trainable", device, n_trainable, n_total)
+    log.info("finetune_scope=%s, trainable submodules: %s", finetune_scope, trainable_submodules(model))
 
     return model
+
+
+def trainable_submodules(model: torch.nn.Module) -> list[str]:
+    """Sorted two-level name prefixes (e.g. 'adapt_features.up1') that hold
+    at least one trainable parameter -- for logging the freeze split."""
+    return sorted({".".join(n.split(".")[:2]) for n, p in model.named_parameters() if p.requires_grad})
 
 
 def set_train_mode(model: torch.nn.Module, training: bool) -> None:
@@ -163,9 +209,18 @@ def set_train_mode(model: torch.nn.Module, training: bool) -> None:
     not required for correctness of gradients -- but eval() additionally
     stops any BatchNorm/dropout inside the backbone from updating running
     stats, which train() alone would not.
+
+    Every other fully-frozen submodule (e.g. adapt_features.prototype_attention
+    under a narrower --finetune-scope) is put in eval() too, so its dropout
+    does not inject noise into a part of the network that cannot adapt.
     """
     model.train(training)
     model.backbone.eval()
+    if training:
+        for module in model.modules():
+            params = list(module.parameters())
+            if params and not any(p.requires_grad for p in params):
+                module.eval()
 
 
 def _load_and_pad_grad(

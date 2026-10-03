@@ -171,6 +171,10 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
     )
 
     set_train_mode(model, train)
+    if not train and hasattr(loader.dataset, "reset_rng"):
+        # Same frames + augmentations every validation pass, so epochs (and
+        # the epoch-0 baseline) are compared on an identical set.
+        loader.dataset.reset_rng()
     total_loss, n_present, n_absent, n_samples = 0.0, 0, 0, 0
     frame_stats: list[dict] = []
     # Track B (docs/GECO2_scale_domain_gap_plan.md): model.scale_fusion_gates
@@ -318,9 +322,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "TP-vs-clutter margin). Keeps --p-present unchanged. 0 = uniform (stock).")
     p.add_argument("--hard-frame-top", type=int, default=50)
     p.add_argument("--select-by", choices=["val_loss", "top1_hit", "margin"], default="val_loss",
-                    help="Validation metric that picks the saved checkpoint. top1_hit = share of present "
-                         "val frames whose highest-scoring peak has IoU>=0.5; margin = mean(best good peak "
-                         "- highest clutter peak). Both are logged every epoch regardless.")
+                    help="Validation metric that picks the saved checkpoint, drives ReduceLROnPlateau and "
+                         "early stopping. top1_hit = share of present val frames whose highest-scoring peak "
+                         "has IoU>=0.5; margin = mean(best good peak - highest clutter peak). Both are logged "
+                         "every epoch regardless.")
+    p.add_argument("--val-steps", type=int, default=0,
+                    help="Number of validation frames per epoch (fixed set, re-drawn identically every "
+                         "epoch). 0 = steps_per_epoch // 4 (old default). ~300+ recommended: with ~70 "
+                         "present frames top1_hit has a std of ~0.06 from sampling alone.")
+    p.add_argument("--val-augment", action="store_true",
+                    help="Validate with the TRAINING augmentations (ref/query downscale, brightness/contrast, "
+                         "dynamic exemplars + jitter) -- the old behaviour. Default: clean val (fixed "
+                         "--val-ref-downscale, no other augmentation, no dynamic exemplars), closer to "
+                         "inference.")
+    p.add_argument("--val-ref-downscale", type=float, default=1.0,
+                    help="Fixed reference-image downscale factor for clean validation (match the "
+                         "inference stage123_geco2.ref_downscale_factor). Ignored with --val-augment.")
+    p.add_argument("--skip-baseline-eval", action="store_true",
+                    help="Skip the epoch-0 validation of the base checkpoint (the reference point that "
+                         "tells whether finetuning helped at all).")
     p.add_argument("--ref-downscale-lo", type=float, default=0.03)
     p.add_argument("--ref-downscale-hi", type=float, default=1.0)
     p.add_argument("--brightness-lo", type=float, default=0.0)
@@ -363,7 +383,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "it before trusting this.")
     p.add_argument("--dynamic-exemplar-box-jitter", type=float, default=0.0,
                     help="Randomly perturbs each --max-dynamic-exemplars crop's GT box (center "
-                         "shift + rescale, both up to this fraction) instead of using it exactly -- "
+                         "shift + rescale, both up to this fraction; shift capped at 0.5, scale "
+                         "floored at 0.5 -- keep this around 0.1-0.3) instead of using it exactly -- "
                          "a real inference-time dynamic_prototype token comes from the model's OWN "
                          "confirmed prediction, not GT, so an exact GT crop is the noise-free best "
                          "case; this narrows that gap a little without the cost of running "
@@ -401,8 +422,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "--num-ref-scale-variants=1 (every group has exactly 1 member, nothing to "
                          "penalize). NOT YET VALIDATED -- toggle independently of the gate itself "
                          "when comparing runs.")
+    p.add_argument("--finetune-scope", choices=["all", "heads", "decoder", "no-proto-attn"], default="all",
+                    help="Which parameters train (backbone is always frozen). all = adapt_features + heads "
+                         "(original recipe); heads = only class_embed/bbox_embed (+aux, +scale-fusion gates); "
+                         "decoder = heads + adapt_features.up1/up2/up3/up_aux; no-proto-attn = all except "
+                         "adapt_features.prototype_attention* (the exemplar-matching cross-attention, most "
+                         "prone to overfitting the few training objects). Narrower scopes trade train fit "
+                         "for generalization to unseen categories.")
+    p.add_argument("--freeze-prefixes", nargs="+", default=[],
+                    help="Extra parameter-name prefixes to freeze on top of --finetune-scope, e.g. "
+                         "adapt_features.image_attention_l1 adapt_features.prototype_attention_l2. "
+                         "Errors out if a prefix matches no parameter.")
     p.add_argument("--lr-patience", type=int, default=3,
-                    help="Epochs with no val_loss improvement before ReduceLROnPlateau halves LR -- "
+                    help="Epochs with no --select-by improvement before ReduceLROnPlateau halves LR -- "
                          "added after the first finetune attempt showed train+val loss oscillating "
                          "together (both rising for 2+ epochs at a stretch) rather than converging "
                          "smoothly, a classic too-high-LR-for-this-stage symptom.")
@@ -470,6 +502,8 @@ def main():
         cfg, device=device,
         num_ref_scale_variants=args.num_ref_scale_variants,
         scale_gate_hidden_dim=args.scale_gate_hidden_dim,
+        finetune_scope=args.finetune_scope,
+        extra_freeze_prefixes=tuple(args.freeze_prefixes),
     )
 
     ref_cache = RefImageCache(cfg, video_ids)
@@ -487,17 +521,25 @@ def main():
         hard_frame_frac=args.hard_frame_frac, hard_frame_top=args.hard_frame_top,
         seed=args.seed,
     )
+    val_steps = args.val_steps if args.val_steps > 0 else max(1, steps_per_epoch // 4)
+    if args.val_augment:
+        val_aug = dict(
+            ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
+            brightness_range=(args.brightness_lo, args.brightness_hi),
+            contrast_range=(args.contrast_lo, args.contrast_hi),
+            query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
+            max_dynamic_exemplars=args.max_dynamic_exemplars,
+            dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
+        )
+    else:
+        val_aug = dict(ref_downscale_range=(args.val_ref_downscale, args.val_ref_downscale))
     val_ds = Geco2FinetuneDataset(
-        cfg, val_ids, ref_cache, steps_per_epoch=max(1, steps_per_epoch // 4),
-        p_present=args.p_present, ref_downscale_range=(args.ref_downscale_lo, args.ref_downscale_hi),
-        brightness_range=(args.brightness_lo, args.brightness_hi),
-        contrast_range=(args.contrast_lo, args.contrast_hi),
-        query_downscale_range=(args.query_downscale_lo, args.query_downscale_hi),
-        max_dynamic_exemplars=args.max_dynamic_exemplars,
-        dynamic_exemplar_box_jitter=args.dynamic_exemplar_box_jitter,
-        num_ref_scale_variants=args.num_ref_scale_variants,
-        seed=args.seed + 1,
+        cfg, val_ids, ref_cache, steps_per_epoch=val_steps, p_present=args.p_present,
+        num_ref_scale_variants=args.num_ref_scale_variants, seed=args.seed + 1, **val_aug,
     )
+    log.info("Validation: %d fixed frame(s) per epoch, %s", val_steps,
+             "training augmentations" if args.val_augment else
+             f"clean (ref_downscale={args.val_ref_downscale}, no other augmentation)")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
                                collate_fn=finetune_collate, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
@@ -515,8 +557,9 @@ def main():
     # See --lr-patience help text: addresses the oscillating train+val loss
     # observed in the first finetune attempt (both rising together for
     # multiple epochs at a stretch, rather than converging), by halving LR
-    # once val_loss plateaus instead of holding a single flat LR for the
-    # whole run.
+    # once the --select-by metric plateaus instead of holding a single flat
+    # LR for the whole run. Stepped with select_value (always "lower is
+    # better"), the same quantity checkpointing and early stopping use.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=args.lr_decay_factor, patience=args.lr_patience,
     )
@@ -533,6 +576,30 @@ def main():
         log.info("Dry run OK in %.1fs: mean_loss=%.4f present=%d absent=%d",
                  time.time() - t0, mean_loss, n_present, n_absent)
         return
+
+    def selection_value(val_loss: float, val_stats: dict) -> float:
+        """--select-by metric as "lower is better" (inf when undefined)."""
+        v = val_loss if args.select_by == "val_loss" else -val_stats[args.select_by]
+        return v if np.isfinite(v) else float("inf")
+
+    def shown_metric(select_value: float) -> float:
+        return select_value if args.select_by == "val_loss" else -select_value
+
+    baseline_value = None
+    if not args.skip_baseline_eval:
+        t0 = time.time()
+        base_loss, base_present, base_absent, base_stats = run_epoch(
+            model, val_loader, criterion, optimizer, args, image_size, device, train=False,
+        )
+        baseline_value = selection_value(base_loss, base_stats)
+        log.info(
+            "  baseline val detection: top1_hit=%.3f margin=%.3f present_empty=%.3f absent_empty=%.3f "
+            "absent_max=%.3f",
+            base_stats["top1_hit"], base_stats["margin"], base_stats["present_empty"],
+            base_stats["absent_empty"], base_stats["absent_max"],
+        )
+        log.info("epoch 0 (base checkpoint, no training): val_loss=%.4f (present=%d absent=%d) [%.1fs]",
+                 base_loss, base_present, base_absent, time.time() - t0)
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -556,11 +623,9 @@ def main():
             val_stats["top1_hit"], val_stats["margin"], val_stats["present_empty"],
             val_stats["absent_empty"], val_stats["absent_max"],
         )
-        select_value = val_loss if args.select_by == "val_loss" else -val_stats[args.select_by]
-        if not np.isfinite(select_value):
-            select_value = float("inf")
+        select_value = selection_value(val_loss, val_stats)
         lr_before = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_loss)
+        scheduler.step(select_value)
         lr_after = optimizer.param_groups[0]["lr"]
         log.info(
             "epoch %d/%d: train_loss=%.4f (present=%d absent=%d) val_loss=%.4f "
@@ -569,8 +634,8 @@ def main():
             val_loss, val_present, val_absent, lr_after, time.time() - t0,
         )
         if lr_after < lr_before:
-            log.info("LR decayed: %.2e -> %.2e (val_loss plateaued for %d epochs)",
-                      lr_before, lr_after, args.lr_patience)
+            log.info("LR decayed: %.2e -> %.2e (%s plateaued for %d epochs)",
+                      lr_before, lr_after, args.select_by, args.lr_patience)
 
         if select_value < best_val_loss:
             best_val_loss = select_value
@@ -581,17 +646,21 @@ def main():
                  "val_stats": val_stats, "args": vars(args)},
                 out_checkpoint,
             )
-            shown = val_loss if args.select_by == "val_loss" else val_stats[args.select_by]
             log.info("Saved new best checkpoint (%s=%.4f, val_loss=%.4f) -> %s",
-                     args.select_by, shown, val_loss, out_checkpoint)
+                     args.select_by, shown_metric(select_value), val_loss, out_checkpoint)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.early_stop_patience:
                 log.info("Early stopping: no val improvement for %d epoch(s)", epochs_without_improvement)
                 break
 
-    best_shown = best_val_loss if args.select_by == "val_loss" else -best_val_loss
-    log.info("Training done. Best %s=%.4f, checkpoint at %s", args.select_by, best_shown, out_checkpoint)
+    log.info("Training done. Best %s=%.4f, checkpoint at %s",
+             args.select_by, shown_metric(best_val_loss), out_checkpoint)
+    if baseline_value is not None:
+        log.info("Base checkpoint (epoch 0) %s=%.4f", args.select_by, shown_metric(baseline_value))
+        if best_val_loss >= baseline_value:
+            log.warning("Finetuning never beat the base checkpoint on %s -- the base checkpoint is "
+                        "the better choice for this validation set.", args.select_by)
 
 
 if __name__ == "__main__":

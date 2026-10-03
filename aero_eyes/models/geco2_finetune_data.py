@@ -170,6 +170,10 @@ def sample_brightness_contrast(
     return brightness, contrast
 
 
+_MAX_JITTER_SHIFT = 0.5   # center shift, as a fraction of the box's own w/h
+_MIN_JITTER_SCALE = 0.5   # never shrink below half size (and never invert)
+
+
 def jitter_box(
     rng: np.random.Generator, box: tuple[float, float, float, float], jitter: float,
 ) -> tuple[float, float, float, float]:
@@ -180,14 +184,22 @@ def jitter_box(
     time confirmed detection box (which passed consecutive-hit + cross-
     check, but is a MODEL prediction, not ground truth). jitter=0.0 (the
     default) is a no-op, returning `box` unchanged.
+
+    The shift is capped at _MAX_JITTER_SHIFT (the jittered center always
+    stays inside the original box) and the scale floored at
+    _MIN_JITTER_SCALE: an unbounded jitter (e.g. 1.5) otherwise crops mostly
+    background and, for jitter > 1, yields a NEGATIVE scale, i.e. an
+    inverted (x1 > x2) box -- an exemplar no real confirmed detection could
+    ever produce.
     """
     if jitter <= 0.0:
         return box
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
-    cx = (x1 + x2) / 2.0 + rng.uniform(-jitter, jitter) * w
-    cy = (y1 + y2) / 2.0 + rng.uniform(-jitter, jitter) * h
-    scale = rng.uniform(1.0 - jitter, 1.0 + jitter)
+    shift = min(jitter, _MAX_JITTER_SHIFT)
+    cx = (x1 + x2) / 2.0 + rng.uniform(-shift, shift) * w
+    cy = (y1 + y2) / 2.0 + rng.uniform(-shift, shift) * h
+    scale = rng.uniform(max(_MIN_JITTER_SCALE, 1.0 - jitter), 1.0 + jitter)
     hw, hh = (w * scale) / 2.0, (h * scale) / 2.0
     return (cx - hw, cy - hh, cx + hw, cy + hh)
 
@@ -476,6 +488,7 @@ class Geco2FinetuneDataset(Dataset):
         self.hard_frame_top = hard_frame_top
         self._hardness: dict[tuple[str, bool], dict[int, float]] = {}
         self.hard_count = 0
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
 
         self._gt: dict[str, dict[int, Box]] = {}
@@ -497,6 +510,13 @@ class Geco2FinetuneDataset(Dataset):
 
     def __len__(self) -> int:
         return self.steps_per_epoch
+
+    def reset_rng(self) -> None:
+        """Re-seed sampling so the next pass draws exactly the same frames
+        and augmentations as the first one -- call before every validation
+        pass so val metrics compare epochs on an identical set (otherwise
+        self.rng keeps advancing and each epoch sees different frames)."""
+        self.rng = np.random.default_rng(self.seed)
 
     def record_hardness(self, video_id: str, frame_idx: int, is_present: bool, value: float) -> None:
         """Latest hardness of a frame (higher = harder); only used when hard_frame_frac > 0."""
