@@ -1293,6 +1293,10 @@ stage123_geco2:
     background_source: photo
     video_frame_index: 0
     feather_px: 2.0
+    # video_frame only: true = blur the frame inside the object's box (outside
+    # its mask) so no confuser detail is pooled; false = keep the sharp frame
+    # there (same textured surroundings as query objects). Ablation knob.
+    blur_box_surround: true
     # Expected apparent size(s) [width, height] in pixels of the object AS
     # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- estimate
     # from flight altitude/GSD, or eyeball it on a sample frame. Required

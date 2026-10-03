@@ -179,29 +179,32 @@ def _scaled_object_patch(
 
 def _paste_object_on_frame(
     frame_canvas: np.ndarray, patch: np.ndarray, alpha: np.ndarray, x: int, y: int, feather_px: float,
+    blur_box_surround: bool = True,
 ) -> np.ndarray:
-    """Composite `patch` (alpha) onto a copy of frame_canvas at (x, y). The
-    patch's box area of the frame is first swapped for a strongly blurred
-    copy (soft-edged, so it does not draw a rectangle) -- the pixels inside
-    the box but outside the object's mask are pooled by RoI-Align directly,
-    so they must not carry sharp frame structure such as a confuser. Parts
-    of the patch falling outside the canvas are dropped."""
+    """Composite `patch` (alpha) onto a copy of frame_canvas at (x, y). With
+    blur_box_surround, the patch's box area of the frame is first swapped for
+    a strongly blurred copy (soft-edged, so it does not draw a rectangle) --
+    the pixels inside the box but outside the object's mask are pooled by
+    RoI-Align directly, so they must not carry sharp frame structure such as
+    a confuser; without it the object sits on the sharp frame. Parts of the
+    patch falling outside the canvas are dropped."""
     out = frame_canvas.astype(np.float32)
     H, W = out.shape[:2]
     ph, pw = alpha.shape
     cx1, cy1, cx2, cy2 = max(0, x), max(0, y), min(W, x + pw), min(H, y + ph)
     if cx2 <= cx1 or cy2 <= cy1:
         return frame_canvas.copy()
-    sigma = max(3.0, 0.5 * max(ph, pw))
-    pad = int(np.ceil(3 * sigma))
-    ox1, oy1, ox2, oy2 = max(0, cx1 - pad), max(0, cy1 - pad), min(W, cx2 + pad), min(H, cy2 + pad)
-    region = out[oy1:oy2, ox1:ox2]
-    blurred = cv2.GaussianBlur(region, (0, 0), sigmaX=sigma)
-    box_w = np.zeros(region.shape[:2], np.float32)
-    box_w[cy1 - oy1:cy2 - oy1, cx1 - ox1:cx2 - ox1] = 1.0
-    if feather_px > 0:
-        box_w = cv2.GaussianBlur(box_w, (0, 0), sigmaX=max(feather_px, 1.0))
-    region[:] = box_w[..., None] * blurred + (1.0 - box_w[..., None]) * region
+    if blur_box_surround:
+        sigma = max(3.0, 0.5 * max(ph, pw))
+        pad = int(np.ceil(3 * sigma))
+        ox1, oy1, ox2, oy2 = max(0, cx1 - pad), max(0, cy1 - pad), min(W, cx2 + pad), min(H, cy2 + pad)
+        region = out[oy1:oy2, ox1:ox2]
+        blurred = cv2.GaussianBlur(region, (0, 0), sigmaX=sigma)
+        box_w = np.zeros(region.shape[:2], np.float32)
+        box_w[cy1 - oy1:cy2 - oy1, cx1 - ox1:cx2 - ox1] = 1.0
+        if feather_px > 0:
+            box_w = cv2.GaussianBlur(box_w, (0, 0), sigmaX=max(feather_px, 1.0))
+        region[:] = box_w[..., None] * blurred + (1.0 - box_w[..., None]) * region
 
     a = alpha[cy1 - y:cy2 - y, cx1 - x:cx2 - x][..., None]
     p = patch[cy1 - y:cy2 - y, cx1 - x:cx2 - x].astype(np.float32)
@@ -212,7 +215,7 @@ def _paste_object_on_frame(
 def _render_on_video_frame(
     img: np.ndarray, mask: np.ndarray, tight_box, resize_ratio: float,
     frame_canvas: np.ndarray, valid_hw: tuple[int, int], context_margin: float, feather_px: float,
-    log_ctx: str = "",
+    log_ctx: str = "", blur_box_surround: bool = True,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     """scale_calibration.background_source=video_frame: paste the object
     (scaled by resize_ratio, feathered) at the flattest spot of the real
@@ -235,7 +238,7 @@ def _render_on_video_frame(
             )
     else:
         x, y = loc[0] + (win_w - pw) // 2, loc[1] + (win_h - ph) // 2
-    canvas = _paste_object_on_frame(frame_canvas, patch, alpha, x, y, feather_px)
+    canvas = _paste_object_on_frame(frame_canvas, patch, alpha, x, y, feather_px, blur_box_surround)
     H, W = canvas.shape[:2]
     box = (float(max(0, x)), float(max(0, y)), float(min(W, x + pw)), float(min(H, y + ph)))
     return canvas, box
@@ -586,7 +589,7 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                         )
                         canvas, box_c = _render_on_video_frame(
                             img, m, b, ratio, frame_canvas, valid_hw, sc_cfg.context_margin, sc_cfg.feather_px,
-                            log_ctx=f"{sample_id}: ref {ref_idx}: ",
+                            log_ctx=f"{sample_id}: ref {ref_idx}: ", blur_box_surround=sc_cfg.blur_box_surround,
                         )
                     elif sc_cfg.mode == "factor":
                         canvas, box_c = _render_object_canvas(
@@ -608,8 +611,8 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                          for bx in canvas_boxes if bx is not None]
                 log.info(
                     "[Stage123-GeCo2] %s: scale_calibration background_source=video_frame (frame %d, "
-                    "feather_px=%.1f) -- object pasted at: %s", sample_id, sc_cfg.video_frame_index,
-                    sc_cfg.feather_px, ", ".join(where),
+                    "feather_px=%.1f, blur_box_surround=%s) -- object pasted at: %s", sample_id,
+                    sc_cfg.video_frame_index, sc_cfg.feather_px, sc_cfg.blur_box_surround, ", ".join(where),
                 )
             if sc_cfg.mode == "factor":
                 sizes = [f"{bx[2] - bx[0]:.0f}x{bx[3] - bx[1]:.0f}" for bx in canvas_boxes if bx is not None]

@@ -2358,7 +2358,11 @@ class ScaleCalibrationConfig(BaseModel):
         paste off whatever objects/confusers the frame shows). Inside the
         object's box but outside its mask -- pixels RoI-Align pools from
         directly -- the frame is replaced by a strongly blurred copy (soft
-        edges), so no sharp frame structure leaks into the exemplar token.
+        edges), so no sharp frame structure leaks into the exemplar token
+        (blur_box_surround=false keeps the sharp frame there instead -- the
+        exemplar then sits on the same kind of textured ground as the query
+        objects, at the risk of pooling whatever the frame shows in the box
+        corners; an ablation knob, not yet validated either way).
         If the scaled object does not fit the real frame area it is centered
         and clipped (a warning is logged). Independent of domain_calibration
         (still opt-in on its own). NOT YET VALIDATED.
@@ -2368,6 +2372,7 @@ class ScaleCalibrationConfig(BaseModel):
     background_source: Literal["photo", "video_frame"] = "photo"
     video_frame_index: int = 0
     feather_px: float = 2.0
+    blur_box_surround: bool = True  # video_frame only
     # Expected apparent size(s) [width, height] in pixels of the object AS
     # IT APPEARS IN THE RAW VIDEO FRAME (before any resize/pad) -- e.g.
     # estimated from flight altitude/GSD, or eyeballed on a sample frame.
