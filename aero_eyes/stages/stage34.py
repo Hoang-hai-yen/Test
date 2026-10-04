@@ -50,6 +50,18 @@ def _score_against_ref(feats: np.ndarray, ref: np.ndarray, metric: str) -> np.nd
     raise ValueError(f"Unknown metric '{metric}'")
 
 
+def _otsu_threshold(scores: np.ndarray, bins: int = 256) -> float:
+    """Otsu split of a 1-D score distribution (maximises between-class variance)."""
+    hist, edges = np.histogram(scores, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    w0 = np.cumsum(hist).astype(np.float64)
+    w1 = w0[-1] - w0
+    m0 = np.cumsum(hist * centers) / np.maximum(w0, 1)
+    m1 = (np.sum(hist * centers) - np.cumsum(hist * centers)) / np.maximum(w1, 1)
+    between = w0 * w1 * (m0 - m1) ** 2
+    return float(edges[int(np.argmax(between)) + 1])
+
+
 def _run_matching(cfg, sample_id: str) -> Path:
     """(cũ: run_stage3) So khớp candidates với prototype -> detections.json."""
     from aero_eyes.stages.stage12 import read_candidates_with_features
@@ -178,6 +190,15 @@ def _run_matching(cfg, sample_id: str) -> Path:
             effective_threshold = max(s3.adaptive_min_floor, raw_threshold)
         else:
             effective_threshold = raw_threshold
+
+        if getattr(s3, "adaptive_cap", "none") == "otsu":
+            otsu_thr = _otsu_threshold(all_sims)
+            if otsu_thr < effective_threshold:
+                log.info(
+                    "[StageB/match] %s: adaptive threshold %.3f capped by Otsu split %.3f",
+                    sample_id, effective_threshold, otsu_thr,
+                )
+                effective_threshold = max(s3.adaptive_min_floor, otsu_thr)
 
         sim_max = float(all_sims.max())
         if effective_threshold > sim_max:

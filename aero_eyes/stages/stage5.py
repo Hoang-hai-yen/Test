@@ -21,15 +21,29 @@ from aero_eyes.types import Box
 log = logging.getLogger(__name__)
 
 
-def _ema_smooth(tube: dict[int, Box], alpha: float) -> dict[int, Box]:
-    """Exponential moving average smoothing over consecutive present frames."""
+def _ema_smooth(tube: dict[int, Box], alpha: float, reset_iou: float = 0.3) -> dict[int, Box]:
+    """Exponential moving average smoothing over consecutive present frames.
+
+    The EMA state is reset at every temporal gap and whenever the raw box
+    jumps away from the smoothed one (IoU < reset_iou, i.e. a re-detection
+    landed somewhere else). Carrying state across those used to blend the
+    new box with a stale, far-away one -- on the stage-diagnose run this made
+    S5 lower ST-IoU vs raw tracks.json on all 16 videos (e.g. Helmet_1
+    0.809 -> 0.634).
+    """
+    from aero_eyes.utils.geometry import box_iou
+
     if not tube:
         return tube
     frames = sorted(tube.keys())
     smoothed: dict[int, Box] = {}
     prev: Box | None = None
+    prev_fi: int | None = None
     for fi in frames:
         b = tube[fi]
+        if prev is not None and (fi != prev_fi + 1 or box_iou(b, prev) < reset_iou):
+            prev = None
+        prev_fi = fi
         if prev is None:
             smoothed[fi] = b
         else:
@@ -116,7 +130,11 @@ def run_stage5(cfg, sample_id: str) -> Path:
 
     # ---- Temporal smoothing ----
     if s5.temporal_smoothing.enabled and s5.temporal_smoothing.method == "ema":
-        tube = _ema_smooth(raw_tube, alpha=s5.temporal_smoothing.ema_alpha)
+        tube = _ema_smooth(
+            raw_tube,
+            alpha=s5.temporal_smoothing.ema_alpha,
+            reset_iou=s5.temporal_smoothing.reset_iou,
+        )
     else:
         tube = dict(raw_tube)
 

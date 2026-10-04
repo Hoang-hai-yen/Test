@@ -165,6 +165,11 @@ class Stage3Config(BaseModel):
     adaptive_threshold: bool = False
     adaptive_z_score: float = 2.0
     adaptive_min_floor: float = 0.05
+    # Upper cap on the adaptive threshold. "otsu": min(mean + z*std, Otsu
+    # split of the score histogram). mean + z*std assumes the target is a
+    # rare outlier; when most candidates ARE the target (few proposals per
+    # frame, e.g. Wallet_1) it lands above the target's own scores.
+    adaptive_cap: Literal["none", "otsu"] = "none"
     calibrate: CalibrateConfig = CalibrateConfig()
 
 
@@ -217,6 +222,7 @@ class TemporalSmoothingConfig(BaseModel):
     enabled: bool = True
     method: Literal["ema", "none"] = "ema"
     ema_alpha: float = 0.6
+    reset_iou: float = 0.3   # restart EMA when raw box jumps (IoU with smoothed box below this)
 
 
 class Stage5Config(BaseModel):
