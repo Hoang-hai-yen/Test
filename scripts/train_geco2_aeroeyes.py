@@ -33,7 +33,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from aero_eyes.models.geco2_loss_extras import LossOptions, custom_main_loss, frame_detection_stats
+from aero_eyes.models.geco2_loss_extras import (
+    LossOptions,
+    cross_frame_rank_loss,
+    custom_main_loss,
+    frame_detection_stats,
+    frame_level_detection_metrics,
+    matched_tp_scores,
+)
 from aero_eyes.models.geco2_finetune_data import (
     DEFAULT_HOLDOUT_CATEGORIES,
     Geco2FinetuneDataset,
@@ -159,15 +166,33 @@ def loss_opts_from_args(args) -> LossOptions:
         rank_weight=args.rank_weight, rank_margin=args.rank_margin, rank_topk=args.rank_topk,
         pos_weight=args.pos_weight, pos_margin=args.pos_margin,
         absent_topk=args.absent_topk, absent_ceiling=args.absent_ceiling, absent_weight=args.absent_weight,
+        recall_weight=args.recall_weight, recall_margin=args.recall_margin,
+        recall_center_frac=args.recall_center_frac,
     )
 
 
-def summarize_frame_stats(rows: list[dict]) -> dict:
+def recall_constraint_ok(val_stats: dict, baseline_stats: dict | None, ratio: float) -> bool:
+    """--min-recall-ratio: an epoch may become the saved checkpoint only if
+    its val recall@t is at least `ratio` x the base checkpoint's (so with
+    ratio=1.0 the saved model never detects fewer TPs than the one it started
+    from, on the validation set). Off when ratio <= 0."""
+    if ratio <= 0:
+        return True
+    base = (baseline_stats or {}).get("recall_at_t", float("nan"))
+    got = val_stats.get("recall_at_t", float("nan"))
+    if not np.isfinite(base):
+        return True
+    return bool(np.isfinite(got) and got >= ratio * base - 1e-9)
+
+
+def summarize_frame_stats(rows: list[dict], threshold: float = 0.3) -> dict:
     """Detection-oriented validation numbers (peaks from the training-mode
     median-threshold head): top1_hit = share of present frames whose
     highest-scoring peak has IoU>=0.5; margin = mean(best good peak - highest
-    clutter peak); absent_max = mean over absent frames of the highest peak
-    score (empty frames count as 0, i.e. nothing emitted)."""
+    clutter peak), in-frame only; absent_max = mean over absent frames of the
+    highest peak score (empty frames count as 0, i.e. nothing emitted). Plus
+    the cross-frame numbers of frame_level_detection_metrics (frame_ap,
+    best_f1, recall_at_t / absent_fp_at_t at `threshold`, tp_score)."""
     pres = [r for r in rows if r.get("present")]
     absn = [r for r in rows if not r.get("present", True)]
     out = {
@@ -177,7 +202,18 @@ def summarize_frame_stats(rows: list[dict]) -> dict:
         "absent_empty": float(np.mean([r["empty"] for r in absn])) if absn else float("nan"),
         "absent_max": float(np.mean([max(r["max_score"], 0.0) for r in absn])) if absn else float("nan"),
     }
+    out.update(frame_level_detection_metrics(rows, threshold))
     return out
+
+
+def format_detection_stats(stats: dict, threshold: float) -> str:
+    return (
+        f"top1_hit={stats['top1_hit']:.3f} margin={stats['margin']:.3f} "
+        f"frame_ap={stats['frame_ap']:.3f} best_f1={stats['best_f1']:.3f}@{stats['best_f1_thr']:.3f} "
+        f"oracle_recall={stats['oracle_recall']:.3f} "
+        f"tp_score={stats['tp_score']:.3f} absent_max={stats['absent_max']:.3f} "
+        f"recall@{threshold:g}={stats['recall_at_t']:.3f} absent_fp@{threshold:g}={stats['absent_fp_at_t']:.3f}"
+    )
 
 
 def run_epoch(model, loader, criterion, optimizer, args, image_size, device, train: bool):
@@ -262,6 +298,34 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
                 # re-identification literature note for the rationale.
                 if consistency_loss is not None and args.resolution_consistency_weight > 0.0:
                     loss = loss + args.resolution_consistency_weight * consistency_loss
+
+                # --pair-absent: score an absent frame of the same video with
+                # the SAME exemplars. It gets the ordinary absent-frame loss,
+                # and (--cross-rank-weight) the cross-frame score triplet:
+                # this sample's TP peaks must beat that frame's strongest
+                # peaks by --cross-rank-margin.
+                if train and sample.pair_frame_bgr is not None:
+                    pfeats, pscale, _ = query_backbone_pass(model, sample.pair_frame_bgr, image_size, device)
+                    pout = forward_train_step(model, pfeats, pscale, proto)
+                    pair_stats: dict = {}
+                    loss = loss + compute_step_loss(
+                        criterion, pout, torch.zeros((0, 4), device=device), args.aux_weight, image_size,
+                        aux_size_threshold_px=args.aux_size_threshold_px,
+                        opts=loss_opts_from_args(args), stats=pair_stats,
+                    )
+                    frame_stats.append(pair_stats)
+                    n_absent += 1
+                    if hasattr(loader.dataset, "record_hardness") and np.isfinite(pair_stats.get("max_score", np.nan)):
+                        loader.dataset.record_hardness(
+                            sample.video_id, sample.pair_frame_idx, False, float(pair_stats["max_score"]),
+                        )
+                    if args.cross_rank_weight > 0:
+                        tp_s = matched_tp_scores(
+                            criterion.matcher, out.main, target_boxes, min_iou=loss_opts_from_args(args).tp_min_iou,
+                        )
+                        loss = loss + args.cross_rank_weight * cross_frame_rank_loss(
+                            tp_s, pout.main["box_v"][0], args.cross_rank_margin, args.cross_rank_topk,
+                        )
                 batch_losses.append(loss)
                 n_samples += 1
 
@@ -278,7 +342,7 @@ def run_epoch(model, loader, criterion, optimizer, args, image_size, device, tra
             total_loss += float(batch_loss.item())
 
     mean_loss = total_loss / max(1, n_samples)
-    return mean_loss, n_present, n_absent, summarize_frame_stats(frame_stats)
+    return mean_loss, n_present, n_absent, summarize_frame_stats(frame_stats, args.metric_threshold)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -340,11 +404,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "scored worst in earlier epochs (absent: highest peak score; present: smallest "
                          "TP-vs-clutter margin). Keeps --p-present unchanged. 0 = uniform (stock).")
     p.add_argument("--hard-frame-top", type=int, default=50)
-    p.add_argument("--select-by", choices=["val_loss", "top1_hit", "margin"], default="val_loss",
+    p.add_argument("--select-by", default="val_loss",
+                    choices=["val_loss", "top1_hit", "margin", "frame_ap", "best_f1", "recall_at_t"],
                     help="Validation metric that picks the saved checkpoint, drives ReduceLROnPlateau and "
                          "early stopping. top1_hit = share of present val frames whose highest-scoring peak "
-                         "has IoU>=0.5; margin = mean(best good peak - highest clutter peak). Both are logged "
-                         "every epoch regardless.")
+                         "has IoU>=0.5; margin = mean(best good peak - highest clutter peak), in-frame only. "
+                         "frame_ap / best_f1 = cross-frame: every frame's top-1 peak ranked together, so a TP "
+                         "must also beat the strongest peak of absent frames (threshold-free; recommended); "
+                         "recall_at_t = present frames whose correct top-1 is >= --metric-threshold. All are "
+                         "logged every epoch regardless.")
+    p.add_argument("--metric-threshold", type=float, default=0.3,
+                    help="Score threshold for the logged recall@t / absent_fp@t (an operating point; the "
+                         "logged best_f1@thr shows where the best one currently is).")
+    p.add_argument("--pair-absent", action="store_true",
+                    help="Each PRESENT training sample also scores an absent frame of the same video with the "
+                         "SAME exemplars (hard-mined with --hard-frame-frac). That frame gets the ordinary "
+                         "absent loss, and is the negative of --cross-rank-weight. ~1.5-2x time per step.")
+    p.add_argument("--cross-rank-weight", type=float, default=0.0,
+                    help="Cross-frame score triplet (needs --pair-absent): mean relu(margin + s_neg - s_TP), "
+                         "s_TP = matched TP peaks (IoU>=0.3) of the present frame, s_neg = the "
+                         "--cross-rank-topk strongest peaks of its paired absent frame. Separates TPs from "
+                         "other frames' clutter, which the in-frame --rank-weight cannot. Pair with "
+                         "--pos-weight so it is not satisfied by lowering TP scores.")
+    p.add_argument("--cross-rank-margin", type=float, default=0.3)
+    p.add_argument("--recall-weight", type=float, default=0.0,
+                    help="Recall hinge on every present frame: relu(--recall-margin - s), s = the highest peak "
+                         "in the central --recall-center-frac of the GT box (or the centerness value at the GT "
+                         "centre if no peak is there). Needs no Hungarian match / IoU, so it also covers frames "
+                         "with a poor box, which the pos/rank terms skip. Keeps an object detectable at the "
+                         "operating threshold -- set --recall-margin to it (e.g. --metric-threshold).")
+    p.add_argument("--recall-margin", type=float, default=0.3)
+    p.add_argument("--recall-center-frac", type=float, default=0.5)
+    p.add_argument("--min-recall-ratio", type=float, default=0.0,
+                    help="Checkpoint guard: an epoch is only saved as best if its val recall@t "
+                         "(--metric-threshold) is >= this x the base checkpoint's (epoch 0). 1.0 = never save a "
+                         "model that detects fewer TPs than the start; 0 = off. Among qualifying epochs the "
+                         "best --select-by wins. Needs the baseline eval (no --skip-baseline-eval).")
+    p.add_argument("--cross-rank-topk", type=int, default=1)
     p.add_argument("--val-steps", type=int, default=0,
                     help="Number of validation frames per epoch (fixed set, re-drawn identically every "
                          "epoch). 0 = steps_per_epoch // 4 (old default). ~300+ recommended: with ~70 "
@@ -508,6 +604,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main():
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
+    if args.cross_rank_weight > 0 and not args.pair_absent:
+        raise SystemExit("--cross-rank-weight needs --pair-absent (its negatives are the paired absent frames)")
+    if args.min_recall_ratio > 0 and args.skip_baseline_eval:
+        raise SystemExit("--min-recall-ratio compares against the epoch-0 baseline; drop --skip-baseline-eval")
     set_seed(args.seed)
 
     from aero_eyes.config import load_config
@@ -572,7 +672,7 @@ def main():
         hard_frame_frac=args.hard_frame_frac, hard_frame_top=args.hard_frame_top,
         seed=args.seed,
         ref_canvas_mode=args.ref_canvas_mode, calib_size_jitter=args.calib_size_jitter,
-        ref_canvas_bg=args.ref_canvas_bg,
+        ref_canvas_bg=args.ref_canvas_bg, pair_absent=args.pair_absent,
     )
     val_steps =args.val_steps if args.val_steps > 0 else max(1, steps_per_epoch // 4)
     if args.val_augment:
@@ -657,18 +757,14 @@ def main():
         return select_value if args.select_by == "val_loss" else -select_value
 
     baseline_value = None
+    base_stats = None
     if not args.skip_baseline_eval:
         t0 = time.time()
         base_loss, base_present, base_absent, base_stats = run_epoch(
             model, val_loader, criterion, optimizer, args, image_size, device, train=False,
         )
         baseline_value = selection_value(base_loss, base_stats)
-        log.info(
-            "  baseline val detection: top1_hit=%.3f margin=%.3f present_empty=%.3f absent_empty=%.3f "
-            "absent_max=%.3f",
-            base_stats["top1_hit"], base_stats["margin"], base_stats["present_empty"],
-            base_stats["absent_empty"], base_stats["absent_max"],
-        )
+        log.info("  baseline val detection: %s", format_detection_stats(base_stats, args.metric_threshold))
         log.info("epoch 0 (base checkpoint, no training): val_loss=%.4f (present=%d absent=%d) [%.1fs]",
                  base_loss, base_present, base_absent, time.time() - t0)
 
@@ -681,19 +777,11 @@ def main():
         train_loss, train_present, train_absent, train_stats = run_epoch(
             model, train_loader, criterion, optimizer, args, image_size, device, train=True,
         )
-        log.info(
-            "  train detection: top1_hit=%.3f margin=%.3f present_empty=%.3f absent_empty=%.3f absent_max=%.3f",
-            train_stats["top1_hit"], train_stats["margin"], train_stats["present_empty"],
-            train_stats["absent_empty"], train_stats["absent_max"],
-        )
+        log.info("  train detection: %s", format_detection_stats(train_stats, args.metric_threshold))
         val_loss, val_present, val_absent, val_stats = run_epoch(
             model, val_loader, criterion, optimizer, args, image_size, device, train=False,
         )
-        log.info(
-            "  val detection: top1_hit=%.3f margin=%.3f present_empty=%.3f absent_empty=%.3f absent_max=%.3f",
-            val_stats["top1_hit"], val_stats["margin"], val_stats["present_empty"],
-            val_stats["absent_empty"], val_stats["absent_max"],
-        )
+        log.info("  val detection: %s", format_detection_stats(val_stats, args.metric_threshold))
         select_value = selection_value(val_loss, val_stats)
         lr_before = optimizer.param_groups[0]["lr"]
         scheduler.step(select_value)
@@ -708,7 +796,13 @@ def main():
             log.info("LR decayed: %.2e -> %.2e (%s plateaued for %d epochs)",
                       lr_before, lr_after, args.select_by, args.lr_patience)
 
-        if select_value < best_val_loss:
+        recall_ok = recall_constraint_ok(val_stats, base_stats, args.min_recall_ratio)
+        if args.min_recall_ratio > 0:
+            log.info("  recall guard: val recall@%g=%.3f vs required %.3f (%.2f x baseline) -> %s",
+                     args.metric_threshold, val_stats["recall_at_t"],
+                     args.min_recall_ratio * base_stats["recall_at_t"], args.min_recall_ratio,
+                     "ok" if recall_ok else "REJECTED, not saved")
+        if recall_ok and select_value < best_val_loss:
             best_val_loss = select_value
             epochs_without_improvement = 0
             out_checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -725,6 +819,11 @@ def main():
                 log.info("Early stopping: no val improvement for %d epoch(s)", epochs_without_improvement)
                 break
 
+    if not np.isfinite(best_val_loss) and args.min_recall_ratio > 0:
+        log.warning("No epoch met --min-recall-ratio %.2f (recall@%g >= %.3f): nothing was saved -- keep "
+                    "using the base checkpoint.", args.min_recall_ratio, args.metric_threshold,
+                    args.min_recall_ratio * base_stats["recall_at_t"])
+        return
     log.info("Training done. Best %s=%.4f, checkpoint at %s",
              args.select_by, shown_metric(best_val_loss), out_checkpoint)
     if baseline_value is not None:

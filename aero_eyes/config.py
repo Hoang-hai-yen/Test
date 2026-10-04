@@ -4293,6 +4293,75 @@ class Stage123PetDinoCalibrationConfig(BaseModel):
     blur_max_ksize: int = 3
 
 
+class Stage123PetDinoVisualRouteConfig(BaseModel):
+    """stage123_pet_dino.visual_route -- builds the calibrated Visual-route
+    prompt embedding that stage123_pet_dino.detect_route "visual"/"both"
+    detects with (aero_eyes/models/pet_dino_detector.py::
+    build_visual_prompt_embedding), and how.
+
+    The reference photos are close-up product shots; PET-DINO resizes every
+    input image itself, so a plain downscale of the photo is undone and the
+    object still fills the frame. Instead each reference object (its
+    stage1.segmentation mask) is drawn at the size it has in the VIDEO:
+      background_source "video_frame" (default): pasted onto the sample's
+        video frame video_frame_index at full video resolution -- edges
+        feathered (feather_px), at the flattest spot of the frame, the frame
+        inside the box but outside the mask blurred (blur_box_surround);
+        same helpers as stage123_geco2.scale_calibration's video_frame mode.
+        PET-DINO then resizes that frame exactly like a query frame.
+      background_source "photo": the scaled photo drawn centered on a canvas
+        the size of a video frame (stage1.segmentation.background_mode for
+        the photo's own background, its mean color beyond its edges).
+    prompt_layout picks how the reference photos become ONE embedding:
+      "separate" (default): one image per reference, extract_embedding on
+        each, then the mean -- the paper's Visual-G (global-concept)
+        protocol, which averages per-image embeddings.
+      "combined": all references pasted onto the SAME video frame (each at
+        the flattest spot not taken by an earlier one) and sent as several
+        boxes of one label in a single call -- PET-DINO's own universal
+        content carrier (the use_global_box token) aggregates them, as it
+        does for multiple boxes of a category in one image. video_frame
+        background only.
+    PET-DINO consumes one vector per category; the result is saved to
+    <work_dir>/<sample>/pet_dino_visual_prompt.pt.
+
+    Object size in the video, scale_source:
+      "factor": object px in the reference photo x ref_downscale_factor --
+        built before the first keyframe.
+      "text_estimate": the first keyframes run the Text route only; once
+        estimate_min_boxes keyframes had a box (or estimate_max_keyframes
+        keyframes passed), the median sqrt(area) of their top box is the
+        target size, the embedding is built, and the remaining keyframes run
+        detect_route. No box at all -> falls back to ref_downscale_factor
+        (warning). Causal: only already-seen keyframes are used.
+    Per-reference scale is clamped to [min_scale_factor, max_scale_factor].
+
+    box_threshold: score cut for Visual-route boxes (Visual scores are not on
+    the Text route's scale); null = stage123_pet_dino.box_threshold.
+    NOT YET VALIDATED.
+    """
+    scale_source: Literal["factor", "text_estimate"] = "text_estimate"
+    ref_downscale_factor: float = 0.05
+    estimate_min_boxes: int = 3
+    estimate_max_keyframes: int = 30
+    min_scale_factor: float = 0.005
+    max_scale_factor: float = 1.0
+    background_source: Literal["photo", "video_frame"] = "video_frame"
+    prompt_layout: Literal["separate", "combined"] = "separate"
+    video_frame_index: int = 0
+    feather_px: float = 2.0
+    blur_box_surround: bool = True
+    context_margin: float = 0.5
+    label_id: int = 1
+    box_threshold: Optional[float] = None
+
+    @model_validator(mode="after")
+    def check_layout(self) -> "Stage123PetDinoVisualRouteConfig":
+        if self.prompt_layout == "combined" and self.background_source != "video_frame":
+            raise ValueError("stage123_pet_dino.visual_route.prompt_layout=combined needs background_source=video_frame")
+        return self
+
+
 class Stage123PetDinoDynamicPrototypeConfig(BaseModel):
     """stage123_pet_dino.dynamic_prototype -- PET-DINO's own online/
     incremental visual-prototype adaptation. See
@@ -4340,6 +4409,11 @@ class Stage123PetDinoDynamicPrototypeConfig(BaseModel):
     """
     enabled: bool = False
     label_id: int = 1
+    # true: start the bank from stage123_pet_dino.visual_route's calibrated
+    # embedding (<work_dir>/<sample>/pet_dino_visual_prompt.pt, written by
+    # stage123_pet_dino when detect_route uses the Visual route) instead of
+    # calibration below -- falls back to calibration when that file is absent.
+    use_visual_route_embedding: bool = False
     # Raised from an earlier 16: the bank saturates (FIFO-rotates) well
     # before a typical sample's keyframe count exhausts, so the effective
     # "memory" only ever covers a short recent window -- more slots let
@@ -4510,6 +4584,16 @@ class Stage123PetDinoConfig(BaseModel):
     negative_text_prompt: str = ""
     negative_suppress_iou: float = 0.3
     dynamic_prototype: Stage123PetDinoDynamicPrototypeConfig = Stage123PetDinoDynamicPrototypeConfig()
+    # Which PET-DINO route detects -- per keyframe here AND in Stage 4's
+    # PET-DINO re-detection:
+    #   "text" (default): text prompt only -- the original behavior.
+    #   "visual": the calibrated reference embedding only (visual_route).
+    #   "both": union of both routes' boxes (each cut at its own threshold),
+    #           then the usual area filters/NMS/top-K.
+    # With visual_route.scale_source=text_estimate the first keyframes run
+    # Text only until the embedding exists (see visual_route).
+    detect_route: Literal["text", "visual", "both"] = "text"
+    visual_route: Stage123PetDinoVisualRouteConfig = Stage123PetDinoVisualRouteConfig()
     # Same filter as stage123_geco2/stage123_gdino.color_postfilter, applied
     # to each keyframe's PET-DINO boxes and to Stage 4's PET-DINO
     # re-detection. Reference photos are segmented with stage1.segmentation

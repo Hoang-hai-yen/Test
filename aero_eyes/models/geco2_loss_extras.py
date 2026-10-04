@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -41,12 +42,15 @@ class LossOptions:
     absent_ceiling: float = 0.0       # ... above this score (squared hinge)
     absent_weight: float = 1.0
     tp_min_iou: float = 0.3           # matched peaks below this IoU are not treated as TP for rank/pos
+    recall_weight: float = 0.0        # relu(recall_margin - best score near each GT centre), every present frame
+    recall_margin: float = 0.3
+    recall_center_frac: float = 0.5   # "near" = peak centre inside this central fraction of the GT box
 
     def custom_main(self) -> bool:
         return (
             self.group_norm_ce or self.mask_gt_peaks or self.tp_target_iou_floor is not None
             or self.multi_peak_box > 0 or self.rank_weight > 0 or self.pos_weight > 0
-            or self.absent_topk > 0
+            or self.absent_topk > 0 or self.recall_weight > 0
         )
 
 
@@ -177,8 +181,37 @@ def custom_main_loss(
         loss = loss + opts.rank_weight * torch.relu(opts.rank_margin + hard[None, :] - good[:, None]).mean()
     if opts.pos_weight > 0 and len(good):
         loss = loss + opts.pos_weight * torch.relu(opts.pos_margin - good).mean()
+    if opts.recall_weight > 0:
+        best = recall_anchor_scores(scores, xy, centerness, target_boxes, opts.recall_center_frac)
+        loss = loss + opts.recall_weight * torch.relu(opts.recall_margin - best).mean()
 
     return loss, {"n_tp": int(tp_valid.sum()), "n_neg": int(neg_mask.sum())}
+
+
+def recall_anchor_scores(
+    scores: torch.Tensor, xy: torch.Tensor, centerness: torch.Tensor, target_boxes: torch.Tensor,
+    center_frac: float = 0.5,
+) -> torch.Tensor:
+    """[G] differentiable "is this GT detectable at all" score: the highest
+    peak whose centre lies in the central `center_frac` of the GT box, or --
+    when no peak is there -- the centerness map value at the GT centre cell.
+    No Hungarian match and no IoU condition, so frames with a poor box (where
+    the pos/rank terms are skipped) still get pushed to keep a peak on the
+    object; the recall hinge relu(margin - this) is what keeps TPs above the
+    operating threshold."""
+    h, w = centerness.shape[-2], centerness.shape[-1]
+    near = points_in_boxes(xy, target_boxes, center_frac)          # [N,G]
+    out = []
+    for gi in range(target_boxes.shape[0]):
+        idx = near[:, gi].nonzero(as_tuple=True)[0]
+        if len(idx):
+            out.append(scores[idx].max())
+        else:
+            c = (target_boxes[gi, :2] + target_boxes[gi, 2:]) / 2
+            cx = (c[0] * w).long().clamp(0, w - 1)
+            cy = (c[1] * h).long().clamp(0, h - 1)
+            out.append(centerness[0, cy, cx])
+    return torch.stack(out) if out else scores[:0]
 
 
 def frame_detection_stats(
@@ -191,10 +224,12 @@ def frame_detection_stats(
     empty. Absent frame: max_score (-inf when no peaks)."""
     scores, pred_boxes = scores.detach(), pred_boxes.detach()
     n = scores.shape[0]
+    top = float(scores.max()) if n else float("-inf")
     if target_boxes.shape[0] == 0:
-        return {"present": False, "empty": n == 0, "max_score": float(scores.max()) if n else float("-inf")}
+        return {"present": False, "empty": n == 0, "max_score": top, "top_score": top}
     if n == 0:
-        return {"present": True, "empty": True, "top1_hit": False, "margin": -1.0, "hardness": 2.0}
+        return {"present": True, "empty": True, "top1_hit": False, "margin": -1.0, "hardness": 2.0,
+                "top_score": top, "tp_score": None}
     gt = target_boxes[:1].expand(n, 4)
     iou, _ = pair_giou(pred_boxes, gt)
     xy = _cell_xy(ref_points, grid_hw)
@@ -212,4 +247,106 @@ def frame_detection_stats(
     return {
         "present": True, "empty": False, "top1_hit": bool(good[int(scores.argmax())]),
         "margin": margin, "hardness": 1.0 - margin,
+        "top_score": top, "tp_score": best_good,
     }
+
+
+def frame_level_detection_metrics(rows: list[dict], threshold: float) -> dict:
+    """Cross-frame metrics from frame_detection_stats rows, treating each
+    frame's top-1 peak as THE detection (one target per video, as the
+    pipeline uses it) and ranking all frames -- present and absent -- by that
+    score, so a TP only counts as separated if it beats the strongest peak of
+    OTHER frames too (the in-frame `margin` cannot see that):
+
+      frame_ap        average precision over that ranking (TP = present frame
+                      whose top-1 has IoU>=0.5; FP = any other frame's top-1);
+                      denominator = number of present frames. Threshold-free.
+      best_f1 / best_f1_thr  best F1 over all thresholds, and where it is.
+      recall_at_t     present frames whose top-1 is correct AND >= threshold
+                      ("TPs still detected" at a fixed operating point).
+      absent_fp_at_t  absent frames whose top-1 >= threshold.
+      tp_score        mean score of the best good (IoU>=0.5) peak, over
+                      present frames that have one.
+      oracle_recall   present frames with ANY good (IoU>=0.5) peak, whatever
+                      its score -- the recall ceiling if scoring were perfect.
+                      High oracle_recall but low recall_at_t/top1_hit = the
+                      object is localized but scored too low (the heads can
+                      fix that); low oracle_recall = no peak lands on it at
+                      all (adapt_features has to change)."""
+    items: list[tuple[float, bool]] = []
+    n_pos = n_neg = 0
+    rec_hits = fp_hits = 0
+    tp_scores = []
+    for r in rows:
+        top = r.get("top_score", r.get("max_score", float("-inf")))
+        has_pred = not r.get("empty") and top is not None and np.isfinite(top)
+        if r.get("present"):
+            n_pos += 1
+            if r.get("tp_score") is not None:
+                tp_scores.append(r["tp_score"])
+            if has_pred:
+                items.append((top, bool(r.get("top1_hit"))))
+                rec_hits += int(bool(r.get("top1_hit")) and top >= threshold)
+        else:
+            n_neg += 1
+            if has_pred:
+                items.append((top, False))
+                fp_hits += int(top >= threshold)
+    items.sort(key=lambda t: -t[0])
+    tp = fp = 0
+    ap = best_f1 = 0.0
+    best_thr = float("nan")
+    for score, is_tp in items:
+        tp, fp = tp + is_tp, fp + (not is_tp)
+        precision, recall = tp / (tp + fp), (tp / n_pos if n_pos else 0.0)
+        if is_tp:
+            ap += precision
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+        if f1 > best_f1:
+            best_f1, best_thr = f1, score
+    nan = float("nan")
+    return {
+        "frame_ap": ap / n_pos if n_pos else nan,
+        "best_f1": best_f1 if n_pos else nan,
+        "best_f1_thr": best_thr,
+        "recall_at_t": rec_hits / n_pos if n_pos else nan,
+        "absent_fp_at_t": fp_hits / n_neg if n_neg else nan,
+        "tp_score": float(np.mean(tp_scores)) if tp_scores else nan,
+        "oracle_recall": len(tp_scores) / n_pos if n_pos else nan,
+    }
+
+
+def matched_tp_scores(
+    matcher, main_out: dict, target_boxes: torch.Tensor, min_iou: float = 0.3,
+) -> torch.Tensor:
+    """Differentiable scores of the Hungarian-matched peaks whose box has
+    IoU >= min_iou with their GT (same TP definition as the rank/pos terms);
+    empty tensor when there is no GT, no peak, or no good match."""
+    scores = main_out["box_v"][0]
+    if target_boxes.shape[0] == 0 or scores.shape[0] == 0:
+        return scores[:0]
+    targets = [{"boxes": target_boxes, "labels": torch.zeros(len(target_boxes), dtype=torch.long)}]
+    with torch.no_grad():
+        indices, _fn, _fp = matcher(main_out, targets)
+    tp_pred = torch.as_tensor(indices[0][0], dtype=torch.long, device=scores.device)
+    tp_gt = torch.as_tensor(indices[0][1], dtype=torch.long, device=scores.device)
+    if tp_pred.numel() == 0:
+        return scores[:0]
+    iou, _ = pair_giou(main_out["pred_boxes"][0][tp_pred].detach(), target_boxes[tp_gt])
+    return scores[tp_pred][iou >= min_iou]
+
+
+def cross_frame_rank_loss(
+    tp_scores: torch.Tensor, negative_scores: torch.Tensor, margin: float, topk: int = 1,
+) -> torch.Tensor:
+    """Score-space triplet across frames: the anchor is the shared exemplar
+    set, the positive a TP peak of a present frame, the negatives the
+    `topk` strongest peaks of an ABSENT frame of the same video scored with
+    the SAME exemplars -> mean relu(margin + s_neg - s_tp). Unlike the
+    in-frame rank term this compares against other frames, which is what a
+    global score threshold at inference needs. Zero (graph kept) when either
+    side is empty."""
+    if tp_scores.numel() == 0 or negative_scores.numel() == 0:
+        return tp_scores.sum() * 0.0 + negative_scores.sum() * 0.0
+    hard = negative_scores.topk(min(topk, negative_scores.numel())).values
+    return torch.relu(margin + hard[None, :] - tp_scores[:, None]).mean()

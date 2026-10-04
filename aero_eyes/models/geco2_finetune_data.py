@@ -372,6 +372,33 @@ def load_precomputed_ref_masks(path: str | Path) -> tuple[dict, dict[str, np.nda
     return index, masks
 
 
+def check_precomputed_photos(cfg, precomputed: tuple[dict, dict[str, np.ndarray]], video_id: str) -> None:
+    """Raise if this sample's reference files are not byte-identical to the
+    ones the masks were computed from (MD5 recorded by
+    scripts/precompute_ref_masks.py) -- e.g. a re-cropped copy on the training
+    machine: masks/boxes are in that exact photo's pixels, so they would
+    silently land in the wrong place."""
+    import hashlib
+
+    from aero_eyes.stages.stage123_geco2 import list_ref_paths
+
+    entries = precomputed[0].get(video_id)
+    if entries is None:
+        raise KeyError(f"precomputed ref masks have no entry for {video_id!r} -- rerun scripts/precompute_ref_masks.py")
+    refs_dir = Path(cfg.data.data_root) / video_id / cfg.data.refs_subdir
+    paths = list_ref_paths(refs_dir, cfg.data.num_references)
+    bad = []
+    for e, p in zip(entries, paths):
+        if "hash" in e and hashlib.md5(p.read_bytes()).hexdigest() != e["hash"]:
+            bad.append(f"{p.name} (masks made from {e['file']} {e.get('shape')})")
+    if bad:
+        raise ValueError(
+            f"{video_id}: reference photo(s) differ from the ones the precomputed masks were made from: "
+            f"{bad}. Copy the exact photos used for scripts/precompute_ref_masks.py to {refs_dir}, or rerun "
+            "that script on these photos."
+        )
+
+
 def precomputed_masks_for(
     precomputed: tuple[dict, dict[str, np.ndarray]], video_id: str, ref_imgs: list[np.ndarray],
 ) -> tuple[list[np.ndarray], list[tuple[float, float, float, float] | None]]:
@@ -434,6 +461,7 @@ class RefImageCache:
             ref_imgs = _load_ref_images(cfg, video_id)
             if use_masks:
                 if precomputed is not None:
+                    check_precomputed_photos(cfg, precomputed, video_id)
                     masks, boxes = precomputed_masks_for(precomputed, video_id, ref_imgs)
                 else:
                     masks = [segmenter.segment(img) for img in ref_imgs]
@@ -504,6 +532,11 @@ class FinetuneSample:
     # group per entry, in order" -- callers that don't care about Track B's
     # scale-fusion grouping can ignore this field entirely.
     ref_group_ids: list[int] = field(default_factory=list)
+    # pair_absent (opt-in): an ABSENT frame of the same video, scored with
+    # the SAME reference images as this (present) sample, for the
+    # cross-frame score triplet. None when off or this sample is absent.
+    pair_frame_bgr: np.ndarray | None = None
+    pair_frame_idx: int | None = None
 
 
 class Geco2FinetuneDataset(Dataset):
@@ -546,6 +579,7 @@ class Geco2FinetuneDataset(Dataset):
         calib_size_jitter: float = 1.0,
         ref_canvas_bg: str = "photo",
         bg_frame_index: int | None = None,
+        pair_absent: bool = False,
     ):
         if not video_ids:
             raise ValueError("video_ids must be non-empty")
@@ -591,6 +625,11 @@ class Geco2FinetuneDataset(Dataset):
                 )
         self.ref_canvas_bg = ref_canvas_bg
         self.bg_frame_index = bg_frame_index
+        # pair_absent: every PRESENT sample also carries an absent frame of
+        # the same video (hard-mined like any absent frame when
+        # hard_frame_frac > 0), to be scored with the same exemplars -- the
+        # negative of the cross-frame score triplet in the training loop.
+        self.pair_absent = pair_absent
         self.sc_cfg = cfg.stage123_geco2.scale_calibration
         self.cfg = cfg
         self.video_ids = list(video_ids)
@@ -718,18 +757,31 @@ class Geco2FinetuneDataset(Dataset):
         self.rng keeps advancing and each epoch sees different frames)."""
         self.rng = np.random.default_rng(self.seed)
 
-    def _background_canvas(self, video_id: str, query_frame_idx: int) -> tuple[np.ndarray, tuple[int, int], int]:
+    def _sample_absent(self, video_id: str) -> int | None:
+        """An absent frame of this video (hard-mined with probability
+        hard_frame_frac, like _sample_frame), or None if it has none."""
+        absent = self._pools[video_id][1]
+        if not absent:
+            return None
+        if self.hard_frame_frac > 0:
+            hard = self._pick_hard(video_id, False)
+            if hard is not None:
+                return hard
+        return int(self.rng.choice(absent))
+
+    def _background_canvas(self, video_id: str, exclude: set[int]) -> tuple[np.ndarray, tuple[int, int], int]:
         """Frame to paste the references onto, resized/padded like a query:
         bg_frame_index if set, else a random absent frame (any other frame if
-        the video has no absent one) that is not the query frame itself.
-        Returns (frame_canvas, valid_hw, frame index)."""
+        the video has no absent one) not in `exclude` (the query frame and
+        its paired absent frame -- a negative must not share the exemplar's
+        background). Returns (frame_canvas, valid_hw, frame index)."""
         from aero_eyes.stages.stage123_geco2 import _video_frame_canvas
 
         if self.bg_frame_index is not None:
             idx = int(self.bg_frame_index)
         else:
             present, absent, total = self._pools[video_id]
-            pool = [f for f in absent if f != query_frame_idx] or [f for f in range(total) if f != query_frame_idx]
+            pool = [f for f in absent if f not in exclude] or [f for f in range(total) if f not in exclude]
             idx = int(self.rng.choice(pool))
         frame = read_frame(self._video_paths[video_id], idx)
         if frame is None:
@@ -781,11 +833,13 @@ class Geco2FinetuneDataset(Dataset):
         else:
             self.absent_count += 1
 
+        pair_idx = self._sample_absent(video_id) if self.pair_absent and is_present else None
+
         native_imgs, native_boxes = self.ref_cache.get(video_id)
         ref_masks = self.ref_cache.masks(video_id)
         bg = None
         if self.ref_canvas_bg == "video_frame":
-            bg = self._background_canvas(video_id, frame_idx)
+            bg = self._background_canvas(video_id, {frame_idx} | ({pair_idx} if pair_idx is not None else set()))
         ref_images: list[np.ndarray] = []
         ref_boxes: list[tuple[float, float, float, float] | None] = []
         ref_group_ids: list[int] = []
@@ -844,6 +898,13 @@ class Geco2FinetuneDataset(Dataset):
         frame_bgr = _apply_query_downscale(frame_bgr, query_factor)
         gt_box = self._gt[video_id].get(frame_idx)
 
+        pair_frame_bgr = None
+        if pair_idx is not None:
+            # Same query-side degradation recipe, independently sampled.
+            pair_frame_bgr = read_frame(video_path, pair_idx)
+            pair_factor = sample_ref_downscale_factor(self.rng, self.query_downscale_lo, self.query_downscale_hi)
+            pair_frame_bgr = _apply_query_downscale(pair_frame_bgr, pair_factor)
+
         # Extra dynamic-style exemplar(s) (opt-in, see max_dynamic_exemplars
         # docstring in __init__): crop(s) from OTHER present frames of this
         # SAME video, at their own GT box -- never the current query frame
@@ -881,6 +942,7 @@ class Geco2FinetuneDataset(Dataset):
             frame_bgr=frame_bgr, gt_box=gt_box,
             num_dynamic_exemplars=num_dynamic_exemplars,
             ref_group_ids=ref_group_ids,
+            pair_frame_bgr=pair_frame_bgr, pair_frame_idx=pair_idx,
         )
 
 

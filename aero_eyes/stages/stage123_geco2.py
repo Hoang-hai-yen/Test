@@ -139,12 +139,15 @@ def _video_frame_canvas(frame_bgr: np.ndarray, canvas_px: int) -> tuple[np.ndarr
     return canvas, (vh, vw)
 
 
-def _flattest_window(frame_canvas: np.ndarray, valid_hw: tuple[int, int], win_w: int, win_h: int):
+def _flattest_window(frame_canvas: np.ndarray, valid_hw: tuple[int, int], win_w: int, win_h: int,
+                     avoid_boxes=()):
     """Top-left (x, y) of the win_w x win_h window inside the real-frame area
     with the lowest mean gradient magnitude (Sobel), via an integral image.
     Clipped pixels (any channel >= 250) count as maximally busy: blown-out
     highlights have no gradient, but they are sunlit objects (e.g. white
-    sheets), not empty ground. None if the window does not fit."""
+    sheets), not empty ground. avoid_boxes (x1,y1,x2,y2) count as maximally
+    busy too -- e.g. objects already pasted onto this frame. None if the
+    window does not fit."""
     vh, vw = valid_hw
     if win_w > vw or win_h > vh:
         return None
@@ -152,6 +155,8 @@ def _flattest_window(frame_canvas: np.ndarray, valid_hw: tuple[int, int], win_w:
     gray = cv2.cvtColor(real, cv2.COLOR_BGR2GRAY).astype(np.float32)
     grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0), cv2.Sobel(gray, cv2.CV_32F, 0, 1))
     grad[real.max(axis=2) >= 250] = 1000.0
+    for bx1, by1, bx2, by2 in avoid_boxes:
+        grad[max(0, int(by1)):max(0, int(np.ceil(by2))), max(0, int(bx1)):max(0, int(np.ceil(bx2)))] = 1000.0
     ii = cv2.integral(grad, sdepth=cv2.CV_64F)
     sums = ii[win_h:, win_w:] - ii[:-win_h, win_w:] - ii[win_h:, :-win_w] + ii[:-win_h, :-win_w]
     y, x = np.unravel_index(int(np.argmin(sums)), sums.shape)
@@ -215,26 +220,27 @@ def _paste_object_on_frame(
 def _render_on_video_frame(
     img: np.ndarray, mask: np.ndarray, tight_box, resize_ratio: float,
     frame_canvas: np.ndarray, valid_hw: tuple[int, int], context_margin: float, feather_px: float,
-    log_ctx: str = "", blur_box_surround: bool = True,
+    log_ctx: str = "", blur_box_surround: bool = True, avoid_boxes=(),
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     """scale_calibration.background_source=video_frame: paste the object
     (scaled by resize_ratio, feathered) at the flattest spot of the real
-    frame area; returns (canvas, object box in canvas px)."""
+    frame area, away from avoid_boxes; returns (canvas, object box in
+    canvas px)."""
     patch, alpha = _scaled_object_patch(img, mask, tight_box, resize_ratio, feather_px)
     ph, pw = alpha.shape
     win_w = int(round(pw * (1.0 + 2.0 * context_margin)))
     win_h = int(round(ph * (1.0 + 2.0 * context_margin)))
-    loc = _flattest_window(frame_canvas, valid_hw, win_w, win_h)
+    loc = _flattest_window(frame_canvas, valid_hw, win_w, win_h, avoid_boxes)
     if loc is None:
-        loc = _flattest_window(frame_canvas, valid_hw, pw, ph)
+        loc = _flattest_window(frame_canvas, valid_hw, pw, ph, avoid_boxes)
         if loc is not None:
             x, y = loc
         else:
             vh, vw = valid_hw
             x, y = int(round((vw - pw) / 2.0)), int(round((vh - ph) / 2.0))
             log.warning(
-                "[Stage123-GeCo2] %sscale_calibration video_frame: scaled object (%dx%d) does not fit the "
-                "real frame area (%dx%d) -- centered and clipped. Use a smaller scale.", log_ctx, pw, ph, vw, vh,
+                "%spaste on video frame: scaled object (%dx%d) does not fit the real frame area (%dx%d) "
+                "-- centered and clipped. Use a smaller scale.", log_ctx, pw, ph, vw, vh,
             )
     else:
         x, y = loc[0] + (win_w - pw) // 2, loc[1] + (win_h - ph) // 2
@@ -589,7 +595,8 @@ def build_exemplar_prototype(cfg, sample_id: str, detector, work_dir: Path):
                         )
                         canvas, box_c = _render_on_video_frame(
                             img, m, b, ratio, frame_canvas, valid_hw, sc_cfg.context_margin, sc_cfg.feather_px,
-                            log_ctx=f"{sample_id}: ref {ref_idx}: ", blur_box_surround=sc_cfg.blur_box_surround,
+                            log_ctx=f"[Stage123-GeCo2] {sample_id}: ref {ref_idx}: ",
+                            blur_box_surround=sc_cfg.blur_box_surround,
                         )
                     elif sc_cfg.mode == "factor":
                         canvas, box_c = _render_object_canvas(
