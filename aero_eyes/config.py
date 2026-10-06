@@ -169,7 +169,11 @@ class Stage3Config(BaseModel):
     # split of the score histogram). mean + z*std assumes the target is a
     # rare outlier; when most candidates ARE the target (few proposals per
     # frame, e.g. Wallet_1) it lands above the target's own scores.
-    adaptive_cap: Literal["none", "otsu"] = "none"
+    # "upper_quantile": cap at adaptive_cap_quantile of the scores above the
+    # Otsu split (only bites when the threshold would reject most of the
+    # target cluster). "otsu" alone over-lowers when the target is often absent.
+    adaptive_cap: Literal["none", "otsu", "upper_quantile"] = "none"
+    adaptive_cap_quantile: float = 0.25
     calibrate: CalibrateConfig = CalibrateConfig()
 
 

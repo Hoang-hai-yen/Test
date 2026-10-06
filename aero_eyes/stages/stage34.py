@@ -62,6 +62,22 @@ def _otsu_threshold(scores: np.ndarray, bins: int = 256) -> float:
     return float(edges[int(np.argmax(between)) + 1])
 
 
+def _adaptive_cap_threshold(scores: np.ndarray, mode: str, quantile: float = 0.25) -> float:
+    """Upper cap for the adaptive threshold.
+
+    "otsu": the Otsu split itself -- too aggressive when the target is absent
+        from many frames (public BlackBox_1 top-1 F1 92.5% -> 49.9%).
+    "upper_quantile": the given quantile of the scores ABOVE the Otsu split,
+        i.e. only bite when mean + z*std would reject most of the high
+        (target) cluster, as on Wallet_1.
+    """
+    otsu = _otsu_threshold(scores)
+    if mode == "otsu":
+        return otsu
+    upper = scores[scores >= otsu]
+    return float(np.quantile(upper, quantile)) if upper.size else otsu
+
+
 def _run_matching(cfg, sample_id: str) -> Path:
     """(cũ: run_stage3) So khớp candidates với prototype -> detections.json."""
     from aero_eyes.stages.stage12 import read_candidates_with_features
@@ -191,14 +207,17 @@ def _run_matching(cfg, sample_id: str) -> Path:
         else:
             effective_threshold = raw_threshold
 
-        if getattr(s3, "adaptive_cap", "none") == "otsu":
-            otsu_thr = _otsu_threshold(all_sims)
-            if otsu_thr < effective_threshold:
+        cap_mode = getattr(s3, "adaptive_cap", "none")
+        if cap_mode != "none":
+            cap_thr = _adaptive_cap_threshold(
+                all_sims, cap_mode, getattr(s3, "adaptive_cap_quantile", 0.25)
+            )
+            if cap_thr < effective_threshold:
                 log.info(
-                    "[StageB/match] %s: adaptive threshold %.3f capped by Otsu split %.3f",
-                    sample_id, effective_threshold, otsu_thr,
+                    "[StageB/match] %s: adaptive threshold %.3f capped by %s -> %.3f",
+                    sample_id, effective_threshold, cap_mode, cap_thr,
                 )
-                effective_threshold = max(s3.adaptive_min_floor, otsu_thr)
+                effective_threshold = max(s3.adaptive_min_floor, cap_thr)
 
         sim_max = float(all_sims.max())
         if effective_threshold > sim_max:

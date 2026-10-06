@@ -238,7 +238,9 @@ stage4:
 # ----------------------------------------------------------------------------
 stage5:
   temporal_smoothing:
-    enabled: true
+    # Off: on the stage-diagnose run EMA lowered ST-IoU vs raw tracks even
+    # with the gap/jump reset (public 0.6366 -> 0.5975, private 0.4052 -> 0.3718).
+    enabled: false
     method: ema              # ema | none
     ema_alpha: 0.6
   min_tube_length: 2         # discard tubes shorter than this (frames)
