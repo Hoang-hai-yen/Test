@@ -1797,7 +1797,9 @@ def _run_geco2_candidate_pass(
 
         frame_dets: list[Detection] = []
         for i, box in enumerate(boxes):
-            d = Detection(frame_idx=frame_idx, box=box, similarity=0.0, source="candidate")
+            # similarity carries GeCo2's own box score so candidates.json is
+            # readable on its own; Stage 3 overwrites it with its cosine score.
+            d = Detection(frame_idx=frame_idx, box=box, similarity=box.score, source="candidate")
             d._feature = feats[i]  # type: ignore[attr-defined]
             frame_dets.append(d)
         candidates[frame_idx] = frame_dets
