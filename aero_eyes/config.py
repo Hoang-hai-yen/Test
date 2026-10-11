@@ -172,8 +172,12 @@ class Stage3Config(BaseModel):
     # "upper_quantile": cap at adaptive_cap_quantile of the scores above the
     # Otsu split (only bites when the threshold would reject most of the
     # target cluster). "otsu" alone over-lowers when the target is often absent.
-    adaptive_cap: Literal["none", "otsu", "upper_quantile"] = "none"
+    # "otsu_if_sparse": Otsu cap only when the video averages fewer than
+    # adaptive_cap_max_cands_per_frame proposals per keyframe -- i.e. exactly
+    # when most candidates are the target and mean + z*std breaks down.
+    adaptive_cap: Literal["none", "otsu", "upper_quantile", "otsu_if_sparse"] = "none"
     adaptive_cap_quantile: float = 0.25
+    adaptive_cap_max_cands_per_frame: float = 2.0
     calibrate: CalibrateConfig = CalibrateConfig()
 
 

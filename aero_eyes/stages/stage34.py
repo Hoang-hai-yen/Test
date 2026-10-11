@@ -208,6 +208,16 @@ def _run_matching(cfg, sample_id: str) -> Path:
             effective_threshold = raw_threshold
 
         cap_mode = getattr(s3, "adaptive_cap", "none")
+        if cap_mode == "otsu_if_sparse":
+            # Few proposals per keyframe => most candidates are the target, the
+            # regime where mean + z*std overshoots (Wallet_1: 0.6 cands/frame).
+            cands_per_frame = len(all_entries) / max(1, len(candidates))
+            max_cpf = getattr(s3, "adaptive_cap_max_cands_per_frame", 2.0)
+            cap_mode = "otsu" if cands_per_frame < max_cpf else "none"
+            log.info(
+                "[StageB/match] %s: %.2f candidates/frame (sparse < %.1f) -> cap=%s",
+                sample_id, cands_per_frame, max_cpf, cap_mode,
+            )
         if cap_mode != "none":
             cap_thr = _adaptive_cap_threshold(
                 all_sims, cap_mode, getattr(s3, "adaptive_cap_quantile", 0.25)
