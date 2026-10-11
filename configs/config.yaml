@@ -184,6 +184,14 @@ stage3:
   # Re-sweep if the domain gap, dataset, or upstream stage1/2/4/5 changes.
   adaptive_z_score: 1.5
   adaptive_min_floor: 0.05   # hard floor: never accept sim below this even if adaptive
+  # Cap on the adaptive threshold. otsu_if_sparse = cap at the Otsu split only
+  # when the video averages < adaptive_cap_max_cands_per_frame proposals per
+  # keyframe (most candidates are then the target and mean + z*std overshoots).
+  # Measured on segfix_helmet@1f3982c outputs: Wallet_1 0.000 -> 0.776,
+  # Wallet_0 0.440 -> 0.723; < 1.0 leaves every other video unchanged
+  # (at < 1.5, CardboardBox_0 at 1.25 cands/frame dropped 0.758 -> 0.718).
+  adaptive_cap: otsu_if_sparse     # none | otsu | upper_quantile | otsu_if_sparse
+  adaptive_cap_max_cands_per_frame: 1.0
   # Optional auto-calibration of match_threshold on a labelled subset.
   calibrate:
     enabled: false

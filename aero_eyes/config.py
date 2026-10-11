@@ -177,7 +177,7 @@ class Stage3Config(BaseModel):
     # when most candidates are the target and mean + z*std breaks down.
     adaptive_cap: Literal["none", "otsu", "upper_quantile", "otsu_if_sparse"] = "none"
     adaptive_cap_quantile: float = 0.25
-    adaptive_cap_max_cands_per_frame: float = 2.0
+    adaptive_cap_max_cands_per_frame: float = 1.0
     calibrate: CalibrateConfig = CalibrateConfig()
 
 
