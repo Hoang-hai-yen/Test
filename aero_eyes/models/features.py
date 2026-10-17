@@ -159,7 +159,10 @@ class DINOv3FeatureExtractor:
             batch_pil = pil_imgs[i:i+batch_size]
             inputs = self.processor(images=batch_pil, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            pooled = self.model(**inputs).pooler_output
+            outputs = self.model(**inputs)
+            pooled = getattr(outputs, "pooler_output", None)
+            if pooled is None:  # fall back to the last layer's CLS token
+                pooled = outputs.last_hidden_state[:, 0]
             out.append(F.normalize(pooled, dim=-1).cpu().numpy())
         return np.concatenate(out, axis=0).astype(np.float32)
 
