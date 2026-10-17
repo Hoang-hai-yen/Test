@@ -193,6 +193,7 @@ def write_detections(
     detections: dict[int, list[Detection]],
     path: str | Path,
     threshold: float | None = None,
+    frame_thresholds: dict[int, float] | None = None,
 ) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -208,6 +209,9 @@ def write_detections(
         # tuning and reject nearly every re-detect attempt.
         "threshold": threshold,
     }
+    if frame_thresholds:
+        # Online Stage 3: one causal threshold per keyframe.
+        payload["frame_thresholds"] = {str(fi): float(t) for fi, t in sorted(frame_thresholds.items())}
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
     log.debug("Wrote detections: %s (%d frames)", path, len(detections))
@@ -220,6 +224,14 @@ def read_detections(path: str | Path) -> dict[int, list[Detection]]:
         int(fi): [Detection.from_dict(d) for d in dets]
         for fi, dets in payload["frames"].items()
     }
+
+
+def read_detections_frame_thresholds(path: str | Path) -> dict[int, float] | None:
+    """Per-keyframe thresholds written by online Stage 3, if any."""
+    with open(path) as f:
+        payload = json.load(f)
+    ft = payload.get("frame_thresholds")
+    return {int(k): float(v) for k, v in ft.items()} if ft else None
 
 
 def read_detections_threshold(path: str | Path) -> float | None:

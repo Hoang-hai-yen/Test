@@ -178,6 +178,17 @@ class Stage3Config(BaseModel):
     adaptive_cap: Literal["none", "otsu", "upper_quantile", "otsu_if_sparse"] = "none"
     adaptive_cap_quantile: float = 0.25
     adaptive_cap_max_cands_per_frame: float = 1.0
+    # Online (causal) Stage 3: threshold for keyframe t from a running window of
+    # the last adaptive_threshold_online_window scores of keyframes < t; cold
+    # start (< adaptive_threshold_min_samples scores) = adaptive_min_floor.
+    # Dynamic prototype and adaptive_cap also run causally (see stage34).
+    adaptive_threshold_online: bool = False
+    adaptive_threshold_online_window: int = 300
+    adaptive_threshold_min_samples: int = 20
+    # Cold start before min_samples scores exist: "reject" = accept nothing yet
+    # (a few frames lost), "floor" = accept >= adaptive_min_floor (test-geco2's
+    # choice; lets background through and the tracker can extend it).
+    adaptive_threshold_online_cold_start: Literal["reject", "floor"] = "reject"
     calibrate: CalibrateConfig = CalibrateConfig()
 
 
