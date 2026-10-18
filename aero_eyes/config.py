@@ -67,7 +67,13 @@ class SegmentationConfig(BaseModel):
     max_area_frac: float = 0.95
     score_ratio_floor: float = 0.85
     max_border_touch_frac: float = 0.02
-    background_mode: Literal["mean_fill", "keep_real", "blur"] = "mean_fill"
+    # How pixels outside the reference mask are filled before feature extraction.
+    # mean_fill = the image's own mean colour (default; for an orange life jacket
+    # on a small crop this is itself orange-ish, so the prototype leans on
+    # colour); neutral_fill = ImageNet mean colour, which DINO's normalisation
+    # maps to ~0 (no colour signal); gray_fill = mid gray 128; blur / keep_real
+    # as in stage123_geco2.
+    background_mode: Literal["mean_fill", "neutral_fill", "gray_fill", "keep_real", "blur"] = "mean_fill"
     blur_sigma: float = 25.0
 
 

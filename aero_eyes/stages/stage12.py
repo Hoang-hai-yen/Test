@@ -54,6 +54,30 @@ def _center_box_mask(shape: tuple, ratio: float) -> np.ndarray:
     return mask
 
 
+# ImageNet mean in BGR order (DINOv2/DINOv3 normalise with it, so this colour
+# becomes ~0 after preprocessing).
+_IMAGENET_MEAN_BGR = np.array([0.406, 0.456, 0.485]) * 255.0
+
+
+def _fill_background(img: np.ndarray, mask: np.ndarray, mode: str, blur_sigma: float = 25.0) -> np.ndarray:
+    """Replace pixels outside the reference mask (stage1.segmentation.background_mode)."""
+    if mode == "keep_real" or mask.all():
+        return img.copy()
+    out = img.copy()
+    if mode == "blur":
+        blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=blur_sigma)
+        out[~mask] = blurred[~mask]
+        return out
+    if mode == "neutral_fill":
+        fill = _IMAGENET_MEAN_BGR
+    elif mode == "gray_fill":
+        fill = np.array([128.0, 128.0, 128.0])
+    else:  # mean_fill
+        fill = img.reshape(-1, 3).mean(axis=0)
+    out[~mask] = fill.astype(img.dtype)
+    return out
+
+
 def _apply_aerial_sim(img: np.ndarray, downscale_factor: float, blur_ksize: int) -> np.ndarray:
     out = img
     if downscale_factor < 1.0:
@@ -127,10 +151,8 @@ def _run_reference_processing(cfg, sample_id: str) -> Path:
         else:
             mask = np.ones(img.shape[:2], dtype=bool)
         masks.append(mask)
-        masked = img.copy()
-        bg_color = img.reshape(-1, 3).mean(axis=0)
-        masked[~mask] = bg_color
-        masked_imgs.append(masked)
+        masked_imgs.append(_fill_background(
+            img, mask, getattr(seg_cfg, "background_mode", "mean_fill"), getattr(seg_cfg, "blur_sigma", 25.0)))
 
     if cfg.runtime.save_visualizations:
         viz_dir = work_dir / "viz" / "stageA_ref"
