@@ -207,12 +207,14 @@ def _online_match_and_threshold(
                 std = float(np.sqrt(max(0.0, run_sumsq / run_n - mean * mean)))
             thr = max(floor, mean + z_online * std)
             cap_mode = cap_mode_cfg
-            if cap_mode != "none" and w is None:
-                w = np.asarray(window, dtype=np.float64)
             if cap_mode == "otsu_if_sparse":
                 sparse = (len(recent_counts) >= max(1, cap_warmup // 2)
                           and float(np.mean(recent_counts)) < max_cpf)
+                if sparse and w is None:
+                    w = np.asarray(window, dtype=np.float64)
                 cap_mode = "otsu" if sparse and _is_bimodal(w, cap_min_sep) else "none"
+            if cap_mode != "none" and w is None:
+                w = np.asarray(window, dtype=np.float64)
             if cap_mode != "none":
                 cap_thr = _adaptive_cap_threshold(w, cap_mode, cap_q)
                 if cap_thr < thr:
