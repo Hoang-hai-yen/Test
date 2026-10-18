@@ -99,9 +99,13 @@ def _online_match_and_threshold(
     are processed in order and every decision for frame t uses only what was
     observed at frames < t, as a live drone feed requires.
 
-    - Threshold: mean + z*std over a running window of the last
-      adaptive_threshold_online_window similarity scores (design from
-      test-geco2's OnlineAdaptiveThreshold). Cold start (fewer than
+    - Threshold: max(abs floor, mean + z*std) over a running window of the
+      last adaptive_threshold_online_window similarity scores (design from
+      test-geco2's OnlineAdaptiveThreshold), or over ALL earlier scores when
+      the window is 0. A 300-score window covers only a few dozen frames of one
+      scene: its std is tiny, so mean + z*std sits just above the background
+      and lets ~4% of background through everywhere (measured: online
+      0.2353/0.2860 vs offline 0.5587/0.5790 with DINOv3). Cold start (fewer than
       adaptive_threshold_min_samples scores seen) rejects everything by
       default (adaptive_threshold_online_cold_start="reject"); "floor" accepts
       >= adaptive_min_floor like test-geco2.
@@ -134,10 +138,18 @@ def _online_match_and_threshold(
     cap_min_sep = getattr(s3, "adaptive_cap_online_min_separation", 3.0)
     recent_counts: deque = deque(maxlen=max(1, cap_warmup))
 
-    window: deque = deque(maxlen=s3.adaptive_threshold_online_window)
+    # window_size <= 0: cumulative statistics over every earlier score (tends to
+    # the offline whole-video statistics as the video goes on); > 0: sliding
+    # window of that many scores (test-geco2's design).
+    window_size = int(s3.adaptive_threshold_online_window)
+    window: deque = deque(maxlen=window_size if window_size > 0 else None)
+    run_n, run_sum, run_sumsq = 0, 0.0, 0.0
     min_samples = s3.adaptive_threshold_min_samples
     cold_start = getattr(s3, "adaptive_threshold_online_cold_start", "reject")
+    z_online = getattr(s3, "adaptive_threshold_online_z", None)
+    z_online = s3.adaptive_z_score if z_online is None else float(z_online)
     floor = s3.adaptive_min_floor if s3.similarity == "cosine" else float("-inf")
+    floor = max(floor, float(getattr(s3, "adaptive_threshold_online_abs_floor", floor)))
     cap_mode_cfg = getattr(s3, "adaptive_cap", "none")
     max_cpf = getattr(s3, "adaptive_cap_max_cands_per_frame", 1.0)
     cap_q = getattr(s3, "adaptive_cap_quantile", 0.25)
@@ -186,9 +198,17 @@ def _online_match_and_threshold(
             thr = floor if cold_start == "floor" else float("inf")
             cold += 1
         else:
-            w = np.asarray(window, dtype=np.float64)
-            thr = max(floor, float(w.mean() + s3.adaptive_z_score * w.std()))
+            if window_size > 0:
+                w = np.asarray(window, dtype=np.float64)
+                mean, std = float(w.mean()), float(w.std())
+            else:
+                w = None  # built lazily: only the cap needs the full array
+                mean = run_sum / run_n
+                std = float(np.sqrt(max(0.0, run_sumsq / run_n - mean * mean)))
+            thr = max(floor, mean + z_online * std)
             cap_mode = cap_mode_cfg
+            if cap_mode != "none" and w is None:
+                w = np.asarray(window, dtype=np.float64)
             if cap_mode == "otsu_if_sparse":
                 sparse = (len(recent_counts) >= max(1, cap_warmup // 2)
                           and float(np.mean(recent_counts)) < max_cpf)
@@ -215,7 +235,11 @@ def _online_match_and_threshold(
             if hc.any():
                 dyn_sum += feats[hc].sum(axis=0)
                 dyn_n += int(hc.sum())
-        window.extend(np.asarray(sims, dtype=np.float64).tolist())
+        sims64 = np.asarray(sims, dtype=np.float64)
+        window.extend(sims64.tolist())
+        run_n += sims64.size
+        run_sum += float(sims64.sum())
+        run_sumsq += float((sims64 * sims64).sum())
         seen_entries += len(idxs)
         recent_counts.append(len(idxs))
 
@@ -228,10 +252,10 @@ def _online_match_and_threshold(
 
     thr_vals = np.array(list(frame_thresholds.values())) if frame_thresholds else np.array([floor])
     log.info(
-        "[StageB/match] %s: ONLINE threshold (window=%d, min_samples=%d, cap=%s) -> "
+        "[StageB/match] %s: ONLINE threshold (window=%d [0=cumulative], z=%.2f, floor=%.3f, min_samples=%d, cap=%s) -> "
         "thr p10/p50/p90=%.3f/%.3f/%.3f, cold-start frames=%d, capped frames=%d, "
         "dynamic feats=%d, %d / %d candidates pass",
-        sample_id, s3.adaptive_threshold_online_window, min_samples, cap_mode_cfg,
+        sample_id, window_size, z_online, floor, min_samples, cap_mode_cfg,
         *np.percentile(thr_vals, [10, 50, 90]), cold, capped, dyn_n, int(keep_mask.sum()), n,
     )
     return all_sims, keep_mask, frame_thresholds, per_ref_final, proto_final, dyn is not None
