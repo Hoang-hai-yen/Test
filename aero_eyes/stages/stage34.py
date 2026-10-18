@@ -78,6 +78,19 @@ def _adaptive_cap_threshold(scores: np.ndarray, mode: str, quantile: float = 0.2
     return float(np.quantile(upper, quantile)) if upper.size else otsu
 
 
+def _is_bimodal(scores: np.ndarray, min_separation: float) -> bool:
+    """Otsu split gives two clusters whose means are >= min_separation pooled
+    standard deviations apart (and the upper one has a few members)."""
+    if scores.size < 10:
+        return False
+    split = _otsu_threshold(scores)
+    lo, hi = scores[scores < split], scores[scores >= split]
+    if lo.size < 2 or hi.size < 5:
+        return False
+    pooled = float(np.sqrt((lo.var() + hi.var()) / 2.0)) + 1e-8
+    return (float(hi.mean()) - float(lo.mean())) / pooled >= min_separation
+
+
 def _online_match_and_threshold(
     s3, sample_id: str, candidates: dict, all_feats: np.ndarray, all_frame_idxs: list[int],
     prototype: np.ndarray, per_ref_features: list[np.ndarray], use_multi_ref: bool, pool_fn,
@@ -94,10 +107,15 @@ def _online_match_and_threshold(
       >= adaptive_min_floor like test-geco2.
     - adaptive_cap (otsu / upper_quantile / otsu_if_sparse) is applied to the
       same window; otsu_if_sparse uses the running candidates-per-frame.
-    - Dynamic prototype: instead of 2 whole-video rounds, a running mean of
+    - Dynamic prototype (only if dynamic_prototype_online): a running mean of
       high-confidence candidate features (>= max(high_conf_abs_floor,
       high_conf_percentile of the window)) joins the reference pool once it
-      has min_support members, weighted like the `rounds` offline refs.
+      has min_support members, weighted like the `rounds` offline refs. Off by
+      default -- it drifted to background in practice.
+    - otsu_if_sparse: candidates/frame over the last
+      adaptive_cap_online_warmup_frames frames, and the Otsu cap only when the
+      window splits into two well-separated clusters (_is_bimodal) -- few
+      candidates alone can also mean an empty scene.
 
     Returns (all_sims, keep_mask, frame_thresholds, per_ref_features_final,
     prototype_final, dynamic_used).
@@ -106,11 +124,15 @@ def _online_match_and_threshold(
 
     dyn_cfg = getattr(s3, "dynamic_prototype", None)
     dyn_enabled = getattr(dyn_cfg, "enabled", True) if dyn_cfg is not None else True
+    dyn_enabled = dyn_enabled and getattr(s3, "dynamic_prototype_online", False)
     dyn_rounds = getattr(dyn_cfg, "rounds", 2) if dyn_cfg is not None else 2
     dyn_alpha = getattr(dyn_cfg, "alpha", 0.3) if dyn_cfg is not None else 0.3
     dyn_percentile = getattr(dyn_cfg, "high_conf_percentile", 90) if dyn_cfg is not None else 90
     dyn_abs_floor = getattr(dyn_cfg, "high_conf_abs_floor", 0.15) if dyn_cfg is not None else 0.15
     dyn_min_support = getattr(dyn_cfg, "min_support", 2) if dyn_cfg is not None else 2
+    cap_warmup = getattr(s3, "adaptive_cap_online_warmup_frames", 100)
+    cap_min_sep = getattr(s3, "adaptive_cap_online_min_separation", 3.0)
+    recent_counts: deque = deque(maxlen=max(1, cap_warmup))
 
     window: deque = deque(maxlen=s3.adaptive_threshold_online_window)
     min_samples = s3.adaptive_threshold_min_samples
@@ -143,6 +165,7 @@ def _online_match_and_threshold(
         idxs = frame_to_idx.get(fi, [])
         seen_frames += 1
         if not idxs:
+            recent_counts.append(0)
             continue
 
         # -- score this frame against the prototype state as of frame t-1
@@ -167,7 +190,9 @@ def _online_match_and_threshold(
             thr = max(floor, float(w.mean() + s3.adaptive_z_score * w.std()))
             cap_mode = cap_mode_cfg
             if cap_mode == "otsu_if_sparse":
-                cap_mode = "otsu" if seen_entries / max(1, seen_frames - 1) < max_cpf else "none"
+                sparse = (len(recent_counts) >= max(1, cap_warmup // 2)
+                          and float(np.mean(recent_counts)) < max_cpf)
+                cap_mode = "otsu" if sparse and _is_bimodal(w, cap_min_sep) else "none"
             if cap_mode != "none":
                 cap_thr = _adaptive_cap_threshold(w, cap_mode, cap_q)
                 if cap_thr < thr:
@@ -192,6 +217,7 @@ def _online_match_and_threshold(
                 dyn_n += int(hc.sum())
         window.extend(np.asarray(sims, dtype=np.float64).tolist())
         seen_entries += len(idxs)
+        recent_counts.append(len(idxs))
 
     dyn = dynamic_feat()
     per_ref_final = list(per_ref_features) + ([dyn] * dyn_rounds if (use_multi_ref and dyn is not None) else [])

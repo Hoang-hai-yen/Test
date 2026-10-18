@@ -189,6 +189,20 @@ class Stage3Config(BaseModel):
     # (a few frames lost), "floor" = accept >= adaptive_min_floor (test-geco2's
     # choice; lets background through and the tracker can extend it).
     adaptive_threshold_online_cold_start: Literal["reject", "floor"] = "reject"
+    # Online running-mean dynamic prototype. Off by default (test-geco2 also
+    # disables it online): measured on segfix_helmet@148ec5f it drifted to
+    # background -- it absorbed thousands of pre-target background features and
+    # took half the pooling weight (public 0.6476 -> 0.1933).
+    dynamic_prototype_online: bool = False
+    # otsu_if_sparse online: candidates/frame is measured over the last
+    # adaptive_cap_online_warmup_frames frames (needs >= half of them), and the
+    # Otsu cap only applies if the score window is clearly two clusters
+    # (separation >= adaptive_cap_online_min_separation pooled std). Few
+    # candidates can mean "mostly the target" (cap) or "empty scene" (don't):
+    # a cumulative estimate capped BlackBox_1 / CardboardBox_0 / Motorbike_0
+    # during empty stretches (segfix_helmet@148ec5f).
+    adaptive_cap_online_warmup_frames: int = 100
+    adaptive_cap_online_min_separation: float = 3.0
     calibrate: CalibrateConfig = CalibrateConfig()
 
 
