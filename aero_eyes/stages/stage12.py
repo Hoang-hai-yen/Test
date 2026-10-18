@@ -4,12 +4,9 @@ Gộp từ 2 stage cũ:
   - Stage 1 (reference processing): 3 ref images -> MobileSAM mask ->
     multi-scale crops -> DINOv2 features -> weighted fusion -> prototype.npz
   - Stage 2 (candidate generation): video -> keyframe sampling -> proposals
-    (+ optional SAHI tiling) -> optional dense-scan fallback (dùng
-    prototype.npz vừa tạo ở phần trên) -> DINOv2 features -> candidates.json
+    (+ optional SAHI tiling) -> DINOv2 features -> candidates.json
 
-Lý do gộp: Stage 2 (dense_scan) vốn đã phụ thuộc trực tiếp vào prototype.npip
-do Stage 1 ghi ra, nên tách thành 2 lệnh CLI riêng chỉ tạo thêm rủi ro
-"chạy thiếu bước 1". Gộp lại thành 1 stage duy nhất, chạy tuần tự nội bộ,
+Gộp lại thành 1 stage duy nhất, chạy tuần tự nội bộ,
 vẫn giữ nguyên các file trung gian (prototype.npz, candidates.json +
 candidates.feats.npz) để không phá cache / visualization / khả năng debug
 từng bước như cũ.
@@ -294,53 +291,9 @@ def _proposals_for_frame(
     return boxes[:max_candidates]
 
 
-def _dense_scan_boxes(
-    frame_bgr: np.ndarray,
-    extractor,
-    prototype: np.ndarray,
-    use_sahi: bool,
-    sahi_tile: list[int],
-    sahi_overlap: float,
-    sim_threshold: float,
-    min_blob_patches: int,
-    min_area: float,
-    max_candidates: int,
-    use_fpn_pyramid: bool = False,
-) -> list[Box]:
-    """DINOv2 patch-similarity scan against the prototype -- fallback
-    candidate source for when proposal_model starves a keyframe."""
-    from aero_eyes.utils.geometry import dense_patches_to_boxes, nms, sahi_tiles
-
-    h, w = frame_bgr.shape[:2]
-    all_boxes: list[Box] = []
-    extract = extractor.extract_pyramid_grid if use_fpn_pyramid else extractor.extract_dense_grid
-
-    if use_sahi:
-        for tile in sahi_tiles(w, h, sahi_tile, sahi_overlap):
-            tile_img = frame_bgr[tile.y1:tile.y2, tile.x1:tile.x2]
-            if tile_img.size == 0:
-                continue
-            grid, scale_x, scale_y = extract(tile_img)
-            all_boxes.extend(dense_patches_to_boxes(
-                grid, prototype, sim_threshold, min_blob_patches,
-                scale_x, scale_y, offset_x=tile.x1, offset_y=tile.y1,
-            ))
-        keep = nms(all_boxes, iou_threshold=0.5)
-        all_boxes = [all_boxes[i] for i in keep]
-    else:
-        grid, scale_x, scale_y = extract(frame_bgr)
-        all_boxes = dense_patches_to_boxes(
-            grid, prototype, sim_threshold, min_blob_patches, scale_x, scale_y,
-        )
-
-    all_boxes = [b for b in all_boxes if b.area() >= min_area]
-    all_boxes.sort(key=lambda b: b.score, reverse=True)
-    return all_boxes[:max_candidates]
-
 
 def _run_candidate_generation(cfg, sample_id: str) -> Path:
-    """(cũ: run_stage2) Sinh candidates.json từ video, có thể dùng
-    prototype.npz (đã tạo ở _run_reference_processing) cho dense-scan."""
+    """(cũ: run_stage2) Sinh candidates.json từ video (không phụ thuộc prototype)."""
     from aero_eyes.models.features import build_feature_extractor
     from aero_eyes.models.proposals import build_proposal_model
     from aero_eyes.utils import viz as vizmod
@@ -385,29 +338,6 @@ def _run_candidate_generation(cfg, sample_id: str) -> Path:
 
     cand_cfg = cfg.stage2.candidate
     sahi_cfg = cfg.stage2.sahi
-    dscfg = getattr(cfg.stage2, 'dense_scan', None)
-
-    # ---- Optional dense-scan fallback candidate source ----
-    dense_prototype = None
-    if dscfg is not None and getattr(dscfg, 'enabled', False):
-        if cfg.stage1.feature_extractor.model != "dinov2":
-            log.warning(
-                "[StageA/cand] %s: stage2.dense_scan.enabled=true but "
-                "stage1.feature_extractor.model='%s' (only 'dinov2' supports "
-                "the dense patch-token scan) -- dense scan disabled for this run.",
-                sample_id, cfg.stage1.feature_extractor.model,
-            )
-        else:
-            proto_path = work_dir / cfg.stage1.prototype.cache_name
-            if not proto_path.exists():
-                raise FileNotFoundError(
-                    f"stage2.dense_scan.enabled=true but prototype.npz not found "
-                    f"at {proto_path}. Reference processing (phần 1 của StageA) "
-                    f"chưa chạy hoặc chưa ghi ra file."
-                )
-            from aero_eyes.utils.io import read_prototype
-            dense_prototype, _, _ = read_prototype(proto_path)
-
     candidates: dict[int, list[Detection]] = {}
     viz_dir = work_dir / "viz" / "stageA_cand"
 
@@ -451,31 +381,6 @@ def _run_candidate_generation(cfg, sample_id: str) -> Path:
         final_boxes = final_boxes[:cand_cfg.max_candidates_per_keyframe]
         box_sources = ["candidate"] * len(final_boxes)
 
-        if dense_prototype is not None and len(final_boxes) < dscfg.trigger_min_proposals:
-            dense_boxes = _dense_scan_boxes(
-                frame_bgr, extractor, dense_prototype,
-                use_sahi=sahi_cfg.use_sahi, sahi_tile=sahi_cfg.tile,
-                sahi_overlap=sahi_cfg.overlap,
-                sim_threshold=dscfg.sim_threshold, min_blob_patches=dscfg.min_blob_patches,
-                min_area=cand_cfg.min_box_area,
-                max_candidates=dscfg.max_dense_candidates_per_keyframe,
-                use_fpn_pyramid=dscfg.use_fpn_pyramid,
-            )
-            if dense_boxes:
-                log.info(
-                    "[StageA/cand] %s frame %d: proposal path found only %d candidate(s) "
-                    "(< trigger_min_proposals=%d) -- dense scan added %d more.",
-                    sample_id, frame_idx, len(final_boxes),
-                    dscfg.trigger_min_proposals, len(dense_boxes),
-                )
-                dense_id_set = {id(b) for b in dense_boxes}
-                merged = final_boxes + dense_boxes
-                keep = do_nms(merged, iou_threshold=0.5)
-                final_boxes = [merged[i] for i in keep][:cand_cfg.max_candidates_per_keyframe]
-                box_sources = [
-                    "candidate_dense" if id(b) in dense_id_set else "candidate"
-                    for b in final_boxes
-                ]
 
         if final_boxes:
             feats = extractor.extract_crops(

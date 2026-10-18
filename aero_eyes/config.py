@@ -188,11 +188,11 @@ class Stage3Config(BaseModel):
     # the last adaptive_threshold_online_window scores of keyframes < t; cold
     # start (< adaptive_threshold_min_samples scores) = adaptive_min_floor.
     # Dynamic prototype and adaptive_cap also run causally (see stage34).
-    adaptive_threshold_online: bool = False
-    adaptive_threshold_online_window: int = 300   # 0 = cumulative (all earlier scores)
+    adaptive_threshold_online: bool = True   # online is the pipeline default; false = whole-video (offline)
+    adaptive_threshold_online_window: int = 3000  # 0 = cumulative (all earlier scores)
     adaptive_threshold_online_z: Optional[float] = None   # None = adaptive_z_score
     adaptive_threshold_online_abs_floor: float = 0.05    # online threshold never below this
-    adaptive_threshold_min_samples: int = 20
+    adaptive_threshold_min_samples: int = 50
     # Cold start before min_samples scores exist: "reject" = accept nothing yet
     # (a few frames lost), "floor" = accept >= adaptive_min_floor (test-geco2's
     # choice; lets background through and the tracker can extend it).
